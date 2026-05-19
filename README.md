@@ -20,7 +20,8 @@ NoPainNoScan/
 ├── check_snmp.py          # SNMP : community strings, snmpwalk
 ├── check_ipmi.py          # IPMI : cipher-zero, RAKP, creds par défaut
 ├── check_winrm.py         # WinRM : auth methods, test creds, exec
-└── check_kerberos.py      # Kerberos : user enum, AS-REP, Kerberoast
+├── check_kerberos.py      # Kerberos : user enum, AS-REP, Kerberoast
+└── generate_report.py     # Rapport HTML — agrège tous les outputs en un seul fichier
 ```
 
 ---
@@ -32,6 +33,7 @@ NoPainNoScan/
 | `masscan` | ad_recon_userless | `apt install masscan` |
 | `fping` | ad_recon_userless | `apt install fping` |
 | `arp-scan` | ad_recon_userless | `apt install arp-scan` |
+| `nmap` | ad_recon_userless (`--verify`) | `apt install nmap` |
 | `nxc` / `netexec` | smb, ldap, rdp, mssql, ssh, ftp, winrm, kerberos | `pip install netexec` |
 | `ldapsearch` | ldap | `apt install ldap-utils` |
 | `dig` | dns | `apt install dnsutils` |
@@ -54,7 +56,7 @@ Chaque script vérifie les outils requis au démarrage et signale les manquants 
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  ad_recon_userless.py -t 10.10.0.0/24                           │
+│  ad_recon_userless.py -t 10.10.0.0/24 [--verify]               │
 │                                                                  │
 │  → hosts_alive.txt, hosts_smb.txt, hosts_ldap.txt, ...          │
 │  → port_445.txt, port_22.txt, ...                               │
@@ -69,6 +71,12 @@ Chaque script vérifie les outils requis au démarrage et signale les manquants 
     check_ftp.py             check_snmp.py            check_winrm.py
           │
           └────────── avec -u/-p/-H : checks authentifiés supplémentaires
+                                     │
+                                     ▼
+          ┌──────────────────────────────────────────────────────┐
+          │  generate_report.py -d /tmp/pentest/ -n "Client"     │
+          │  → report.html  (rapport HTML self-contained)        │
+          └──────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -89,6 +97,7 @@ sudo python3 ad_recon_userless.py -t 10.10.10.0/24 -o /tmp/pentest -r 2000
 | `-t` | — | Réseau cible CIDR |
 | `-o` | `.` | Répertoire de sortie |
 | `-r` | `5000` | Taux masscan en paquets/seconde |
+| `--verify` | off | Active un second pass nmap SYN pour confirmer les résultats masscan |
 
 #### Ce que fait le script
 
@@ -107,7 +116,24 @@ TCP : 21, 22, 53, 80, 88, 135, 139, 389, 443, 445, 464, 593, 636,
 UDP : 161 (SNMP), 623 (IPMI)
 ```
 
+Masscan est lancé avec `--retries=2` pour limiter les faux négatifs liés à sa nature stateless.
+
 Parse le JSON masscan (gère les trailing commas malformées), catégorise les hosts et génère :
+
+**ETAPE 3 — Vérification nmap (optionnel, `--verify`)**
+
+Lance un second pass `nmap -sS --open --max-retries 2 --min-rate 500` sur les mêmes hosts et ports TCP.
+Nmap étant stateful avec retry, il rattrape les ports manqués par masscan (congestion réseau, firewalls stateful).
+Les résultats sont **mergés** : chaque port trouvé par l'un ou l'autre apparaît dans les fichiers de sortie.
+Le terminal affiche explicitement les hosts/ports ajoutés par rapport à masscan.
+
+```bash
+# Scan rapide (masscan seul, retries=2)
+sudo python3 ad_recon_userless.py -t 10.10.0.0/24
+
+# Scan complet (masscan + vérification nmap)
+sudo python3 ad_recon_userless.py -t 10.10.0.0/24 --verify
+```
 
 | Fichier | Contenu |
 |---|---|
@@ -789,6 +815,62 @@ Fallback : `GetUserSPNs.py <domain>/<user>:<pass> -dc-ip <dc_ip> -request -forma
 
 ---
 
+---
+
+## Rapport HTML
+
+### `generate_report.py`
+
+Agrège tous les fichiers de sortie produits par les scripts et génère un rapport HTML self-contained (zéro dépendance externe, un seul fichier).
+
+```bash
+python3 generate_report.py -d /tmp/pentest/ -n "CorpClient" -o report.html
+```
+
+| Argument | Défaut | Description |
+|---|---|---|
+| `-d` | — | Répertoire de scan (parcouru récursivement) |
+| `-o` | `nopainnoscan_report.html` | Fichier HTML de sortie |
+| `-n` | `Internal Pentest` | Nom de l'engagement / client |
+
+Le script scanne récursivement le répertoire fourni et détecte automatiquement tous les fichiers connus. Les scripts n'ont pas besoin d'avoir été lancés avec le même `-o` : le scan récursif trouve tout.
+
+#### Contenu du rapport
+
+**Sidebar fixe** avec un point coloré par service :
+- 🔴 rouge = findings critiques
+- 🟠 orange = warnings
+- 🟢 vert = scanné, rien de critique
+- ⚫ gris = non scanné
+
+**Bandeau critique** : liste agrégée de tous les findings critiques avec le service source.
+
+**Bandeau warnings** : idem pour les alertes de niveau warning.
+
+**Stat grid** : hosts alive, nombre de findings critiques, nombre de services scannés.
+
+**Une card cliquable par service** (expand/collapse) :
+
+| Service | Données affichées |
+|---|---|
+| Discovery | Hosts vivants, DCs, compte par service, top ports |
+| SMB | Unsigned (relay), SMBv1, writable shares, SYSVOL files |
+| LDAP | Null bind, no pre-auth, délégation, users/groups/computers counts |
+| Kerberos | Valid users, AS-REP hashes (hashcat -m 18200), SPN hashes (hashcat -m 13100) |
+| RDP | Hosts sans NLA, logins réussis |
+| SSH | Banners, algos faibles, password auth, logins réussis |
+| HTTP/S | Titres, ADCS, WebDAV, OWA/RDWeb/ADFS/WSUS |
+| MSSQL | Accessible, default creds, xp_cmdshell (RCE), linked servers |
+| DNS | Domaines détectés, AXFR réussis, hostnames |
+| FTP | Anonymous, writable paths, banners |
+| SNMP | Community strings valides, fichiers de données |
+| IPMI | Cipher zero, anonymous auth, RAKP hashes, default creds |
+| WinRM | Hosts détectés, hosts accessibles avec creds |
+
+Les services non scannés affichent "Not scanned" en gris plutôt que de rester vides.
+
+---
+
 ## Légende criticité
 
 | Icône | Signification |
@@ -802,24 +884,30 @@ Fallback : `GetUserSPNs.py <domain>/<user>:<pass> -dc-ip <dc_ip> -request -forma
 
 ```bash
 # 1. Discovery (root requis)
-sudo python3 ad_recon_userless.py -t 10.10.0.0/24 -o /tmp/pentest -r 3000
+#    --verify pour double-check nmap sur les hosts découverts (recommandé)
+sudo python3 ad_recon_userless.py -t 10.10.0.0/24 -o /tmp/pentest -r 3000 --verify
 
 # 2. Checks sans creds
-python3 check_smb.py      -t /tmp/pentest/10.10.0.0_24/hosts_smb.txt     -o /tmp/pentest/smb
-python3 check_ldap.py     -t /tmp/pentest/10.10.0.0_24/hosts_ldap.txt    -o /tmp/pentest/ldap
+python3 check_smb.py      -t /tmp/pentest/10.10.0.0_24/hosts_smb.txt      -o /tmp/pentest/smb
+python3 check_ldap.py     -t /tmp/pentest/10.10.0.0_24/hosts_ldap.txt     -o /tmp/pentest/ldap
 python3 check_kerberos.py -t /tmp/pentest/10.10.0.0_24/hosts_kerberos.txt -d corp.local -o /tmp/pentest/krb
-python3 check_dns.py      -t /tmp/pentest/10.10.0.0_24/hosts_dns.txt     -d corp.local -o /tmp/pentest/dns
-python3 check_http.py     -t /tmp/pentest/10.10.0.0_24/hosts_http.txt    -o /tmp/pentest/http
-python3 check_mssql.py    -t /tmp/pentest/10.10.0.0_24/hosts_mssql.txt   -o /tmp/pentest/mssql
-python3 check_ftp.py      -t /tmp/pentest/10.10.0.0_24/hosts_ftp.txt     -o /tmp/pentest/ftp
-python3 check_snmp.py     -t /tmp/pentest/10.10.0.0_24/hosts_snmp.txt    -o /tmp/pentest/snmp
-python3 check_ipmi.py     -t /tmp/pentest/10.10.0.0_24/hosts_ipmi.txt    -o /tmp/pentest/ipmi
-python3 check_rdp.py      -t /tmp/pentest/10.10.0.0_24/hosts_rdp.txt     -o /tmp/pentest/rdp
-python3 check_ssh.py      -t /tmp/pentest/10.10.0.0_24/hosts_ssh.txt     -o /tmp/pentest/ssh
+python3 check_dns.py      -t /tmp/pentest/10.10.0.0_24/hosts_dns.txt      -d corp.local -o /tmp/pentest/dns
+python3 check_http.py     -t /tmp/pentest/10.10.0.0_24/hosts_http.txt     -o /tmp/pentest/http
+python3 check_mssql.py    -t /tmp/pentest/10.10.0.0_24/hosts_mssql.txt    -o /tmp/pentest/mssql
+python3 check_ftp.py      -t /tmp/pentest/10.10.0.0_24/hosts_ftp.txt      -o /tmp/pentest/ftp
+python3 check_snmp.py     -t /tmp/pentest/10.10.0.0_24/hosts_snmp.txt     -o /tmp/pentest/snmp
+python3 check_ipmi.py     -t /tmp/pentest/10.10.0.0_24/hosts_ipmi.txt     -o /tmp/pentest/ipmi
+python3 check_rdp.py      -t /tmp/pentest/10.10.0.0_24/hosts_rdp.txt      -o /tmp/pentest/rdp
+python3 check_ssh.py      -t /tmp/pentest/10.10.0.0_24/hosts_ssh.txt      -o /tmp/pentest/ssh
 
 # 3. Une fois des creds obtenus (default MSSQL, null bind LDAP, etc.)
-python3 check_smb.py      -t /tmp/pentest/10.10.0.0_24/hosts_smb.txt -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/smb_auth
-python3 check_kerberos.py -t /tmp/pentest/10.10.0.0_24/hosts_kerberos.txt -d corp.local -u jdoe -p 'P@ss' -o /tmp/pentest/krb_auth
-python3 check_ldap.py     -t /tmp/pentest/10.10.0.0_24/hosts_ldap.txt -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/ldap_auth
-python3 check_winrm.py    -t /tmp/pentest/10.10.0.0_24/hosts_winrm.txt -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/winrm_auth
+python3 check_smb.py      -t /tmp/pentest/10.10.0.0_24/hosts_smb.txt      -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/smb_auth
+python3 check_kerberos.py -t /tmp/pentest/10.10.0.0_24/hosts_kerberos.txt -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/krb_auth
+python3 check_ldap.py     -t /tmp/pentest/10.10.0.0_24/hosts_ldap.txt     -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/ldap_auth
+python3 check_winrm.py    -t /tmp/pentest/10.10.0.0_24/hosts_winrm.txt    -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/winrm_auth
+
+# 4. Génération du rapport HTML
+python3 generate_report.py -d /tmp/pentest/ -n "CorpClient" -o /tmp/pentest/report.html
+# Ouvrir dans le navigateur :
+xdg-open /tmp/pentest/report.html
 ```
