@@ -2,14 +2,23 @@
 """
 AD Recon Userless — Phase 1: Host Discovery + Port Scan
 Usage: sudo python3 ad_recon_userless.py -t 192.168.1.0/24
+       sudo python3 ad_recon_userless.py -t targets.txt
 
 Workflow:
     1. fping      — ICMP sweep (hosts alive)
     2. arp-scan   — ARP sweep (hosts silencieux ICMP, réseau local)
-    3. masscan    — port scan rapide (ports AD + services communs + UDP SNMP/IPMI)
+    3. nmap       — TCP SYN ping sur ports AD/internes courants (hosts bloquant ICMP/ARP)
+    4. masscan    — port scan rapide (ports AD + services communs + UDP SNMP/IPMI)
+
+Input:
+    -t peut être :
+      • un CIDR     : 192.168.1.0/24
+      • une IP      : 10.0.0.5
+      • un fichier  : targets.txt  (un CIDR/IP par ligne, # pour commentaires)
 
 Output files:
-    hosts_alive.txt       tous les hosts répondants (ICMP/ARP)
+    targets.txt           cibles scannées (copie, si multi-cibles)
+    hosts_alive.txt       tous les hosts répondants (ICMP/ARP/TCP)
     hosts_dc.txt          DCs potentiels (Kerberos 88/464 + LDAP 389/3268)
     hosts_smb.txt         SMB (445/139)
     hosts_ldap.txt        LDAP/LDAPS (389,636,3268,3269)
@@ -88,12 +97,42 @@ def tool_exists(name):
 
 def check_root():
     if os.geteuid() != 0:
-        log_warn("Non root — masscan nécessite les privilèges root")
+        log_warn("Non root — masscan et nmap SYN ping nécessitent les privilèges root")
         log_warn("Relancer avec sudo pour des résultats complets")
 
 
 def setup_output(base_dir, target):
     safe = target.replace("/", "_")
+    path = Path(base_dir) / safe
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def parse_targets(target_arg):
+    """
+    Retourne la liste des cibles depuis un CIDR/IP ou un fichier.
+    Le fichier accepte : CIDRs, IPs, plages (10.0.0.1-10.0.0.50), commentaires #.
+    """
+    p = Path(target_arg)
+    if p.is_file():
+        targets = []
+        for line in p.read_text().splitlines():
+            line = line.split("#")[0].strip()
+            if line:
+                targets.append(line)
+        if not targets:
+            log_err(f"Fichier {target_arg} vide ou sans cibles valides")
+            sys.exit(1)
+        log_ok(f"{len(targets)} cible(s) chargée(s) depuis {target_arg}")
+        return targets
+    return [target_arg]
+
+
+def setup_output_multi(base_dir, target_arg, targets):
+    """Choisit le répertoire de sortie : nom du fichier si multi-cibles, CIDR sinon."""
+    if len(targets) == 1:
+        return setup_output(base_dir, targets[0])
+    safe = Path(target_arg).stem.replace(" ", "_") if Path(target_arg).is_file() else "multi"
     path = Path(base_dir) / safe
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -159,36 +198,43 @@ for _cat, _ports in PORT_CATEGORIES.items():
         PORT_TO_CAT[_p] = _cat
 
 
+# Ports utilisés pour la découverte TCP (SYN ping nmap) — ports AD/internes courants
+DISCOVERY_TCP_PORTS = "22,80,88,135,139,389,443,445,3389,5985,5986"
+
+
 # =============================================================================
 # ETAPE 1 — DECOUVERTE DES HOSTS
 # =============================================================================
-def discover_hosts(base_path, target):
+def discover_hosts(base_path, targets):
     """
-    Découverte via ICMP (fping) + ARP (arp-scan).
-    Les deux sources sont fusionnées et dédupliquées.
+    Découverte via ICMP (fping) + ARP (arp-scan) + TCP SYN ping (nmap).
+    Les trois sources sont fusionnées et dédupliquées.
 
+    Args:
+        targets: list[str] — CIDRs/IPs à scanner
     Returns:
         list[str]: IPs découvertes, triées
     """
     log_step("ETAPE 1 — Découverte des hôtes")
     hosts = set()
 
-    # --- fping: ICMP echo ---
+    # --- fping: ICMP echo (une exécution par cible) ---
     if tool_exists("fping"):
-        log_info("fping ICMP sweep...")
-        out, _, _ = run(f"fping -a -g -q {target} 2>/dev/null", timeout=120)
-        icmp_hosts = {line.strip() for line in out.splitlines() if line.strip()}
-        if icmp_hosts:
-            log_ok(f"fping: {len(icmp_hosts)} hosts ICMP alive")
-            hosts.update(icmp_hosts)
-        else:
-            log_warn("fping: 0 host ICMP (ICMP filtré ou réseau vide)")
+        for target in targets:
+            log_info(f"fping ICMP sweep → {target}...")
+            out, _, _ = run(f"fping -a -g -q {target} 2>/dev/null", timeout=120)
+            icmp_hosts = {line.strip() for line in out.splitlines() if line.strip()}
+            if icmp_hosts:
+                log_ok(f"fping [{target}]: {len(icmp_hosts)} hosts ICMP alive")
+                hosts.update(icmp_hosts)
+            else:
+                log_warn(f"fping [{target}]: 0 host ICMP (ICMP filtré ou réseau vide)")
     else:
         log_warn("fping non installé — skipping ICMP (apt install fping)")
 
-    # --- arp-scan: ARP (réseau local, détecte les hosts qui bloquent ICMP) ---
+    # --- arp-scan: ARP (réseau local uniquement, une seule exécution) ---
     if tool_exists("arp-scan"):
-        log_info("arp-scan ARP sweep...")
+        log_info("arp-scan ARP sweep (réseau local)...")
         out, _, _ = run("arp-scan --localnet --quiet 2>/dev/null", timeout=60)
         arp_hosts = set()
         for line in out.splitlines():
@@ -201,8 +247,38 @@ def discover_hosts(base_path, target):
     else:
         log_warn("arp-scan non installé — hosts silencieux ICMP non détectés (apt install arp-scan)")
 
+    # --- nmap: TCP SYN ping sur ports AD/internes courants ---
+    # Détecte les hosts qui bloquent ICMP et ARP (hôtes routés, VLANs distants,
+    # machines Windows avec pare-feu bloquant le ping).
+    if tool_exists("nmap"):
+        for target in targets:
+            log_info(f"nmap TCP SYN ping [{DISCOVERY_TCP_PORTS}] → {target}...")
+            out, _, _ = run(
+                f"nmap -sn -PS{DISCOVERY_TCP_PORTS} -n "
+                f"--max-retries 1 --min-rate 500 "
+                f"{target} -oG - 2>/dev/null",
+                timeout=300
+            )
+            tcp_hosts = set()
+            for line in out.splitlines():
+                if "Status: Up" in line:
+                    m = re.match(r'^Host:\s+(\S+)', line)
+                    if m:
+                        tcp_hosts.add(m.group(1))
+            new_hosts = tcp_hosts - hosts
+            if tcp_hosts:
+                log_ok(
+                    f"nmap TCP ping [{target}]: {len(tcp_hosts)} hosts répondent"
+                    + (f" ({len(new_hosts)} nouveaux vs ICMP/ARP)" if new_hosts else "")
+                )
+                hosts.update(tcp_hosts)
+            else:
+                log_warn(f"nmap TCP ping [{target}]: 0 host détecté via ports TCP")
+    else:
+        log_warn("nmap non installé — TCP port ping désactivé (apt install nmap)")
+
     if not hosts:
-        log_err("Aucun host découvert — vérifier le réseau ou les permissions (root requis pour ARP)")
+        log_err("Aucun host découvert — vérifier le réseau ou les permissions (root requis pour ARP/SYN)")
         return []
 
     hosts_list = sort_ips(list(hosts))
@@ -483,10 +559,20 @@ def write_summary(base_path, target, hosts_list, host_ports, rate):
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    targets_file = base_path / "targets.txt"
+    all_targets  = targets_file.read_text().splitlines() if targets_file.exists() else [target]
+
     lines = [
         "NoPainNoScan Discovery Summary",
         "===============================",
-        f"Target     : {target}",
+    ]
+    if len(all_targets) == 1:
+        lines.append(f"Target     : {all_targets[0]}")
+    else:
+        lines.append(f"Targets    : {len(all_targets)} réseaux")
+        for t in all_targets:
+            lines.append(f"             {t}")
+    lines += [
         f"Date       : {now}",
         f"Rate       : {rate} pps",
         "",
@@ -532,10 +618,16 @@ def main():
 Exemples:
   sudo python3 ad_recon_userless.py -t 192.168.1.0/24
   sudo python3 ad_recon_userless.py -t 10.10.10.0/24 -o /tmp/pentest -r 2000
+  sudo python3 ad_recon_userless.py -t targets.txt -o /tmp/pentest --verify
+
+Fichier de cibles (targets.txt):
+  10.0.0.0/24
+  172.16.5.0/24
+  192.168.1.50    # serveur isolé
         """
     )
     parser.add_argument("-t", "--target", required=True,
-                        help="Réseau cible CIDR (ex: 192.168.1.0/24)")
+                        help="CIDR/IP cible ou fichier de cibles (un CIDR/IP par ligne)")
     parser.add_argument("-o", "--output", default=".",
                         help="Répertoire de sortie (défaut: .)")
     parser.add_argument("-r", "--rate",   default=5000, type=int,
@@ -544,18 +636,29 @@ Exemples:
                         help="Double-check nmap SYN après masscan (plus lent mais zéro faux négatif)")
     args = parser.parse_args()
 
+    targets = parse_targets(args.target)
+
     print(f"\n{C.BOLD}{'='*60}")
     print(f"    AD RECON USERLESS — PHASE 1: DISCOVERY + PORT SCAN")
     print(f"{'='*60}{C.ENDC}")
-    print(f"  Cible   : {args.target}")
+    if len(targets) == 1:
+        print(f"  Cible   : {targets[0]}")
+    else:
+        print(f"  Cibles  : {len(targets)} réseaux (depuis {args.target})")
+        for t in targets:
+            print(f"            {t}")
     print(f"  Output  : {args.output}")
     print(f"  Rate    : {args.rate} pps")
     print(f"{'='*60}\n")
 
     check_root()
 
-    base_path  = setup_output(args.output, args.target)
-    hosts_list = discover_hosts(base_path, args.target)
+    base_path = setup_output_multi(args.output, args.target, targets)
+
+    # Sauvegarde la liste des cibles pour référence
+    (base_path / "targets.txt").write_text("\n".join(targets) + "\n")
+
+    hosts_list = discover_hosts(base_path, targets)
 
     if not hosts_list:
         sys.exit(1)

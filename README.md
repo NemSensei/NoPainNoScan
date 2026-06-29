@@ -33,7 +33,7 @@ NoPainNoScan/
 | `masscan` | ad_recon_userless | `apt install masscan` |
 | `fping` | ad_recon_userless | `apt install fping` |
 | `arp-scan` | ad_recon_userless | `apt install arp-scan` |
-| `nmap` | ad_recon_userless (`--verify`) | `apt install nmap` |
+| `nmap` | ad_recon_userless (discovery TCP + `--verify`) | `apt install nmap` |
 | `nxc` / `netexec` | smb, ldap, rdp, mssql, ssh, ftp, winrm, kerberos | `pip install netexec` |
 | `ldapsearch` | ldap | `apt install ldap-utils` |
 | `dig` | dns | `apt install dnsutils` |
@@ -57,8 +57,9 @@ Chaque script vérifie les outils requis au démarrage et signale les manquants 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  ad_recon_userless.py -t 10.10.0.0/24 [--verify]               │
+│  ad_recon_userless.py -t targets.txt  [--verify]               │
 │                                                                  │
-│  → hosts_alive.txt, hosts_smb.txt, hosts_ldap.txt, ...          │
+│  → targets.txt, hosts_alive.txt, hosts_smb.txt, ...             │
 │  → port_445.txt, port_22.txt, ...                               │
 │  → hosts_detail/<IP>.txt, ports_summary.json, summary.txt       │
 └────────────────────────────────────┬────────────────────────────┘
@@ -85,16 +86,30 @@ Chaque script vérifie les outils requis au démarrage et signale les manquants 
 
 ### `ad_recon_userless.py`
 
-**Prérequis :** root (arp-scan et masscan nécessitent des sockets raw)
+**Prérequis :** root (arp-scan, nmap SYN ping et masscan nécessitent des sockets raw)
 
 ```bash
+# Cible unique
 sudo python3 ad_recon_userless.py -t 192.168.1.0/24
 sudo python3 ad_recon_userless.py -t 10.10.10.0/24 -o /tmp/pentest -r 2000
+
+# Fichier multi-cibles
+sudo python3 ad_recon_userless.py -t targets.txt -o /tmp/pentest --verify
 ```
+
+**Format du fichier de cibles :**
+```
+# targets.txt — un CIDR/IP par ligne, commentaires # ignorés
+10.0.0.0/24
+172.16.5.0/24
+192.168.1.50    # serveur isolé
+```
+
+Le répertoire de sortie est nommé d'après le CIDR (cible unique) ou le nom du fichier (multi-cibles, ex: `targets.txt` → `output/targets/`).
 
 | Argument | Défaut | Description |
 |---|---|---|
-| `-t` | — | Réseau cible CIDR |
+| `-t` | — | CIDR/IP cible **ou** fichier de cibles (un CIDR/IP par ligne) |
 | `-o` | `.` | Répertoire de sortie |
 | `-r` | `5000` | Taux masscan en paquets/seconde |
 | `--verify` | off | Active un second pass nmap SYN pour confirmer les résultats masscan |
@@ -103,9 +118,13 @@ sudo python3 ad_recon_userless.py -t 10.10.10.0/24 -o /tmp/pentest -r 2000
 
 **ETAPE 1 — Découverte des hôtes**
 
-- `fping -a -g -q <CIDR>` — ICMP sweep, liste les hosts qui répondent
-- `arp-scan --localnet` — ARP sweep, détecte les hosts qui bloquent ICMP (silencieux)
-- Fusionne et déduplique les deux sources → **`hosts_alive.txt`**
+Trois méthodes complémentaires, toutes sources mergées et dédupliquées → **`hosts_alive.txt`** :
+
+- `fping -a -g -q <CIDR>` — ICMP sweep, liste les hosts qui répondent au ping
+- `arp-scan --localnet` — ARP sweep, détecte les hosts qui bloquent ICMP (réseau local uniquement)
+- `nmap -sn -PS22,80,88,135,139,389,443,445,3389,5985,5986` — TCP SYN ping sur ports AD/internes courants, détecte les hosts routés ou avec ICMP filtré mais avec des services ouverts (SMB, RDP, LDAP, WinRM…)
+
+Le terminal indique combien de hosts chaque méthode ajoute par rapport aux précédentes.
 
 **ETAPE 2 — Port scan (masscan)**
 
@@ -133,11 +152,15 @@ sudo python3 ad_recon_userless.py -t 10.10.0.0/24
 
 # Scan complet (masscan + vérification nmap)
 sudo python3 ad_recon_userless.py -t 10.10.0.0/24 --verify
+
+# Multi-cibles, scan complet
+sudo python3 ad_recon_userless.py -t targets.txt -o /tmp/pentest --verify
 ```
 
 | Fichier | Contenu |
 |---|---|
-| `hosts_alive.txt` | Tous les hôtes vivants (ICMP + ARP) |
+| `targets.txt` | Cibles scannées (copie du fichier d'entrée ou CIDR unique) |
+| `hosts_alive.txt` | Tous les hôtes vivants (ICMP + ARP + TCP SYN ping) |
 | `hosts_dc.txt` | DC potentiels : ports Kerberos (88 ou 464) **ET** LDAP (389 ou 3268) |
 | `hosts_smb.txt` | Hôtes avec SMB (139 ou 445) |
 | `hosts_ldap.txt` | Hôtes avec LDAP/LDAPS (389, 636, 3268, 3269) |
@@ -884,27 +907,34 @@ Les services non scannés affichent "Not scanned" en gris plutôt que de rester 
 
 ```bash
 # 1. Discovery (root requis)
-#    --verify pour double-check nmap sur les hosts découverts (recommandé)
+#    Cible unique
 sudo python3 ad_recon_userless.py -t 10.10.0.0/24 -o /tmp/pentest -r 3000 --verify
+#    Multi-cibles (fichier)
+sudo python3 ad_recon_userless.py -t targets.txt -o /tmp/pentest -r 3000 --verify
+
+# Le répertoire de découverte dépend de l'entrée :
+#   cible unique  → /tmp/pentest/10.10.0.0_24/
+#   fichier       → /tmp/pentest/targets/       (nom sans extension du fichier)
+DISC=/tmp/pentest/10.10.0.0_24   # adapter si multi-cibles
 
 # 2. Checks sans creds
-python3 check_smb.py      -t /tmp/pentest/10.10.0.0_24/hosts_smb.txt      -o /tmp/pentest/smb
-python3 check_ldap.py     -t /tmp/pentest/10.10.0.0_24/hosts_ldap.txt     -o /tmp/pentest/ldap
-python3 check_kerberos.py -t /tmp/pentest/10.10.0.0_24/hosts_kerberos.txt -d corp.local -o /tmp/pentest/krb
-python3 check_dns.py      -t /tmp/pentest/10.10.0.0_24/hosts_dns.txt      -d corp.local -o /tmp/pentest/dns
-python3 check_http.py     -t /tmp/pentest/10.10.0.0_24/hosts_http.txt     -o /tmp/pentest/http
-python3 check_mssql.py    -t /tmp/pentest/10.10.0.0_24/hosts_mssql.txt    -o /tmp/pentest/mssql
-python3 check_ftp.py      -t /tmp/pentest/10.10.0.0_24/hosts_ftp.txt      -o /tmp/pentest/ftp
-python3 check_snmp.py     -t /tmp/pentest/10.10.0.0_24/hosts_snmp.txt     -o /tmp/pentest/snmp
-python3 check_ipmi.py     -t /tmp/pentest/10.10.0.0_24/hosts_ipmi.txt     -o /tmp/pentest/ipmi
-python3 check_rdp.py      -t /tmp/pentest/10.10.0.0_24/hosts_rdp.txt      -o /tmp/pentest/rdp
-python3 check_ssh.py      -t /tmp/pentest/10.10.0.0_24/hosts_ssh.txt      -o /tmp/pentest/ssh
+python3 check_smb.py      -t $DISC/hosts_smb.txt      -o /tmp/pentest/smb
+python3 check_ldap.py     -t $DISC/hosts_ldap.txt     -o /tmp/pentest/ldap
+python3 check_kerberos.py -t $DISC/hosts_kerberos.txt -d corp.local -o /tmp/pentest/krb
+python3 check_dns.py      -t $DISC/hosts_dns.txt      -d corp.local -o /tmp/pentest/dns
+python3 check_http.py     -t $DISC/hosts_http.txt     -o /tmp/pentest/http
+python3 check_mssql.py    -t $DISC/hosts_mssql.txt    -o /tmp/pentest/mssql
+python3 check_ftp.py      -t $DISC/hosts_ftp.txt      -o /tmp/pentest/ftp
+python3 check_snmp.py     -t $DISC/hosts_snmp.txt     -o /tmp/pentest/snmp
+python3 check_ipmi.py     -t $DISC/hosts_ipmi.txt     -o /tmp/pentest/ipmi
+python3 check_rdp.py      -t $DISC/hosts_rdp.txt      -o /tmp/pentest/rdp
+python3 check_ssh.py      -t $DISC/hosts_ssh.txt      -o /tmp/pentest/ssh
 
 # 3. Une fois des creds obtenus (default MSSQL, null bind LDAP, etc.)
-python3 check_smb.py      -t /tmp/pentest/10.10.0.0_24/hosts_smb.txt      -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/smb_auth
-python3 check_kerberos.py -t /tmp/pentest/10.10.0.0_24/hosts_kerberos.txt -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/krb_auth
-python3 check_ldap.py     -t /tmp/pentest/10.10.0.0_24/hosts_ldap.txt     -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/ldap_auth
-python3 check_winrm.py    -t /tmp/pentest/10.10.0.0_24/hosts_winrm.txt    -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/winrm_auth
+python3 check_smb.py      -t $DISC/hosts_smb.txt      -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/smb_auth
+python3 check_kerberos.py -t $DISC/hosts_kerberos.txt -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/krb_auth
+python3 check_ldap.py     -t $DISC/hosts_ldap.txt     -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/ldap_auth
+python3 check_winrm.py    -t $DISC/hosts_winrm.txt    -u jdoe -p 'P@ss' -d corp.local -o /tmp/pentest/winrm_auth
 
 # 4. Génération du rapport HTML
 python3 generate_report.py -d /tmp/pentest/ -n "CorpClient" -o /tmp/pentest/report.html
