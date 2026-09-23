@@ -30,6 +30,30 @@ def tool_exists(name):
 
 
 # ---------------------------------------------------------------------------
+# User confirmation
+# ---------------------------------------------------------------------------
+
+AUTO_ACCEPT = False
+
+def confirm_step(step_name, detail=None):
+    """Ask the user to validate a step before launching its commands."""
+    global AUTO_ACCEPT
+    if AUTO_ACCEPT:
+        return True
+    print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
+    if detail:
+        print(f"    {C.CYAN}{detail}{C.ENDC}")
+    resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
+    if resp in ("a", "all"):
+        AUTO_ACCEPT = True
+        return True
+    if resp in ("y", "yes"):
+        return True
+    log_warn(f"Skipped by user: {step_name}")
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Target parsing
 # ---------------------------------------------------------------------------
 
@@ -287,6 +311,11 @@ def main():
     # -----------------------------------------------------------------------
     log_step("STEP 1 — Banner Grab")
     # -----------------------------------------------------------------------
+    if not confirm_step("STEP 1 — Banner Grab", f"FTP connect + getwelcome() on {len(targets)} target(s)"):
+        (output_dir / 'ftp_banners.txt').write_text("# Skipped by user request\n")
+        _write_summary(output_dir, targets, banners, anon_success, anon_writable, custom_success)
+        log_ok(f"Results saved to: {output_dir.resolve()}")
+        sys.exit(0)
     for ip in targets:
         log_info(f"Connecting to {ip}:21...")
         banner, ftp = grab_banner(ip)
@@ -317,38 +346,56 @@ def main():
     # -----------------------------------------------------------------------
     log_step("STEP 2 — Anonymous Login Test")
     # -----------------------------------------------------------------------
-    for ip in banners:
-        log_info(f"Testing anonymous login on {ip}...")
-        success, cred, ftp = test_anonymous_login(ip)
-        if success:
-            log_ok(f"  [CRITICAL] {ip} — anonymous login OK (user='{cred[0]}', pass='{cred[1]}')")
-            anon_success.append((ip, cred[0], cred[1]))
+    if confirm_step("STEP 2 — Anonymous Login Test", f"FTP login attempts (anonymous/anonymous@, empty, ftp/ftp) on {len(banners)} host(s)"):
+        do_enum = confirm_step(
+            "STEP 3 — File Enumeration & Write-Access Test",
+            "recursive LIST (depth 3) + mkdir/rmdir write-access probe on each host with anonymous access"
+        )
+        for ip in banners:
+            log_info(f"Testing anonymous login on {ip}...")
+            success, cred, ftp = test_anonymous_login(ip)
+            if success:
+                log_ok(f"  [CRITICAL] {ip} — anonymous login OK (user='{cred[0]}', pass='{cred[1]}')")
+                anon_success.append((ip, cred[0], cred[1]))
 
-            # ---------------------------------------------------------------
-            # STEP 3 — Enumerate files
-            # ---------------------------------------------------------------
-            log_step(f"STEP 3 — File Enumeration on {ip}")
-            try:
-                entries, interesting, writable = enumerate_ftp(ip, ftp, output_dir)
-                log_ok(f"  {ip} → {len(entries)} entries, {len(interesting)} interesting files")
-                for path in writable:
-                    anon_writable.append((ip, path))
-                if interesting:
-                    log_warn(f"  [!] Interesting files on {ip}:")
-                    for epath, _ in interesting[:10]:
-                        log_warn(f"      {epath}")
-            except Exception as e:
-                log_err(f"  Enumeration error on {ip}: {e}")
-            finally:
-                try:
-                    ftp.quit()
-                except Exception:
+                if not do_enum:
+                    log_info(f"  Skipping file enumeration on {ip} (declined at STEP 3)")
                     try:
-                        ftp.close()
+                        ftp.quit()
                     except Exception:
-                        pass
-        else:
-            log_info(f"  {ip} → anonymous login denied")
+                        try:
+                            ftp.close()
+                        except Exception:
+                            pass
+                    continue
+
+                # ---------------------------------------------------------------
+                # STEP 3 — Enumerate files
+                # ---------------------------------------------------------------
+                log_step(f"STEP 3 — File Enumeration on {ip}")
+                try:
+                    entries, interesting, writable = enumerate_ftp(ip, ftp, output_dir)
+                    log_ok(f"  {ip} → {len(entries)} entries, {len(interesting)} interesting files")
+                    for path in writable:
+                        anon_writable.append((ip, path))
+                    if interesting:
+                        log_warn(f"  [!] Interesting files on {ip}:")
+                        for epath, _ in interesting[:10]:
+                            log_warn(f"      {epath}")
+                except Exception as e:
+                    log_err(f"  Enumeration error on {ip}: {e}")
+                finally:
+                    try:
+                        ftp.quit()
+                    except Exception:
+                        try:
+                            ftp.close()
+                        except Exception:
+                            pass
+            else:
+                log_info(f"  {ip} → anonymous login denied")
+    else:
+        log_info("STEP 2/3 skipped by user — no anonymous login test performed")
 
     # Write anonymous results
     with (output_dir / 'ftp_anonymous.txt').open('w') as f:
@@ -379,7 +426,10 @@ def main():
     # STEP 4 — nxc ftp check
     # -----------------------------------------------------------------------
     log_step("STEP 4 — nxc FTP Check")
-    if tool_exists('nxc'):
+    step4_ok = confirm_step("STEP 4 — nxc/ftplib Credential Check", f"nxc ftp <hosts> -u {args.username} -p ***  (anonymous + custom creds)")
+    if not step4_ok:
+        log_info("STEP 4 skipped by user")
+    elif tool_exists('nxc'):
         # Write hosts file for nxc
         responsive_hosts_file = output_dir / 'responsive_ftp_hosts.txt'
         with responsive_hosts_file.open('w') as f:
@@ -408,7 +458,7 @@ def main():
         log_warn("nxc not found — skipping nxc FTP check")
 
     # Custom creds test via ftplib (if nxc not available or as complement)
-    if use_custom_creds and not tool_exists('nxc'):
+    if step4_ok and use_custom_creds and not tool_exists('nxc'):
         log_info(f"Testing custom credentials {args.username}:*** via ftplib...")
         for ip in banners:
             success, ftp = test_custom_login(ip, args.username, args.password)

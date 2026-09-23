@@ -182,6 +182,24 @@ sudo python3 ad_recon_userless.py -t targets.txt -o /tmp/pentest --verify
 
 ---
 
+## Validation interactive
+
+Chaque `check_*.py` demande une confirmation avant de lancer les commandes de chaque étape (`STEP 1`, `STEP 2`, …) :
+
+```
+[?] STEP 1 — Banner grab is about to run.
+    socket connect to 12 host(s) on port 22
+    Proceed? [y/N/a=accept all remaining]
+```
+
+- `y` (ou Entrée sur `yes`) : exécute cette étape, puis redemande à la suivante.
+- `N` (défaut) : passe l'étape (fichiers de sortie vides/placeholder écrits pour ne pas casser la suite).
+- `a` : accepte cette étape et toutes les suivantes du script sans plus redemander.
+
+La confirmation est par étape (pas par host individuel) : un `y`/`a` couvre l'ensemble des hosts ciblés par cette étape.
+
+---
+
 ## Scripts par service
 
 **Arguments communs à tous les scripts :**

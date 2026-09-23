@@ -34,6 +34,26 @@ def tool_exists(name):
     return rc == 0
 
 
+AUTO_ACCEPT = False
+
+def confirm_step(step_name, detail=None):
+    """Ask the user to validate a step before launching its commands."""
+    global AUTO_ACCEPT
+    if AUTO_ACCEPT:
+        return True
+    print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
+    if detail:
+        print(f"    {C.CYAN}{detail}{C.ENDC}")
+    resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
+    if resp in ("a", "all"):
+        AUTO_ACCEPT = True
+        return True
+    if resp in ("y", "yes"):
+        return True
+    log_warn(f"Skipped by user: {step_name}")
+    return False
+
+
 def parse_targets(target_arg):
     """Parse target: file, single IP, or CIDR. Returns list of IPs."""
     hosts = []
@@ -256,6 +276,13 @@ def main():
 
     log_step("Step 1-4: Title, ADCS, WebDAV, Service detection")
 
+    if not confirm_step(
+        "STEP 1-4 — Title/ADCS/WebDAV/Service detection",
+        f"curl requests (title, ADCS paths, WebDAV OPTIONS, OWA/RDWeb/ADFS/WSUS) against {len(tasks)} host:port combo(s) x2 schemes"
+    ):
+        log_info("STEP 1-4 skipped by user")
+        tasks = []
+
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {executor.submit(process_host_port, t): t for t in tasks}
         done = 0
@@ -292,7 +319,10 @@ def main():
                 log_info(f"Progress: {done}/{len(tasks)}")
 
     # Step 5: whatweb (sequential per live host to avoid hammering)
-    if has_whatweb:
+    if has_whatweb and all_titles and confirm_step(
+        "STEP 5 — Tech detection (whatweb)",
+        f"whatweb --no-errors -q <url>  (up to {len(all_titles)} discovered URL(s))"
+    ):
         log_step("Step 5: Tech detection (whatweb)")
         seen_urls = set()
         for t in all_titles:

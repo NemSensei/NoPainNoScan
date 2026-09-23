@@ -28,6 +28,26 @@ def tool_exists(name):
     return rc == 0
 
 
+AUTO_ACCEPT = False
+
+def confirm_step(step_name, detail=None):
+    """Ask the user to validate a step before launching its commands."""
+    global AUTO_ACCEPT
+    if AUTO_ACCEPT:
+        return True
+    print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
+    if detail:
+        print(f"    {C.CYAN}{detail}{C.ENDC}")
+    resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
+    if resp in ("a", "all"):
+        AUTO_ACCEPT = True
+        return True
+    if resp in ("y", "yes"):
+        return True
+    log_warn(f"Skipped by user: {step_name}")
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Target resolution
 # ---------------------------------------------------------------------------
@@ -136,6 +156,11 @@ def step1_nla_check(hosts_file, out_dir):
     """Run unauthenticated nxc rdp scan and extract NLA / OS info."""
     log_step("STEP 1 — NLA & OS Detection (no credentials)")
 
+    if not confirm_step("STEP 1 — NLA & OS Detection", f"nxc rdp {hosts_file}"):
+        (out_dir / "rdp_no_nla.txt").write_text("")
+        (out_dir / "rdp_results.txt").write_text("# Skipped by user request\n")
+        return []
+
     cmd = f"nxc rdp {hosts_file}"
     log_info(f"Running: {cmd}")
     stdout, stderr, rc = run(cmd, timeout=600)
@@ -179,6 +204,10 @@ def step2_auth_check(hosts_file, out_dir, username, password, ntlm_hash, domain)
     """Attempt authenticated RDP login with supplied credentials."""
     log_step("STEP 2 — Authenticated RDP Check")
 
+    if not confirm_step("STEP 2 — Authenticated RDP Check", f"nxc rdp {hosts_file} -u {username} ..."):
+        (out_dir / "rdp_login_success.txt").write_text("")
+        return []
+
     cmd = " ".join(_build_cred_args(hosts_file, username, password, ntlm_hash, domain))
     log_info(f"Running: {cmd}")
     stdout, stderr, rc = run(cmd, timeout=600)
@@ -201,6 +230,9 @@ def step2_auth_check(hosts_file, out_dir, username, password, ntlm_hash, domain)
 def step3_screenshot(hosts_file, out_dir, username, password, ntlm_hash, domain):
     """Capture RDP screenshots for hosts where credentials work."""
     log_step("STEP 3 — RDP Screenshots")
+
+    if not confirm_step("STEP 3 — RDP Screenshots", f"nxc rdp {hosts_file} -u {username} ... --screenshot --screentime 3"):
+        return
 
     parts = _build_cred_args(hosts_file, username, password, ntlm_hash, domain)
     parts.append("--screenshot --screentime 3")

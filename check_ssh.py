@@ -28,6 +28,27 @@ def tool_exists(name):
     out, _, rc = run(f"which {name}")
     return rc == 0
 
+# ─── User confirmation ────────────────────────────────────────────────────────
+
+AUTO_ACCEPT = False
+
+def confirm_step(step_name, detail=None):
+    """Ask the user to validate a step before launching its commands."""
+    global AUTO_ACCEPT
+    if AUTO_ACCEPT:
+        return True
+    print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
+    if detail:
+        print(f"    {C.CYAN}{detail}{C.ENDC}")
+    resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
+    if resp in ("a", "all"):
+        AUTO_ACCEPT = True
+        return True
+    if resp in ("y", "yes"):
+        return True
+    log_warn(f"Skipped by user: {step_name}")
+    return False
+
 # ─── Target resolution ────────────────────────────────────────────────────────
 
 def resolve_targets(target_arg):
@@ -68,6 +89,9 @@ def grab_banner(ip, port, timeout=5):
 
 def step_banner(hosts, port, out_dir):
     log_step("STEP 1 — Banner grab and SSH version")
+    if not confirm_step("STEP 1 — Banner grab", f"socket connect to {len(hosts)} host(s) on port {port}"):
+        (out_dir / "ssh_banners.txt").write_text("")
+        return {}
     banners = {}
     for ip in hosts:
         banner = grab_banner(ip, port)
@@ -111,6 +135,9 @@ def _parse_ssh_audit(output):
 
 def step_audit(hosts, port, out_dir):
     log_step("STEP 2 — Algorithm audit (ssh-audit / nxc fallback)")
+    if not confirm_step("STEP 2 — Algorithm audit", f"ssh-audit --no-colors -p {port} <ip>  (or nxc ssh <ip> fallback)"):
+        (out_dir / "ssh_weak_algos.txt").write_text("")
+        return {}
     has_ssh_audit = tool_exists("ssh-audit")
     has_nxc = tool_exists("nxc")
 
@@ -155,6 +182,9 @@ def step_audit(hosts, port, out_dir):
 
 def step_auth_methods(hosts, port, out_dir):
     log_step("STEP 3 — Authentication methods (no credentials)")
+    if not confirm_step("STEP 3 — Authentication methods", f"ssh -o PreferredAuthentications=none dummy@<ip> (x{len(hosts)})"):
+        (out_dir / "ssh_password_auth.txt").write_text("")
+        return []
     password_auth_hosts = []
 
     for ip in hosts:
@@ -189,6 +219,9 @@ def step_auth_methods(hosts, port, out_dir):
 
 def step_cred_test(hosts, port, username, password, out_dir):
     log_step("STEP 4 — Default credential test")
+    if not confirm_step("STEP 4 — Credential test", f"nxc ssh <hosts> --port {port} -u {username} -p ***"):
+        (out_dir / "ssh_login_success.txt").write_text("")
+        return []
     if not tool_exists("nxc"):
         log_err("nxc not found — cannot run credential test")
         return []

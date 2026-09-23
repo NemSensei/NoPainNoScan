@@ -29,6 +29,30 @@ def tool_exists(name):
 
 
 # ---------------------------------------------------------------------------
+# User confirmation
+# ---------------------------------------------------------------------------
+
+AUTO_ACCEPT = False
+
+def confirm_step(step_name, detail=None):
+    """Ask the user to validate a step before launching its commands."""
+    global AUTO_ACCEPT
+    if AUTO_ACCEPT:
+        return True
+    print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
+    if detail:
+        print(f"    {C.CYAN}{detail}{C.ENDC}")
+    resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
+    if resp in ("a", "all"):
+        AUTO_ACCEPT = True
+        return True
+    if resp in ("y", "yes"):
+        return True
+    log_warn(f"Skipped by user: {step_name}")
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Target parsing
 # ---------------------------------------------------------------------------
 
@@ -109,6 +133,9 @@ def detect_domain_from_soa(output):
 def step_soa(servers, guessed_domains, outdir):
     """Query SOA records to auto-detect the AD domain."""
     log_step("STEP 1 — SOA / Domain Detection")
+    if not confirm_step("STEP 1 — SOA / Domain Detection", f"dig SOA <domain> @<ip>  (x{len(servers)} server(s))"):
+        (outdir / "dns_soa.txt").write_text("# Skipped by user request\n")
+        return []
     soa_lines = []
     detected = set()
 
@@ -162,6 +189,9 @@ def step_soa(servers, guessed_domains, outdir):
 def step_axfr(servers, domains, outdir):
     """Attempt DNS zone transfer for each server/domain pair."""
     log_step("STEP 2 — Zone Transfer (AXFR)")
+    if not confirm_step("STEP 2 — Zone Transfer (AXFR)", f"dig axfr <domain> @<ip>  (x{len(servers)} server(s) x {len(domains)} domain(s))"):
+        (outdir / "dns_axfr_success.txt").write_text("# Skipped by user request\n")
+        return []
     zones_dir = outdir / "dns_zones"
     zones_dir.mkdir(exist_ok=True)
 
@@ -216,6 +246,9 @@ COMMON_NAMES = [
 def step_enum_hosts(servers, domains, outdir):
     """Try common AD/Windows hostnames against each DNS server."""
     log_step("STEP 3 — Common Subdomain Enumeration")
+    if not confirm_step("STEP 3 — Common Subdomain Enumeration", f"dig +short <name>.<domain> @<ip>  ({len(COMMON_NAMES)} names x {len(servers)} server(s) x {len(domains)} domain(s))"):
+        (outdir / "dns_hosts.txt").write_text("# Skipped by user request\n")
+        return {}
     found = {}  # hostname → set of IPs
 
     for ip in servers:
@@ -253,6 +286,10 @@ MAX_REVERSE_HOSTS = 256  # hard limit to avoid sweeping /16 etc.
 def step_reverse(servers, target_range, outdir):
     """PTR lookup sweep over target_range using first DNS server."""
     log_step("STEP 4 — Reverse Lookup Sweep")
+
+    if not confirm_step("STEP 4 — Reverse Lookup Sweep", f"dig +short -x <ip> @{servers[0] if servers else '<dns_server>'}  (over {target_range})"):
+        (outdir / "dns_reverse.txt").write_text("# Skipped by user request\n")
+        return {}
 
     if not servers:
         log_warn("No DNS servers available for reverse sweep.")

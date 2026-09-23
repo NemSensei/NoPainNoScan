@@ -29,6 +29,30 @@ def tool_exists(name):
 
 
 # ---------------------------------------------------------------------------
+# User confirmation
+# ---------------------------------------------------------------------------
+
+AUTO_ACCEPT = False
+
+def confirm_step(step_name, detail=None):
+    """Ask the user to validate a step before launching its commands."""
+    global AUTO_ACCEPT
+    if AUTO_ACCEPT:
+        return True
+    print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
+    if detail:
+        print(f"    {C.CYAN}{detail}{C.ENDC}")
+    resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
+    if resp in ("a", "all"):
+        AUTO_ACCEPT = True
+        return True
+    if resp in ("y", "yes"):
+        return True
+    log_warn(f"Skipped by user: {step_name}")
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Target parsing
 # ---------------------------------------------------------------------------
 
@@ -252,6 +276,9 @@ def run_checks(targets: list, output_dir: Path, usernames: list, password: str =
 
     # ---- STEP 1 ----
     log_step("STEP 1/5 — IPMI presence probe")
+    if not confirm_step("STEP 1/5 — IPMI presence probe", f"ipmitool -I lanplus -H <ip> -U '' -P '' chassis status  (x{len(targets)} target(s))"):
+        _write_summary(f_summary, stats, targets)
+        return
     present_hosts = []
     for ip in targets:
         log_info(f"Probing {ip} ...")
@@ -275,58 +302,62 @@ def run_checks(targets: list, output_dir: Path, usernames: list, password: str =
     # ---- STEP 2 ----
     log_step("STEP 2/5 — Cipher Zero vulnerability (CVE-2013-4786)")
     cipher0_vuln = []
-    for ip in present_hosts:
-        log_info(f"Testing cipher zero on {ip} ...")
-        for user in usernames:
-            out, vuln = check_cipher_zero(ip, user)
-            if vuln:
-                line = f"[CRITICAL] {ip} VULNERABLE to cipher zero (user={user})"
-                append_file(f_cipher0, line)
-                cipher0_vuln.append(ip)
-                stats["cipher0_vuln"] += 1
-                log_ok(f"  {ip} — CIPHER ZERO VULNERABLE with user={user}")
-                break
-            else:
-                log_info(f"  {ip} user={user}: not vulnerable (or no response)")
+    if confirm_step("STEP 2/5 — Cipher Zero vulnerability", f"ipmitool -I lanplus -C 0 -H <ip> -U <user> -P anypassword chassis status  (x{len(present_hosts)} host(s) x {len(usernames)} user(s))"):
+        for ip in present_hosts:
+            log_info(f"Testing cipher zero on {ip} ...")
+            for user in usernames:
+                out, vuln = check_cipher_zero(ip, user)
+                if vuln:
+                    line = f"[CRITICAL] {ip} VULNERABLE to cipher zero (user={user})"
+                    append_file(f_cipher0, line)
+                    cipher0_vuln.append(ip)
+                    stats["cipher0_vuln"] += 1
+                    log_ok(f"  {ip} — CIPHER ZERO VULNERABLE with user={user}")
+                    break
+                else:
+                    log_info(f"  {ip} user={user}: not vulnerable (or no response)")
 
     # ---- STEP 3 ----
     log_step("STEP 3/5 — Anonymous / null authentication")
     anon_vuln = []
-    for ip in present_hosts:
-        log_info(f"Testing anonymous auth on {ip} ...")
-        out, vuln = check_anonymous_auth(ip)
-        if vuln:
-            line = f"[CRITICAL] {ip} ALLOWS anonymous/null authentication\n{out}"
-            append_file(f_anon, line)
-            anon_vuln.append(ip)
-            stats["anon_vuln"] += 1
-            log_ok(f"  {ip} — ANONYMOUS AUTH VULNERABLE")
-        else:
-            log_info(f"  {ip} — anonymous auth not successful")
+    if confirm_step("STEP 3/5 — Anonymous / null authentication", f"ipmitool -I lanplus -H <ip> -U '' -P '' chassis status  (x{len(present_hosts)} host(s))"):
+        for ip in present_hosts:
+            log_info(f"Testing anonymous auth on {ip} ...")
+            out, vuln = check_anonymous_auth(ip)
+            if vuln:
+                line = f"[CRITICAL] {ip} ALLOWS anonymous/null authentication\n{out}"
+                append_file(f_anon, line)
+                anon_vuln.append(ip)
+                stats["anon_vuln"] += 1
+                log_ok(f"  {ip} — ANONYMOUS AUTH VULNERABLE")
+            else:
+                log_info(f"  {ip} — anonymous auth not successful")
 
     # ---- STEP 4 ----
     log_step("STEP 4/5 — RAKP hash capture")
-    for ip in present_hosts:
-        log_info(f"Attempting RAKP hash capture on {ip} ...")
-        hashes = capture_rakp_hash(ip, usernames)
-        if hashes:
-            for user, hline in hashes:
-                append_file(f_hashes, f"[CRITICAL] {ip} | user={user} | {hline}")
-                stats["hashes_captured"] += 1
-                log_ok(f"  {ip} — RAKP hash material for user={user}")
-        else:
-            log_info(f"  {ip} — no RAKP hash material captured")
+    if confirm_step("STEP 4/5 — RAKP hash capture", f"ipmitool -I lanplus -vvv (or ipmipwner) chassis status  (x{len(present_hosts)} host(s) x {len(usernames)} user(s))"):
+        for ip in present_hosts:
+            log_info(f"Attempting RAKP hash capture on {ip} ...")
+            hashes = capture_rakp_hash(ip, usernames)
+            if hashes:
+                for user, hline in hashes:
+                    append_file(f_hashes, f"[CRITICAL] {ip} | user={user} | {hline}")
+                    stats["hashes_captured"] += 1
+                    log_ok(f"  {ip} — RAKP hash material for user={user}")
+            else:
+                log_info(f"  {ip} — no RAKP hash material captured")
 
     # ---- STEP 5 ----
     log_step("STEP 5/5 — Default credentials")
-    for ip in present_hosts:
-        log_info(f"Testing default credentials on {ip} ...")
-        extra_user = usernames[0] if usernames else None
-        valid = check_default_creds(ip, extra_user=extra_user, extra_pass=password)
-        if valid:
-            for user, passwd in valid:
-                append_file(f_defcred, f"[CRITICAL] {ip} | {user}:{passwd}")
-                stats["default_creds"] += 1
+    if confirm_step("STEP 5/5 — Default credentials", f"ipmitool chassis status with {len(DEFAULT_CREDS)} default cred pair(s)  (x{len(present_hosts)} host(s))"):
+        for ip in present_hosts:
+            log_info(f"Testing default credentials on {ip} ...")
+            extra_user = usernames[0] if usernames else None
+            valid = check_default_creds(ip, extra_user=extra_user, extra_pass=password)
+            if valid:
+                for user, passwd in valid:
+                    append_file(f_defcred, f"[CRITICAL] {ip} | {user}:{passwd}")
+                    stats["default_creds"] += 1
 
     # ---- SUMMARY ----
     _write_summary(f_summary, stats, targets, cipher0_vuln, anon_vuln)

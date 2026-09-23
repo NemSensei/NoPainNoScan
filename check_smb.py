@@ -90,6 +90,26 @@ def tool_exists(name):
     return rc == 0
 
 
+AUTO_ACCEPT = False
+
+def confirm_step(step_name, detail=None):
+    """Ask the user to validate a step before launching its commands."""
+    global AUTO_ACCEPT
+    if AUTO_ACCEPT:
+        return True
+    print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
+    if detail:
+        print(f"    {C.CYAN}{detail}{C.ENDC}")
+    resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
+    if resp in ("a", "all"):
+        AUTO_ACCEPT = True
+        return True
+    if resp in ("y", "yes"):
+        return True
+    log_warn(f"Skipped by user: {step_name}")
+    return False
+
+
 def sort_ips(ips):
     """Sort IPs numerically, discard invalid entries."""
     valid = []
@@ -172,6 +192,12 @@ def step1_smb_info(hosts_file, out_dir):
 
     relay_file = out_dir / "smb_unsigned.txt"
 
+    if not confirm_step("STEP 1 — SMB Info + Signing Check", f"nxc smb '{hosts_file}' --gen-relay-list"):
+        write_file(relay_file, [])
+        write_file(out_dir / "smb_v1.txt", [])
+        (out_dir / "smb_hosts_info.txt").write_text("# Skipped by user request\n")
+        return unsigned_ips, smbv1_ips, host_rows
+
     # Single run: --gen-relay-list also prints full host info on stdout
     log_info("Running nxc smb (host details + relay list) ...")
     out, err, rc = run(f"nxc smb '{hosts_file}' --gen-relay-list '{relay_file}'", timeout=300)
@@ -221,6 +247,10 @@ def step2_null_session(hosts_file, out_dir):
     """Enumerate shares via null session."""
     log_step("STEP 2 — Null Session Share Listing")
 
+    if not confirm_step("STEP 2 — Null Session Share Listing", f"nxc smb '{hosts_file}' --shares -u '' -p ''"):
+        write_file(out_dir / "smb_shares_null.txt", [])
+        return []
+
     out, err, rc = run(f"nxc smb '{hosts_file}' --shares -u '' -p ''", timeout=300)
 
     shares = []
@@ -249,6 +279,11 @@ def step2_null_session(hosts_file, out_dir):
 def step3_auth_shares(hosts_file, out_dir, creds_args):
     """Enumerate shares with credentials, separate READ vs WRITE."""
     log_step("STEP 3 — Authenticated Share Enumeration")
+
+    if not confirm_step("STEP 3 — Authenticated Share Enumeration", f"nxc smb '{hosts_file}' {creds_args} --shares"):
+        write_file(out_dir / "smb_shares_read.txt", [])
+        write_file(out_dir / "smb_shares_write.txt", [])
+        return [], []
 
     out, err, rc = run(f"nxc smb '{hosts_file}' {creds_args} --shares", timeout=300)
 
@@ -286,6 +321,10 @@ def step4_sysvol(hosts_file, out_dir, creds_args):
     log_step("STEP 4 — SYSVOL/NETLOGON Browsing")
 
     sysvol_files = []
+
+    if not confirm_step("STEP 4 — SYSVOL/NETLOGON Browsing", f"nxc smb '{hosts_file}' {creds_args} -M spider_plus  +  --spider SYSVOL --pattern '.ps1,.vbs,.bat,.xml,.txt'"):
+        write_file(out_dir / "sysvol_files.txt", [])
+        return sysvol_files
 
     # Run spider_plus module on all hosts
     log_info("Running spider_plus module ...")

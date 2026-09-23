@@ -35,6 +35,25 @@ def tool_exists(name):
     out, _, rc = run(f"which {name}")
     return rc == 0
 
+AUTO_ACCEPT = False
+
+def confirm_step(step_name, detail=None):
+    """Ask the user to validate a step before launching its commands."""
+    global AUTO_ACCEPT
+    if AUTO_ACCEPT:
+        return True
+    print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
+    if detail:
+        print(f"    {C.CYAN}{detail}{C.ENDC}")
+    resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
+    if resp in ("a", "all"):
+        AUTO_ACCEPT = True
+        return True
+    if resp in ("y", "yes"):
+        return True
+    log_warn(f"Skipped by user: {step_name}")
+    return False
+
 def write_file(path: Path, content: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
@@ -85,6 +104,10 @@ def step_rootdse(hosts: list[str], outdir: Path) -> dict[str, str]:
     host_map: dict[str, str] = {}
     lines: list[str] = []
 
+    if not confirm_step("STEP 1 — rootDSE query", f"ldapsearch -x -H ldap://<ip> -b '' -s base  (x{len(hosts)} host(s))"):
+        write_file(outdir / "ldap_domain_info.txt", "# Skipped by user request\n")
+        return host_map
+
     for ip in hosts:
         log_info(f"Querying rootDSE for {ip} ...")
         base_dn = query_rootdse(ip)
@@ -117,6 +140,10 @@ def step_nullbind(host_map: dict[str, str], outdir: Path) -> list[str]:
     """Test null bind on all hosts. Returns list of vulnerable IPs."""
     log_step("STEP 2 — Null bind test (anonymous LDAP)")
     vulnerable: list[str] = []
+
+    if not confirm_step("STEP 2 — Null bind test", f"ldapsearch -x -H ldap://<ip> -D '' -w '' -b '<base_dn>'  (x{len(host_map)} host(s))"):
+        write_file(outdir / "ldap_nullbind.txt", "")
+        return vulnerable
 
     for ip, base_dn in host_map.items():
         log_info(f"Testing null bind on {ip} ...")
@@ -151,6 +178,9 @@ def step_nullbind_dump(vulnerable: list[str], host_map: dict[str, str], outdir: 
         return
     log_step("STEP 3 — Dumping AD objects via null bind")
 
+    if not confirm_step("STEP 3 — Dump AD objects via null bind", f"ldapsearch -x -H ldap://<ip> -b '<base_dn>' (objectClass=user|group|computer)  (x{len(vulnerable)} host(s))"):
+        return
+
     for ip in vulnerable:
         base_dn = host_map[ip]
         log_info(f"Dumping users from {ip} ...")
@@ -183,6 +213,9 @@ def step_auth_enum(hosts: list[str], user: str, password: str | None,
     targets = " ".join(hosts)
     cred = build_cred_part(user, password, nt_hash)
 
+    if not confirm_step("STEP 4 — Authenticated enumeration", f"nxc ldap {targets} -u {user} ... --users/--groups/--password-not-required/--trusted-for-delegation/--admin-count"):
+        return
+
     checks = [
         ("--users",                  "ldap_users.txt",       "Users"),
         ("--groups",                 "ldap_groups.txt",      "Groups"),
@@ -208,6 +241,8 @@ def step_auth_enum(hosts: list[str], user: str, password: str | None,
 def step_bloodhound(hosts: list[str], user: str, password: str | None,
                     nt_hash: str | None, domain: str, outdir: Path):
     log_step("STEP 5 — BloodHound collection")
+    if not confirm_step("STEP 5 — BloodHound collection", f"bloodhound-python -u {user} -d {domain} -ns {hosts[0]} -c All --zip"):
+        return
     bh_dir = outdir / "bloodhound"
     bh_dir.mkdir(parents=True, exist_ok=True)
 

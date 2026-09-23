@@ -55,6 +55,26 @@ def tool_exists(name):
     return rc == 0
 
 
+AUTO_ACCEPT = False
+
+def confirm_step(step_name, detail=None):
+    """Ask the user to validate a step before launching its commands."""
+    global AUTO_ACCEPT
+    if AUTO_ACCEPT:
+        return True
+    print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
+    if detail:
+        print(f"    {C.CYAN}{detail}{C.ENDC}")
+    resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
+    if resp in ("a", "all"):
+        AUTO_ACCEPT = True
+        return True
+    if resp in ("y", "yes"):
+        return True
+    log_warn(f"Skipped by user: {step_name}")
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Target parsing
 # ---------------------------------------------------------------------------
@@ -91,6 +111,10 @@ def write_hosts_file(ips, path):
 def step1_detect(hosts_file, port, out_dir):
     """WinRM detection + auth method check — no credentials required."""
     log_step("STEP 1 — WinRM Detection & Auth Methods")
+
+    if not confirm_step("STEP 1 — WinRM Detection & Auth Methods", f"nxc winrm {hosts_file}  +  curl WSMan header check on port {port}"):
+        (out_dir / "winrm_hosts_info.txt").write_text("# Skipped by user request\n")
+        return []
 
     results = []
 
@@ -161,6 +185,10 @@ def step2_auth(hosts_file, username, password, ntlm_hash, domain, out_dir):
     """Test provided credentials against WinRM."""
     log_step("STEP 2 — Authentication Test")
 
+    if not confirm_step("STEP 2 — Authentication Test", f"nxc winrm {hosts_file} -u {username} ..."):
+        (out_dir / "winrm_accessible.txt").write_text("# Skipped by user request\n")
+        return []
+
     cred_part = f"-u '{username}'"
     if ntlm_hash:
         cred_part += f" -H '{ntlm_hash}'"
@@ -198,6 +226,10 @@ def step2_auth(hosts_file, username, password, ntlm_hash, domain, out_dir):
 def step3_exec(hosts_file, username, password, ntlm_hash, domain, out_dir):
     """Execute commands on accessible WinRM hosts."""
     log_step("STEP 3 — Command Execution")
+
+    if not confirm_step("STEP 3 — Command Execution", f"nxc winrm {hosts_file} -u {username} ... -x 'whoami /all' / 'hostname' / 'ipconfig /all'"):
+        (out_dir / "winrm_cmd_results.txt").write_text("# Skipped by user request\n")
+        return
 
     cred_part = f"-u '{username}'"
     if ntlm_hash:

@@ -28,6 +28,26 @@ def tool_exists(name):
     return rc == 0
 
 
+AUTO_ACCEPT = False
+
+def confirm_step(step_name, detail=None):
+    """Ask the user to validate a step before launching its commands."""
+    global AUTO_ACCEPT
+    if AUTO_ACCEPT:
+        return True
+    print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
+    if detail:
+        print(f"    {C.CYAN}{detail}{C.ENDC}")
+    resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
+    if resp in ("a", "all"):
+        AUTO_ACCEPT = True
+        return True
+    if resp in ("y", "yes"):
+        return True
+    log_warn(f"Skipped by user: {step_name}")
+    return False
+
+
 DEFAULT_COMMUNITIES = [
     "public", "private", "community", "manager", "admin",
     "secret", "internal", "cisco", "router", "switch", "monitor", "default"
@@ -236,6 +256,11 @@ Examples:
 
     accessible = {}   # {ip: [community, ...]}
 
+    if not confirm_step("STEP 1 — Community string brute force", f"onesixtyone / snmpwalk with {len(communities)} community string(s)  (x{len(targets)} target(s))"):
+        (out_dir / "snmp_accessible.txt").write_text("# Skipped by user request\n")
+        log_info("STEP 1 skipped — nothing to enumerate. Done.")
+        sys.exit(0)
+
     if has_onesixtyone:
         accessible = brute_onesixtyone(targets, communities, args.version)
     else:
@@ -275,20 +300,25 @@ Examples:
 
     summary_entries = []
 
-    for ip in sorted(accessible):
-        community = accessible[ip][0]   # use first working community
-        log_info(f"Enumerating {ip} (community={community})...")
-        info = enumerate_host(ip, community, args.version, out_dir)
-        summary_entries.append(info)
+    if confirm_step("STEP 2 — System enumeration", f"snmpwalk against system/interfaces/processes/software/storage OIDs  (x{len(accessible)} accessible host(s))"):
+        for ip in sorted(accessible):
+            community = accessible[ip][0]   # use first working community
+            log_info(f"Enumerating {ip} (community={community})...")
+            info = enumerate_host(ip, community, args.version, out_dir)
+            summary_entries.append(info)
+    else:
+        for ip in sorted(accessible):
+            summary_entries.append({"ip": ip, "community": accessible[ip][0], "sysDescr": "", "sysName": ""})
 
     # ================================================================
     log_step("STEP 3 — Windows user/share enumeration")
     # ================================================================
 
-    for ip in sorted(accessible):
-        community = accessible[ip][0]
-        log_info(f"Checking Windows SNMP OIDs on {ip}...")
-        enumerate_windows(ip, community, args.version, out_dir)
+    if confirm_step("STEP 3 — Windows user/share enumeration", f"snmpwalk against Windows-specific OIDs (users/shares)  (x{len(accessible)} accessible host(s))"):
+        for ip in sorted(accessible):
+            community = accessible[ip][0]
+            log_info(f"Checking Windows SNMP OIDs on {ip}...")
+            enumerate_windows(ip, community, args.version, out_dir)
 
     # ================================================================
     # Summary file

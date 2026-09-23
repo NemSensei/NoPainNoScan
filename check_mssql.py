@@ -30,6 +30,26 @@ def run(cmd, timeout=120):
         return "", "TIMEOUT", 1
 
 
+AUTO_ACCEPT = False
+
+def confirm_step(step_name, detail=None):
+    """Ask the user to validate a step before launching its commands."""
+    global AUTO_ACCEPT
+    if AUTO_ACCEPT:
+        return True
+    print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
+    if detail:
+        print(f"    {C.CYAN}{detail}{C.ENDC}")
+    resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
+    if resp in ("a", "all"):
+        AUTO_ACCEPT = True
+        return True
+    if resp in ("y", "yes"):
+        return True
+    log_warn(f"Skipped by user: {step_name}")
+    return False
+
+
 def resolve_targets(target_arg):
     """Return (hosts_file_path, list_of_hosts).
     Accepts: path to existing file, single IP, or CIDR range.
@@ -65,6 +85,10 @@ def step_hosts_info(hosts_file: str, out_dir: Path) -> list:
     log_step("STEP 1 — MSSQL version and instance info")
     out_file = out_dir / "mssql_hosts_info.txt"
 
+    if not confirm_step("STEP 1 — MSSQL version/instance info", f"nxc mssql {hosts_file}"):
+        out_file.write_text("# Skipped by user request\n")
+        return []
+
     stdout, _, _ = run(f"nxc mssql {hosts_file} 2>/dev/null", timeout=180)
     lines = [l for l in stdout.splitlines() if l.strip()]
 
@@ -86,6 +110,10 @@ def step_default_creds(hosts_file: str, out_dir: Path) -> list:
     """Test default SA credentials; return list of (ip, user, pass, raw_line) hits."""
     log_step("STEP 2 — Default credential testing")
     successes = []
+
+    if not confirm_step("STEP 2 — Default credential testing", f"nxc mssql {hosts_file} -u sa -p ***  ({len(DEFAULT_CREDS)} default cred pair(s))"):
+        (out_dir / "mssql_default_creds.txt").write_text("# Skipped by user request\n")
+        return successes
 
     for user, pwd in DEFAULT_CREDS:
         display_pwd = pwd or "<empty>"
@@ -132,6 +160,11 @@ def step_authenticated(hosts_file: str, out_dir: Path,
                        default_hits: list):
     """Perform authenticated MSSQL checks using explicit creds or first default hit."""
     log_step("STEP 3 — Authenticated checks")
+
+    if not confirm_step("STEP 3 — Authenticated checks", "nxc mssql queries: version/sysadmin, database list, xp_cmdshell 'whoami', linked servers"):
+        for fname in ("mssql_accessible.txt", "mssql_cmdexec.txt", "mssql_linked_servers.txt"):
+            (out_dir / fname).write_text("# Skipped by user request\n")
+        return
 
     # Prefer explicit creds; fall back to first successful default hit
     if username:

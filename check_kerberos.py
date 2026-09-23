@@ -61,6 +61,26 @@ def tool_exists(name: str) -> bool:
     return shutil.which(name) is not None
 
 
+AUTO_ACCEPT = False
+
+def confirm_step(step_name, detail=None):
+    """Ask the user to validate a step before launching its commands."""
+    global AUTO_ACCEPT
+    if AUTO_ACCEPT:
+        return True
+    print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
+    if detail:
+        print(f"    {C.CYAN}{detail}{C.ENDC}")
+    resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
+    if resp in ("a", "all"):
+        AUTO_ACCEPT = True
+        return True
+    if resp in ("y", "yes"):
+        return True
+    log_warn(f"Skipped by user: {step_name}")
+    return False
+
+
 def write_list(path: Path, items):
     """Write a sorted, deduplicated list to a file."""
     unique = sorted(set(i.strip() for i in items if i.strip()))
@@ -104,7 +124,7 @@ def step1_domain_detection(hosts: list[str], out: Path, domain: str | None) -> s
         return None
 
     dc_ip = hosts[0]
-    if tool_exists("nxc"):
+    if tool_exists("nxc") and confirm_step("STEP 1 — Domain detection", f"nxc smb {dc_ip}"):
         stdout, _, _ = run(f"nxc smb {dc_ip} 2>/dev/null", timeout=30)
         m = re.search(r'domain:([^\s\)]+)', stdout, re.IGNORECASE)
         if m:
@@ -137,6 +157,9 @@ def step2_user_enum(hosts: list[str], out: Path, domain: str | None, wordlist: s
 
     dc_ip = hosts[0]
     valid_file = out / "kerberos_valid_users.txt"
+
+    if not confirm_step("STEP 2 — User enumeration", f"kerbrute userenum --dc {dc_ip} -d {domain} <wordlist>  (or GetNPUsers.py fallback)"):
+        return
 
     if tool_exists("kerbrute"):
         log_info(f"Running kerbrute userenum against {dc_ip}")
@@ -188,6 +211,9 @@ def step3_asrep_roast(hosts: list[str], out: Path, domain: str | None,
 
     dc_ip = hosts[0]
     hash_file = out / "kerberos_asrep_hashes.txt"
+
+    if not confirm_step("STEP 3 — AS-REP Roasting", f"nxc ldap {dc_ip} --asreproast  (or GetNPUsers.py -no-pass fallback)"):
+        return
 
     # With credentials → use nxc ldap --asreproast
     if (username and (password is not None or hash_)) and tool_exists("nxc"):
@@ -251,6 +277,9 @@ def step4_kerberoast(hosts: list[str], out: Path, domain: str | None,
 
     dc_ip = hosts[0]
     spn_file = out / "kerberos_spn_hashes.txt"
+
+    if not confirm_step("STEP 4 — Kerberoasting", f"nxc ldap {dc_ip} --kerberoasting  (or GetUserSPNs.py -request fallback)"):
+        return
 
     # Prefer nxc ldap
     if tool_exists("nxc"):
