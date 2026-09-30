@@ -1,0 +1,15 @@
+# Runtime SQLite database
+data/*.db
+data/*.db-journal
+data/*.db-wal
+
+# Per-run output workspaces (created under data/ by config.new_run_dir)
+data/*/
+
+# Keep the data directory tracked
+!data/.gitkeep
+
+# Local virtualenvs
+.venv/
+venv/
+__pycache__/

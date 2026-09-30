@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}NoPainNoScan &mdash; Checks{% endblock %}
+
+{% block head %}
+<style>
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px;
+  }
+  .card h3 { margin: 0 0 4px; font-size: 15px; }
+  .card .desc { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 6px; }
+  .badge {
+    font-size: 11px; padding: 2px 8px; border-radius: 12px;
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  .badge.creds { color: #7bd88f; border-color: #2f5a3a; }
+  .badge.root  { color: var(--crit); border-color: #5a2f2f; }
+  .badge.tool  { color: var(--accent); border-color: #2f4a5a; }
+  .count { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+</style>
+{% endblock %}
+
+{% block content %}
+  <p class="count">
+    {{ checks|length }} checks registered &middot;
+    <a href="/api/checks">/api/checks (JSON)</a> &middot;
+    <a href="/api/health">/api/health</a>
+  </p>
+
+  <div class="grid">
+    {% for c in checks %}
+    <div class="card">
+      <h3>{{ c.label }} <span style="color:var(--muted);font-weight:normal">[{{ c.id }}]</span></h3>
+      <div class="desc">{{ c.description }}</div>
+      <div class="badges">
+        <span class="badge">{{ c.script }}</span>
+        {% if c.supports_creds %}<span class="badge creds">creds</span>{% endif %}
+        {% if c.needs_root %}<span class="badge root">root</span>{% endif %}
+        {% for t in c.required_tools %}<span class="badge tool">{{ t }}</span>{% endfor %}
+        {% for t in c.optional_tools %}<span class="badge">{{ t }}?</span>{% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+{% endblock %}
