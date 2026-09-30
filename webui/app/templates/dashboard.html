@@ -1,0 +1,189 @@
+{% extends "base.html" %}
+{% block title %}NoPainNoScan &mdash; Dashboard{% endblock %}
+{% block nav_dash %}active{% endblock %}
+
+{% block content %}
+<div x-data="dashboard()" x-init="init()">
+
+  <template x-if="!campaignId">
+    <div class="notice err">No campaign selected. <a href="/">Choose one</a> or open a campaign's dashboard.</div>
+  </template>
+
+  <template x-if="campaignId">
+    <div>
+      <div class="toolbar">
+        <h2 style="margin:0" x-text="title"></h2>
+        <span class="pill" :class="data && data.scanned ? 'done' : 'queued'"
+              x-text="data && data.scanned ? 'has results' : 'no output yet'"></span>
+        <span class="spacer" style="flex:1"></span>
+        <button class="secondary" @click="load()">Refresh</button>
+        <a class="btn secondary" href="/history">History</a>
+      </div>
+
+      <template x-if="err"><div class="notice err" x-text="err"></div></template>
+
+      <!-- Summary cards ------------------------------------------------- -->
+      <div class="panel" x-show="data" x-cloak>
+        <h3>Severity totals</h3>
+        <div class="stats">
+          <template x-for="s in sevKeys" :key="s">
+            <div class="stat" :class="s">
+              <div class="n" x-text="data.totals[s] ?? 0"></div>
+              <div class="k" x-text="s"></div>
+            </div>
+          </template>
+          <div class="stat">
+            <div class="n" x-text="data.totals.total ?? 0"></div>
+            <div class="k">total</div>
+          </div>
+        </div>
+
+        <div class="row mt">
+          <div class="col">
+            <h3>Hosts alive <span class="muted small" x-text="'('+(data.hosts_alive_count||0)+')'"></span></h3>
+            <template x-if="!data.hosts_alive.length"><div class="muted small">none discovered</div></template>
+            <div>
+              <template x-for="h in data.hosts_alive" :key="h">
+                <span class="host-chip" x-text="h"></span>
+              </template>
+            </div>
+          </div>
+          <div class="col">
+            <h3>Top ports</h3>
+            <template x-if="!data.top_ports.length"><div class="muted small">none</div></template>
+            <table x-show="data.top_ports.length">
+              <thead><tr><th class="nosort">Port</th><th class="nosort">Hosts</th></tr></thead>
+              <tbody>
+                <template x-for="p in data.top_ports" :key="p[0]">
+                  <tr><td class="mono" x-text="p[0]"></td><td x-text="p[1]"></td></tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Per-service rollup -------------------------------------------- -->
+      <div class="panel" x-show="data && Object.keys(data.services).length" x-cloak>
+        <h3>Services</h3>
+        <table>
+          <thead><tr>
+            <th class="nosort">Service</th><th class="nosort">Runs</th>
+            <template x-for="s in sevKeys" :key="'h'+s"><th class="nosort" x-text="s.slice(0,4)"></th></template>
+            <th class="nosort">Total</th>
+          </tr></thead>
+          <tbody>
+            <template x-for="[sid, sv] in Object.entries(data.services)" :key="sid">
+              <tr>
+                <td><span class="link" @click="filterService=sid" x-text="sv.label"></span> <span class="muted small" x-text="'['+sid+']'"></span></td>
+                <td x-text="sv.run_ids.length"></td>
+                <template x-for="s in sevKeys" :key="'c'+sid+s"><td x-text="sv.counts[s] ?? 0"></td></template>
+                <td x-text="sv.counts.total ?? 0"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Findings ------------------------------------------------------ -->
+      <div class="panel" x-show="data" x-cloak>
+        <div class="toolbar">
+          <h3 style="margin:0">Findings</h3>
+          <span class="spacer" style="flex:1"></span>
+          <select x-model="filterSeverity">
+            <option value="">all severities</option>
+            <template x-for="s in sevKeys" :key="'fs'+s"><option :value="s" x-text="s"></option></template>
+          </select>
+          <select x-model="filterService">
+            <option value="">all services</option>
+            <template x-for="sid in serviceIds" :key="'fv'+sid"><option :value="sid" x-text="sid"></option></template>
+          </select>
+        </div>
+
+        <template x-if="filtered.length === 0"><div class="muted small">No findings match.</div></template>
+        <table x-show="filtered.length">
+          <thead><tr>
+            <th @click="sortBy('severity')">Severity <span x-text="arrow('severity')"></span></th>
+            <th @click="sortBy('service')">Service <span x-text="arrow('service')"></span></th>
+            <th @click="sortBy('title')">Finding <span x-text="arrow('title')"></span></th>
+            <th @click="sortBy('count')">Hosts <span x-text="arrow('count')"></span></th>
+            <th class="nosort">Affected</th>
+          </tr></thead>
+          <tbody>
+            <template x-for="(f, i) in filtered" :key="i">
+              <tr>
+                <td><span class="sev" :class="f.severity" x-text="f.severity"></span></td>
+                <td class="mono small" x-text="f.service"></td>
+                <td>
+                  <div x-text="f.title"></div>
+                  <template x-if="f.detail"><div class="muted small" x-text="f.detail"></div></template>
+                </td>
+                <td x-text="f.count"></td>
+                <td class="hosts">
+                  <template x-for="h in (f.hosts||[]).slice(0, 12)" :key="h">
+                    <span class="host-chip" x-text="h"></span>
+                  </template>
+                  <template x-if="(f.hosts||[]).length > 12">
+                    <span class="muted small" x-text="'+' + (f.hosts.length - 12) + ' more'"></span>
+                  </template>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </template>
+</div>
+
+<script>
+function dashboard() {
+  return {
+    campaignId: null, title: '', data: null, err: '',
+    sevKeys: ['critical', 'high', 'medium', 'low', 'info'],
+    filterSeverity: '', filterService: '',
+    sortKey: 'severity', sortDir: 1,
+    _sevRank: { critical: 0, high: 1, medium: 2, low: 3, info: 4 },
+
+    init() {
+      const u = new URLSearchParams(location.search);
+      const q = u.get('campaign');
+      this.campaignId = q ? Number(q) : (this.$store.campaign.id || null);
+      if (q) {
+        // keep the store in sync when arriving via a deep link
+        this.$store.campaign.set(this.campaignId, this.$store.campaign.name);
+      }
+      if (this.campaignId) this.load();
+    },
+    async load() {
+      this.err = '';
+      try {
+        const r = await fetch('/api/campaigns/' + this.campaignId + '/results');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        this.data = await r.json();
+        const c = this.data.campaign;
+        this.title = (c && c.name ? c.name : 'Campaign') + ' #' + this.campaignId;
+      } catch (e) { this.err = 'Failed to load results: ' + e; }
+    },
+    get serviceIds() { return this.data ? Object.keys(this.data.services) : []; },
+    get filtered() {
+      if (!this.data) return [];
+      let out = this.data.findings.slice();
+      if (this.filterSeverity) out = out.filter(f => f.severity === this.filterSeverity);
+      if (this.filterService) out = out.filter(f => f.service === this.filterService);
+      const k = this.sortKey, d = this.sortDir;
+      out.sort((a, b) => {
+        let av, bv;
+        if (k === 'severity') { av = this._sevRank[a.severity] ?? 9; bv = this._sevRank[b.severity] ?? 9; }
+        else if (k === 'count') { av = a.count || 0; bv = b.count || 0; }
+        else { av = (a[k] || '').toString().toLowerCase(); bv = (b[k] || '').toString().toLowerCase(); }
+        return av < bv ? -1 * d : av > bv ? 1 * d : 0;
+      });
+      return out;
+    },
+    sortBy(k) { if (this.sortKey === k) this.sortDir *= -1; else { this.sortKey = k; this.sortDir = 1; } },
+    arrow(k) { return this.sortKey === k ? (this.sortDir === 1 ? '▲' : '▼') : ''; },
+  };
+}
+</script>
+{% endblock %}

@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% block title %}NoPainNoScan &mdash; Run #{{ run_id }}{% endblock %}
+{% block nav_hist %}active{% endblock %}
+
+{% block content %}
+<div x-data="runView({{ run_id }})" x-init="init()">
+
+  <div class="toolbar">
+    <h2 style="margin:0" x-text="'Run #' + runId"></h2>
+    <span class="pill" :class="status" x-text="status"></span>
+    <template x-if="meta && meta.check_id"><span class="badge tool" x-text="meta.check_id"></span></template>
+    <template x-if="meta && meta.target"><span class="badge mono" x-text="meta.target"></span></template>
+    <span class="spacer" style="flex:1"></span>
+    <button class="danger" @click="cancel()" :disabled="!isActive" x-show="isActive" x-cloak>Cancel</button>
+    <button class="secondary" @click="loadResults()">Refresh</button>
+    <template x-if="meta && meta.campaign_id">
+      <a class="btn secondary" :href="'/dashboard?campaign='+meta.campaign_id">Campaign dashboard</a>
+    </template>
+  </div>
+
+  <template x-if="err"><div class="notice err" x-text="err"></div></template>
+
+  <div class="row">
+    <!-- Results ----------------------------------------------------------- -->
+    <div class="col">
+      <div class="panel">
+        <h3>Findings <span class="muted small" x-text="meta ? '('+(meta.counts.total||0)+')' : ''"></span></h3>
+        <div class="stats mb" x-show="meta" x-cloak>
+          <template x-for="s in sevKeys" :key="s">
+            <div class="stat" :class="s"><div class="n" x-text="meta.counts[s] ?? 0"></div><div class="k" x-text="s"></div></div>
+          </template>
+        </div>
+        <template x-if="meta && !meta.scanned"><div class="notice info">No parsed output for this run yet.</div></template>
+        <table x-show="meta && meta.findings.length" x-cloak>
+          <thead><tr><th class="nosort">Sev</th><th class="nosort">Finding</th><th class="nosort">Hosts</th></tr></thead>
+          <tbody>
+            <template x-for="(f, i) in (meta ? meta.findings : [])" :key="i">
+              <tr>
+                <td><span class="sev" :class="f.severity" x-text="f.severity"></span></td>
+                <td>
+                  <div x-text="f.title"></div>
+                  <template x-if="f.detail"><div class="muted small" x-text="f.detail"></div></template>
+                </td>
+                <td class="hosts">
+                  <template x-for="h in (f.hosts||[]).slice(0,12)" :key="h"><span class="host-chip" x-text="h"></span></template>
+                  <template x-if="(f.hosts||[]).length>12"><span class="muted small" x-text="'+'+(f.hosts.length-12)"></span></template>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Log stream -------------------------------------------------------- -->
+    <div class="col">
+      <div class="panel">
+        <div class="toolbar" style="margin-bottom:8px">
+          <h3 style="margin:0">Output log</h3>
+          <span class="spacer" style="flex:1"></span>
+          <span class="muted small" x-text="logs.length + ' lines'"></span>
+          <button class="secondary" @click="openStream()" x-show="!streaming">Reconnect</button>
+        </div>
+        <div class="logbox" x-ref="logbox">
+          <template x-for="(l, i) in logs" :key="i"><div class="ln" :class="{meta:l.meta}" x-text="l.text"></div></template>
+        </div>
+        <template x-if="endInfo">
+          <div class="notice" :class="endInfo.status === 'done' ? 'ok' : 'err'">
+            <span x-text="'Finished: ' + endInfo.status"></span>
+            <template x-if="endInfo.exit_code !== null && endInfo.exit_code !== undefined"><span x-text="' (exit '+endInfo.exit_code+')'"></span></template>
+            <template x-if="endInfo.error"><span x-text="' — '+endInfo.error"></span></template>
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function runView(runId) {
+  return {
+    runId, status: '...', meta: null, err: '',
+    logs: [], endInfo: null, es: null, streaming: false,
+    sevKeys: ['critical', 'high', 'medium', 'low', 'info'],
+    get isActive() { return ['running', 'queued'].includes(this.status); },
+
+    async init() { await this.loadStatus(); await this.loadResults(); this.openStream(); },
+    async loadStatus() {
+      try { const r = await fetch('/api/runs/' + this.runId); if (r.ok) { const j = await r.json(); this.status = j.status || '?'; } }
+      catch (e) {}
+    },
+    async loadResults() {
+      this.err = '';
+      try {
+        const r = await fetch('/api/runs/' + this.runId + '/results');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        this.meta = await r.json();
+        if (this.meta.status) this.status = this.meta.status;
+      } catch (e) { this.err = 'Failed to load results: ' + e; }
+    },
+    openStream() {
+      this.closeStream(); this.logs = []; this.endInfo = null; this.streaming = true;
+      const es = new EventSource('/api/runs/' + this.runId + '/stream');
+      this.es = es;
+      es.addEventListener('status', (ev) => { try { this.status = JSON.parse(ev.data).status; } catch (e) {} });
+      es.addEventListener('log', (ev) => {
+        try {
+          const line = JSON.parse(ev.data).line;
+          const meta = /^\s*\[[*+!\-]\]|^===|^---/.test(line);
+          this.logs.push({ text: line, meta });
+          this.$nextTick(() => { const b = this.$refs.logbox; if (b) b.scrollTop = b.scrollHeight; });
+        } catch (e) {}
+      });
+      es.addEventListener('end', (ev) => {
+        try { this.endInfo = JSON.parse(ev.data); this.status = this.endInfo.status || this.status; } catch (e) {}
+        this.closeStream(); this.loadResults();
+      });
+      es.addEventListener('error', () => { this.streaming = false; });
+    },
+    closeStream() { this.streaming = false; if (this.es) { this.es.close(); this.es = null; } },
+    async cancel() { try { await fetch('/api/runs/' + this.runId + '/cancel', { method: 'POST' }); } catch (e) {} },
+  };
+}
+</script>
+{% endblock %}

@@ -50,12 +50,50 @@ def _startup() -> None:
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
-    """Render the index page listing every registered check."""
+    """Render the home page (campaigns workspace).
+
+    The template loads campaigns client-side via /api/campaigns; the ``checks``
+    context is retained for backwards compatibility and simply ignored there.
+    """
     return templates.TemplateResponse(
         request,
         "index.html",
         {"checks": list_checks()},
     )
+
+
+# >>> agent4 routes
+# HTML page routes for the front-end (Agent 4). These only render templates;
+# all dynamic data is fetched client-side from the JSON/SSE APIs of Agents 2/3.
+@app.get("/scan", response_class=HTMLResponse)
+def page_scan(request: Request) -> HTMLResponse:
+    """Dynamic scan-launch form + live SSE progress."""
+    return templates.TemplateResponse(request, "scan.html", {})
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def page_dashboard(request: Request) -> HTMLResponse:
+    """Campaign results dashboard (reads /api/campaigns/{id}/results)."""
+    return templates.TemplateResponse(request, "dashboard.html", {})
+
+
+@app.get("/history", response_class=HTMLResponse)
+def page_history(request: Request) -> HTMLResponse:
+    """Run history + simple comparison for the active campaign."""
+    return templates.TemplateResponse(request, "history.html", {})
+
+
+@app.get("/runs/{run_id}", response_class=HTMLResponse)
+def page_run(request: Request, run_id: int) -> HTMLResponse:
+    """Single-run view: parsed findings + streamed output log."""
+    return templates.TemplateResponse(request, "run.html", {"run_id": run_id})
+
+
+@app.get("/checks", response_class=HTMLResponse)
+def page_checks(request: Request) -> HTMLResponse:
+    """Reference grid of every registered check."""
+    return templates.TemplateResponse(request, "checks.html", {"checks": list_checks()})
+# <<< agent4 routes
 
 
 @app.get("/api/health")

@@ -1,0 +1,241 @@
+{% extends "base.html" %}
+{% block title %}NoPainNoScan &mdash; New scan{% endblock %}
+{% block nav_scan %}active{% endblock %}
+
+{% block content %}
+<div x-data="scanPage()" x-init="init()">
+
+  <template x-if="!$store.campaign.id">
+    <div class="notice err">
+      No active campaign selected. <a href="/">Pick or create one</a> before launching a scan.
+    </div>
+  </template>
+
+  <div class="row">
+    <!-- Launch form ------------------------------------------------------- -->
+    <div class="col" style="max-width:460px">
+      <div class="panel">
+        <h2>Launch a scan</h2>
+        <div class="muted small mb" x-show="$store.campaign.id" x-cloak>
+          into campaign <b x-text="$store.campaign.name"></b> <span x-text="'#'+$store.campaign.id"></span>
+        </div>
+
+        <label for="check-sel">Check</label>
+        <select id="check-sel" x-model="selectedId" @change="onSelect()">
+          <option value="">-- choose a check --</option>
+          <template x-for="c in checks" :key="c.id">
+            <option :value="c.id" x-text="c.label + ' [' + c.id + ']'"></option>
+          </template>
+        </select>
+
+        <template x-if="current">
+          <div>
+            <div class="field-help mt" x-text="current.description"></div>
+            <div class="badges mt">
+              <span class="badge" x-text="current.script"></span>
+              <template x-if="current.supports_creds"><span class="badge creds">creds</span></template>
+              <template x-if="current.needs_root"><span class="badge root">needs root</span></template>
+              <template x-for="t in current.required_tools" :key="t"><span class="badge tool" x-text="t"></span></template>
+              <template x-for="t in current.optional_tools" :key="'o'+t"><span class="badge" x-text="t + '?'"></span></template>
+            </div>
+
+            <form class="mt" @submit.prevent="launch()">
+              <label for="f-target">Target * <span class="field-help" style="display:inline" x-text="targetHelp"></span></label>
+              <input id="f-target" type="text" x-model="target" required placeholder="10.0.0.0/24, 10.0.0.5 or hosts file">
+
+              <!-- Dynamic args (target & output excluded; output is server-injected) -->
+              <template x-for="a in formArgs" :key="a.dest">
+                <div>
+                  <!-- bool -> checkbox -->
+                  <template x-if="a.type === 'bool'">
+                    <div class="checkbox-row">
+                      <input type="checkbox" :id="'a-'+a.dest" x-model="params[a.dest]">
+                      <label :for="'a-'+a.dest" x-text="a.name + (a.help ? ' — ' + a.help : '')"></label>
+                    </div>
+                  </template>
+                  <!-- int -->
+                  <template x-if="a.type === 'int'">
+                    <div>
+                      <label :for="'a-'+a.dest" x-text="fieldLabel(a)"></label>
+                      <input type="number" :id="'a-'+a.dest" x-model.number="params[a.dest]" :placeholder="a.default ?? ''">
+                      <div class="field-help" x-text="a.help"></div>
+                    </div>
+                  </template>
+                  <!-- str / list -->
+                  <template x-if="a.type === 'str' || a.type === 'list'">
+                    <div>
+                      <label :for="'a-'+a.dest" x-text="fieldLabel(a)"></label>
+                      <input :type="isSecret(a) ? 'password' : 'text'" :id="'a-'+a.dest"
+                             x-model="params[a.dest]"
+                             :placeholder="a.type === 'list' ? 'comma/space separated' : (a.default ?? '')">
+                      <div class="field-help" x-text="a.help + (a.type==='list' ? ' (list)' : '')"></div>
+                    </div>
+                  </template>
+                </div>
+              </template>
+
+              <div class="mt">
+                <button type="submit" :disabled="!target || !$store.campaign.id || launching">Run scan</button>
+              </div>
+            </form>
+          </div>
+        </template>
+        <template x-if="err"><div class="notice err" x-text="err"></div></template>
+      </div>
+    </div>
+
+    <!-- Live progress ----------------------------------------------------- -->
+    <div class="col">
+      <div class="panel">
+        <div class="toolbar" style="margin-bottom:8px">
+          <h2 style="margin:0">Live progress</h2>
+          <span class="spacer" style="flex:1"></span>
+          <template x-if="runId">
+            <span>run <b x-text="'#'+runId"></b> <span class="pill" :class="status" x-text="status"></span></span>
+          </template>
+        </div>
+
+        <template x-if="!runId">
+          <div class="notice info">Launch a scan to stream its output here in real time.</div>
+        </template>
+
+        <template x-if="runId">
+          <div>
+            <div class="toolbar">
+              <button class="danger" @click="cancel()" :disabled="!isActive">Cancel</button>
+              <a class="btn secondary" :href="'/runs/'+runId" x-show="isTerminal" x-cloak>View results</a>
+              <span class="muted small" x-text="logs.length + ' lines'"></span>
+            </div>
+            <div class="logbox" x-ref="logbox">
+              <template x-for="(l, i) in logs" :key="i">
+                <div class="ln" :class="{meta: l.meta}" x-text="l.text"></div>
+              </template>
+            </div>
+            <template x-if="endInfo">
+              <div class="notice" :class="endInfo.status === 'done' ? 'ok' : 'err'">
+                <span x-text="'Finished: ' + endInfo.status"></span>
+                <template x-if="endInfo.exit_code !== null && endInfo.exit_code !== undefined">
+                  <span x-text="' (exit ' + endInfo.exit_code + ')'"></span>
+                </template>
+                <template x-if="endInfo.error"><span x-text="' — ' + endInfo.error"></span></template>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function scanPage() {
+  return {
+    checks: [], selectedId: '', current: null,
+    target: '', params: {}, formArgs: [], targetHelp: '',
+    err: '', launching: false,
+    runId: null, status: '', logs: [], endInfo: null, es: null,
+
+    get isActive() { return ['running', 'queued'].includes(this.status); },
+    get isTerminal() { return ['done', 'failed', 'cancelled'].includes(this.status); },
+
+    async init() {
+      try {
+        const r = await fetch('/api/checks');
+        this.checks = await r.json();
+      } catch (e) { this.err = 'Failed to load checks: ' + e; }
+    },
+    onSelect() {
+      this.err = '';
+      this.current = this.checks.find(c => c.id === this.selectedId) || null;
+      this.params = {};
+      this.formArgs = [];
+      if (!this.current) return;
+      const t = (this.current.arguments || []).find(a => a.dest === 'target');
+      this.targetHelp = t ? t.help : '';
+      for (const a of this.current.arguments || []) {
+        if (a.dest === 'target' || a.dest === 'output') continue;
+        this.formArgs.push(a);
+        // seed defaults so the payload matches the backend contract
+        if (a.type === 'bool') this.params[a.dest] = a.default === true;
+        else if (a.default !== null && a.default !== undefined) this.params[a.dest] = a.default;
+        else this.params[a.dest] = '';
+      }
+    },
+    fieldLabel(a) { return a.name + (a.required ? ' *' : '') + (a.short ? ' (' + a.short + ')' : ''); },
+    isSecret(a) { return a.dest === 'password' || a.dest === 'hash'; },
+
+    buildParams() {
+      const out = {};
+      for (const a of this.formArgs) {
+        let v = this.params[a.dest];
+        if (a.type === 'bool') { out[a.dest] = !!v; continue; }
+        if (v === '' || v === null || v === undefined) continue;
+        if (a.type === 'int') { const n = Number(v); if (!Number.isNaN(n)) out[a.dest] = n; continue; }
+        if (a.type === 'list') { out[a.dest] = String(v).split(/[\s,]+/).filter(Boolean); continue; }
+        out[a.dest] = v;
+      }
+      return out;
+    },
+
+    async launch() {
+      if (!this.$store.campaign.id) { this.err = 'Select an active campaign first.'; return; }
+      this.launching = true; this.err = '';
+      this.closeStream();
+      this.logs = []; this.endInfo = null; this.status = 'queued'; this.runId = null;
+      try {
+        const body = {
+          campaign_id: this.$store.campaign.id,
+          check_id: this.selectedId,
+          target: this.target,
+          params: this.buildParams(),
+        };
+        const r = await fetch('/api/runs', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (!r.ok) {
+          let d = 'HTTP ' + r.status;
+          try { const j = await r.json(); if (j.detail) d = j.detail; } catch (e) {}
+          throw new Error(d);
+        }
+        const { run_id, status } = await r.json();
+        this.runId = run_id; this.status = status || 'running';
+        this.openStream(run_id);
+      } catch (e) { this.err = 'Launch failed: ' + e; this.status = ''; }
+      finally { this.launching = false; }
+    },
+
+    openStream(id) {
+      const es = new EventSource('/api/runs/' + id + '/stream');
+      this.es = es;
+      es.addEventListener('status', (ev) => {
+        try { this.status = JSON.parse(ev.data).status; } catch (e) {}
+      });
+      es.addEventListener('log', (ev) => {
+        try {
+          const line = JSON.parse(ev.data).line;
+          const meta = /^\s*\[[*+!\-]\]|^===|^---/.test(line);
+          this.logs.push({ text: line, meta });
+          this.$nextTick(() => { const b = this.$refs.logbox; if (b) b.scrollTop = b.scrollHeight; });
+        } catch (e) {}
+      });
+      es.addEventListener('end', (ev) => {
+        try { this.endInfo = JSON.parse(ev.data); this.status = this.endInfo.status || this.status; } catch (e) {}
+        this.closeStream();
+      });
+      es.addEventListener('error', () => {
+        // network hiccup or terminal run; if not terminal keep the pill as-is
+        if (this.isTerminal) this.closeStream();
+      });
+    },
+    closeStream() { if (this.es) { this.es.close(); this.es = null; } },
+
+    async cancel() {
+      if (!this.runId) return;
+      try { await fetch('/api/runs/' + this.runId + '/cancel', { method: 'POST' }); }
+      catch (e) { this.err = 'Cancel failed: ' + e; }
+    },
+  };
+}
+</script>
+{% endblock %}

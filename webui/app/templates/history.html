@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}NoPainNoScan &mdash; History{% endblock %}
+{% block nav_hist %}active{% endblock %}
+
+{% block content %}
+<div x-data="history()" x-init="init()">
+
+  <template x-if="!campaignId">
+    <div class="notice err">No campaign selected. <a href="/">Choose one</a> first.</div>
+  </template>
+
+  <template x-if="campaignId">
+    <div>
+      <div class="toolbar">
+        <h2 style="margin:0" x-text="title"></h2>
+        <span class="spacer" style="flex:1"></span>
+        <button class="secondary" @click="load()">Refresh</button>
+        <a class="btn secondary" :href="'/dashboard?campaign='+campaignId">Dashboard</a>
+      </div>
+
+      <template x-if="err"><div class="notice err" x-text="err"></div></template>
+
+      <div class="panel">
+        <div class="toolbar">
+          <h3 style="margin:0">Runs <span class="muted small" x-text="'('+runs.length+')'"></span></h3>
+          <span class="spacer" style="flex:1"></span>
+          <span class="muted small">tick runs to compare their counters</span>
+        </div>
+        <template x-if="runs.length === 0"><div class="notice info">No runs in this campaign yet.</div></template>
+        <table x-show="runs.length">
+          <thead><tr>
+            <th class="nosort"></th>
+            <th class="nosort">Run</th><th class="nosort">Check</th><th class="nosort">Status</th>
+            <template x-for="s in sevKeys" :key="'h'+s"><th class="nosort" x-text="s.slice(0,4)"></th></template>
+            <th class="nosort">Total</th><th class="nosort"></th>
+          </tr></thead>
+          <tbody>
+            <template x-for="r in runs" :key="r.run_id">
+              <tr>
+                <td><input type="checkbox" style="width:auto" :value="r.run_id" x-model.number="compareIds"></td>
+                <td class="mono" x-text="'#'+r.run_id"></td>
+                <td x-text="r.check_id"></td>
+                <td><span class="pill" :class="r.status" x-text="r.status"></span></td>
+                <template x-for="s in sevKeys" :key="'c'+r.run_id+s"><td x-text="r.counts[s] ?? 0"></td></template>
+                <td x-text="r.counts.total ?? 0"></td>
+                <td><a class="link" :href="'/runs/'+r.run_id">view</a></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Simple side-by-side comparison --------------------------------- -->
+      <div class="panel" x-show="compareIds.length >= 2" x-cloak>
+        <h3>Comparison</h3>
+        <table>
+          <thead><tr>
+            <th class="nosort">Metric</th>
+            <template x-for="id in compareIds" :key="'ch'+id"><th class="nosort" x-text="'#'+id"></th></template>
+          </tr></thead>
+          <tbody>
+            <tr>
+              <td>Check</td>
+              <template x-for="id in compareIds" :key="'chk'+id"><td x-text="runById(id).check_id"></td></template>
+            </tr>
+            <tr>
+              <td>Status</td>
+              <template x-for="id in compareIds" :key="'st'+id"><td><span class="pill" :class="runById(id).status" x-text="runById(id).status"></span></td></template>
+            </tr>
+            <template x-for="s in sevKeys" :key="'row'+s">
+              <tr>
+                <td><span class="sev" :class="s" x-text="s"></span></td>
+                <template x-for="id in compareIds" :key="'cell'+s+id"><td x-text="runById(id).counts[s] ?? 0"></td></template>
+              </tr>
+            </template>
+            <tr>
+              <td><b>Total</b></td>
+              <template x-for="id in compareIds" :key="'tot'+id"><td x-text="runById(id).counts.total ?? 0"></td></template>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </template>
+</div>
+
+<script>
+function history() {
+  return {
+    campaignId: null, title: '', runs: [], err: '',
+    compareIds: [], sevKeys: ['critical', 'high', 'medium', 'low', 'info'],
+    init() {
+      const u = new URLSearchParams(location.search);
+      const q = u.get('campaign');
+      this.campaignId = q ? Number(q) : (this.$store.campaign.id || null);
+      if (this.campaignId) this.load();
+    },
+    async load() {
+      this.err = '';
+      try {
+        const r = await fetch('/api/campaigns/' + this.campaignId + '/results');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const d = await r.json();
+        this.runs = d.runs || [];
+        this.title = (d.campaign && d.campaign.name ? d.campaign.name : 'Campaign') + ' #' + this.campaignId + ' — history';
+      } catch (e) { this.err = 'Failed to load history: ' + e; }
+    },
+    runById(id) { return this.runs.find(r => r.run_id === id) || { counts: {} }; },
+  };
+}
+</script>
+{% endblock %}

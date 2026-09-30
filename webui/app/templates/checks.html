@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}NoPainNoScan &mdash; Checks{% endblock %}
+{% block nav_checks %}active{% endblock %}
+
+{% block content %}
+  <p class="muted small">
+    {{ checks|length }} checks registered &middot;
+    <a href="/api/checks">/api/checks (JSON)</a> &middot;
+    <a href="/scan">launch a scan &rarr;</a>
+  </p>
+
+  <div class="grid">
+    {% for c in checks %}
+    <div class="panel" style="margin:0">
+      <h3>{{ c.label }} <span class="muted" style="font-weight:normal">[{{ c.id }}]</span></h3>
+      <div class="muted small mb">{{ c.description }}</div>
+      <div class="badges">
+        <span class="badge">{{ c.script }}</span>
+        {% if c.supports_creds %}<span class="badge creds">creds</span>{% endif %}
+        {% if c.needs_root %}<span class="badge root">root</span>{% endif %}
+        {% for t in c.required_tools %}<span class="badge tool">{{ t }}</span>{% endfor %}
+        {% for t in c.optional_tools %}<span class="badge">{{ t }}?</span>{% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+{% endblock %}
