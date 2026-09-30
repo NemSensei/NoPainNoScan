@@ -22,6 +22,11 @@ from .scanner.registry import list_checks
 
 app = FastAPI(title="NoPainNoScan Web UI", version="0.1.0")
 
+# >>> agent2 routes
+from .scanner.routes import router as scanner_router  # noqa: E402
+app.include_router(scanner_router)
+# <<< agent2 routes
+
 # Static assets and templates.
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
