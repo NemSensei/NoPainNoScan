@@ -1,0 +1,164 @@
+/* app.css - NoPainNoScan web UI (Agent 4 - Front & UX)
+   Dark theme, no CSS framework. Complements the base tokens in base.html. */
+
+:root {
+  --bg: #0f1115;
+  --panel: #1a1d24;
+  --panel-2: #21252e;
+  --border: #2a2f3a;
+  --fg: #e6e8ec;
+  --muted: #9aa4b2;
+  --accent: #5aa9e6;
+  --accent-dim: #2f4a5a;
+  --ok: #7bd88f;
+  --warn: #e6c15a;
+
+  /* Severity palette (colour-blind-safe-ish, distinct hues) */
+  --sev-critical: #e05a5a;
+  --sev-high: #e8894a;
+  --sev-medium: #e6c15a;
+  --sev-low: #5aa9e6;
+  --sev-info: #9aa4b2;
+}
+
+/* ------------------------------------------------------------------ nav */
+nav.topnav {
+  display: flex; gap: 4px; align-items: center; flex-wrap: wrap;
+  margin-top: 10px;
+}
+nav.topnav a {
+  padding: 5px 12px; border-radius: 6px; text-decoration: none;
+  color: var(--muted); border: 1px solid transparent; font-size: 13px;
+}
+nav.topnav a:hover { color: var(--fg); background: var(--panel-2); }
+nav.topnav a.active { color: var(--fg); border-color: var(--border); background: var(--panel-2); }
+nav.topnav .spacer { flex: 1; }
+nav.topnav .active-campaign {
+  font-size: 12px; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 12px; padding: 3px 10px;
+}
+nav.topnav .active-campaign b { color: var(--accent); }
+
+/* --------------------------------------------------------------- layout */
+h2 { font-size: 17px; margin: 0 0 12px; }
+h3 { font-size: 14px; margin: 0 0 8px; }
+.row { display: flex; gap: 14px; flex-wrap: wrap; }
+.col { flex: 1; min-width: 260px; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.mt { margin-top: 16px; }
+.mb { margin-bottom: 12px; }
+.hidden { display: none !important; }
+
+/* ---------------------------------------------------------------- panel */
+.panel {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 8px; padding: 16px; margin-bottom: 16px;
+}
+.panel h2, .panel h3 { margin-top: 0; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+
+/* --------------------------------------------------------------- forms */
+label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+input[type=text], input[type=number], input[type=password], textarea, select {
+  width: 100%; background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
+  font: inherit; font-size: 13px;
+}
+textarea { resize: vertical; min-height: 70px; }
+input:focus, textarea:focus, select:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+.checkbox-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.checkbox-row input { width: auto; }
+.checkbox-row label { margin: 0; color: var(--fg); }
+.field-help { font-size: 11px; color: var(--muted); margin-top: 3px; }
+
+button, .btn {
+  background: var(--accent); color: #08151f; border: none; cursor: pointer;
+  border-radius: 6px; padding: 9px 16px; font: inherit; font-weight: 600; font-size: 13px;
+}
+button:hover, .btn:hover { filter: brightness(1.08); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.secondary, .btn.secondary {
+  background: transparent; color: var(--fg); border: 1px solid var(--border); font-weight: 400;
+}
+button.danger, .btn.danger { background: var(--sev-critical); color: #1a0808; }
+
+/* --------------------------------------------------------------- badges */
+.badges { display: flex; flex-wrap: wrap; gap: 6px; }
+.badge {
+  font-size: 11px; padding: 2px 8px; border-radius: 12px;
+  border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+}
+.badge.creds { color: var(--ok); border-color: #2f5a3a; }
+.badge.root  { color: var(--sev-critical); border-color: #5a2f2f; }
+.badge.tool  { color: var(--accent); border-color: var(--accent-dim); }
+
+/* status pills */
+.pill { font-size: 11px; padding: 2px 9px; border-radius: 12px; border: 1px solid var(--border); }
+.pill.running  { color: var(--warn); border-color: #5a4f2f; }
+.pill.done     { color: var(--ok); border-color: #2f5a3a; }
+.pill.failed   { color: var(--sev-critical); border-color: #5a2f2f; }
+.pill.cancelled{ color: var(--muted); }
+.pill.queued   { color: var(--accent); border-color: var(--accent-dim); }
+
+/* --------------------------------------------------------- severity tags */
+.sev { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; text-transform: uppercase; letter-spacing: .04em; }
+.sev.critical { background: var(--sev-critical); color: #1a0808; }
+.sev.high     { background: var(--sev-high); color: #1a0d05; }
+.sev.medium   { background: var(--sev-medium); color: #1a1505; }
+.sev.low      { background: var(--sev-low); color: #06121a; }
+.sev.info     { background: var(--sev-info); color: #10131a; }
+
+/* --------------------------------------------------------- stat cards */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+.stat {
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px 14px; text-align: center;
+}
+.stat .n { font-size: 24px; font-weight: 700; }
+.stat .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-top: 2px; }
+.stat.critical .n { color: var(--sev-critical); }
+.stat.high .n { color: var(--sev-high); }
+.stat.medium .n { color: var(--sev-medium); }
+.stat.low .n { color: var(--sev-low); }
+.stat.info .n { color: var(--sev-info); }
+
+/* --------------------------------------------------------------- tables */
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; cursor: pointer; user-select: none; white-space: nowrap; }
+th.nosort { cursor: default; }
+tr:hover td { background: var(--panel-2); }
+td.hosts { max-width: 340px; }
+.host-chip { display: inline-block; font-size: 11px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; margin: 1px 2px; }
+
+/* --------------------------------------------------------------- log box */
+.logbox {
+  background: #05070a; border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 12px; height: 340px; overflow-y: auto;
+  font-size: 12px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;
+}
+.logbox .ln { color: #c8cdd6; }
+.logbox .ln.meta { color: var(--accent); }
+.logbox:empty::before { content: "waiting for output..."; color: var(--muted); }
+
+/* toolbar */
+.toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.toolbar select, .toolbar input { width: auto; }
+
+.notice { padding: 10px 12px; border-radius: 6px; font-size: 13px; margin: 10px 0; }
+.notice.err { background: #2a1414; border: 1px solid #5a2f2f; color: #f0b4b4; }
+.notice.ok  { background: #14251a; border: 1px solid #2f5a3a; color: #b8e6c4; }
+.notice.info{ background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); }
+
+.list-item {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px;
+  margin-bottom: 8px; background: var(--panel-2);
+}
+.list-item.selected { border-color: var(--accent); }
+.list-item .meta { color: var(--muted); font-size: 12px; }
+.link { color: var(--accent); cursor: pointer; text-decoration: none; }
+.link:hover { text-decoration: underline; }

@@ -13,7 +13,10 @@
           integrity="sha512-hHWuAZ85rQjhOijMuS/YWJfLRHdgvXNIYtBj2iVQF0vhZ0EWjfPHi5J3wma4y8N7QOMz6JIcTAdrlFDlRwZFA=="
           crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 
+  <link rel="stylesheet" href="/static/app.css">
+
   <style>
+    /* Core tokens kept inline so the shell renders before app.css loads. */
     :root {
       --bg: #0f1115; --panel: #1a1d24; --border: #2a2f3a;
       --fg: #e6e8ec; --muted: #9aa4b2; --accent: #5aa9e6; --crit: #e05a5a;
@@ -24,20 +27,64 @@
       font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
     header {
-      padding: 16px 20px; border-bottom: 1px solid var(--border);
+      padding: 14px 20px; border-bottom: 1px solid var(--border);
       background: var(--panel);
     }
     header h1 { margin: 0; font-size: 18px; }
     header .sub { color: var(--muted); font-size: 12px; }
-    main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+    main { padding: 20px; max-width: 1150px; margin: 0 auto; }
     a { color: var(--accent); }
+    [x-cloak] { display: none !important; }
   </style>
   {% block head %}{% endblock %}
 </head>
 <body>
-  <header>
+  <!-- Shared Alpine store: the "active campaign" persists across pages via localStorage. -->
+  <script>
+    document.addEventListener('alpine:init', () => {
+      Alpine.store('campaign', {
+        id: null,
+        name: '',
+        init() {
+          try {
+            this.id = JSON.parse(localStorage.getItem('npns.campaign.id') || 'null');
+            this.name = localStorage.getItem('npns.campaign.name') || '';
+          } catch (e) { this.id = null; this.name = ''; }
+        },
+        set(id, name) {
+          this.id = id; this.name = name || '';
+          try {
+            localStorage.setItem('npns.campaign.id', JSON.stringify(id));
+            localStorage.setItem('npns.campaign.name', this.name);
+          } catch (e) {}
+        },
+        clear() {
+          this.id = null; this.name = '';
+          try { localStorage.removeItem('npns.campaign.id'); localStorage.removeItem('npns.campaign.name'); } catch (e) {}
+        }
+      });
+    });
+  </script>
+
+  <header x-data>
     <h1>NoPainNoScan <span class="sub">// internal AD pentest toolkit</span></h1>
     <div class="sub">Local UI &mdash; 127.0.0.1 only &mdash; authorized use</div>
+    <nav class="topnav">
+      <a href="/" class="{% block nav_home %}{% endblock %}">Campaigns</a>
+      <a href="/scan" class="{% block nav_scan %}{% endblock %}">New scan</a>
+      <a href="/dashboard" class="{% block nav_dash %}{% endblock %}">Dashboard</a>
+      <a href="/history" class="{% block nav_hist %}{% endblock %}">History</a>
+      <a href="/checks" class="{% block nav_checks %}{% endblock %}">Checks</a>
+      <span class="spacer"></span>
+      <span class="active-campaign" x-cloak>
+        <template x-if="$store.campaign.id">
+          <span>active: <b x-text="$store.campaign.name"></b> <span class="muted" x-text="'#'+$store.campaign.id"></span></span>
+        </template>
+        <template x-if="!$store.campaign.id">
+          <span class="muted">no active campaign</span>
+        </template>
+      </span>
+    </nav>
   </header>
   <main>
     {% block content %}{% endblock %}

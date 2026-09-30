@@ -1,47 +1,111 @@
 {% extends "base.html" %}
-{% block title %}NoPainNoScan &mdash; Checks{% endblock %}
-
-{% block head %}
-<style>
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
-  .card {
-    background: var(--panel); border: 1px solid var(--border);
-    border-radius: 8px; padding: 14px;
-  }
-  .card h3 { margin: 0 0 4px; font-size: 15px; }
-  .card .desc { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
-  .badges { display: flex; flex-wrap: wrap; gap: 6px; }
-  .badge {
-    font-size: 11px; padding: 2px 8px; border-radius: 12px;
-    border: 1px solid var(--border); color: var(--muted);
-  }
-  .badge.creds { color: #7bd88f; border-color: #2f5a3a; }
-  .badge.root  { color: var(--crit); border-color: #5a2f2f; }
-  .badge.tool  { color: var(--accent); border-color: #2f4a5a; }
-  .count { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
-</style>
-{% endblock %}
+{% block title %}NoPainNoScan &mdash; Campaigns{% endblock %}
+{% block nav_home %}active{% endblock %}
 
 {% block content %}
-  <p class="count">
-    {{ checks|length }} checks registered &middot;
-    <a href="/api/checks">/api/checks (JSON)</a> &middot;
-    <a href="/api/health">/api/health</a>
-  </p>
+<div x-data="campaignsPage()" x-init="load()">
 
-  <div class="grid">
-    {% for c in checks %}
-    <div class="card">
-      <h3>{{ c.label }} <span style="color:var(--muted);font-weight:normal">[{{ c.id }}]</span></h3>
-      <div class="desc">{{ c.description }}</div>
-      <div class="badges">
-        <span class="badge">{{ c.script }}</span>
-        {% if c.supports_creds %}<span class="badge creds">creds</span>{% endif %}
-        {% if c.needs_root %}<span class="badge root">root</span>{% endif %}
-        {% for t in c.required_tools %}<span class="badge tool">{{ t }}</span>{% endfor %}
-        {% for t in c.optional_tools %}<span class="badge">{{ t }}?</span>{% endfor %}
+  <div class="row">
+    <!-- Create ------------------------------------------------------------ -->
+    <div class="col" style="max-width:380px">
+      <div class="panel">
+        <h2>New campaign</h2>
+        <form @submit.prevent="create()">
+          <label for="c-name">Name *</label>
+          <input id="c-name" type="text" x-model="form.name" required placeholder="Q3 internal AD">
+          <label for="c-client">Client</label>
+          <input id="c-client" type="text" x-model="form.client" placeholder="ACME Corp">
+          <label for="c-notes">Notes</label>
+          <textarea id="c-notes" x-model="form.notes" placeholder="scope, rules of engagement..."></textarea>
+          <div class="mt"><button type="submit" :disabled="!form.name || busy">Create campaign</button></div>
+        </form>
+        <template x-if="err"><div class="notice err" x-text="err"></div></template>
       </div>
     </div>
-    {% endfor %}
+
+    <!-- List -------------------------------------------------------------- -->
+    <div class="col">
+      <div class="panel">
+        <h2>Campaigns <span class="muted small" x-text="'('+campaigns.length+')'"></span></h2>
+        <template x-if="campaigns.length === 0">
+          <div class="notice info">No campaigns yet. Create one to start scanning.</div>
+        </template>
+        <template x-for="c in campaigns" :key="c.id">
+          <div class="list-item" :class="{selected: $store.campaign.id === c.id}">
+            <div>
+              <div>
+                <b x-text="c.name"></b>
+                <span class="muted small" x-text="'#'+c.id"></span>
+                <template x-if="c.client"><span class="badge" x-text="c.client"></span></template>
+              </div>
+              <div class="meta" x-text="'created ' + fmt(c.created_at)"></div>
+              <template x-if="c.notes"><div class="meta mono" style="white-space:pre-wrap" x-text="c.notes"></div></template>
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">
+              <button class="secondary" @click="select(c)"
+                      x-text="$store.campaign.id === c.id ? 'active' : 'set active'"
+                      :disabled="$store.campaign.id === c.id"></button>
+              <a class="btn secondary" :href="'/dashboard?campaign='+c.id">Dashboard</a>
+              <button class="secondary" @click="editNotes(c)">Notes</button>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- Local annotations editor (client-side; backend has no notes-update API) -->
+      <div class="panel" x-show="notesFor" x-cloak>
+        <h3>Local annotations &mdash; <span x-text="notesFor && notesFor.name"></span></h3>
+        <div class="notice info small">Stored locally in this browser. The campaign's server-side notes are set at creation.</div>
+        <textarea x-model="localNotes" placeholder="working notes, credentials tried, next steps..."></textarea>
+        <div class="mt">
+          <button @click="saveNotes()">Save locally</button>
+          <button class="secondary" @click="notesFor=null">Close</button>
+        </div>
+      </div>
+    </div>
   </div>
+</div>
+
+<script>
+function campaignsPage() {
+  return {
+    campaigns: [], form: { name: '', client: '', notes: '' }, err: '', busy: false,
+    notesFor: null, localNotes: '',
+    async load() {
+      this.err = '';
+      try {
+        const r = await fetch('/api/campaigns');
+        this.campaigns = await r.json();
+      } catch (e) { this.err = 'Failed to load campaigns: ' + e; }
+    },
+    async create() {
+      if (!this.form.name) return;
+      this.busy = true; this.err = '';
+      try {
+        const r = await fetch('/api/campaigns', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(this.form)
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const { id } = await r.json();
+        this.$store.campaign.set(id, this.form.name);
+        this.form = { name: '', client: '', notes: '' };
+        await this.load();
+      } catch (e) { this.err = 'Create failed: ' + e; }
+      finally { this.busy = false; }
+    },
+    select(c) { this.$store.campaign.set(c.id, c.name); },
+    editNotes(c) {
+      this.notesFor = c;
+      try { this.localNotes = localStorage.getItem('npns.notes.' + c.id) || ''; } catch (e) { this.localNotes = ''; }
+    },
+    saveNotes() {
+      if (!this.notesFor) return;
+      try { localStorage.setItem('npns.notes.' + this.notesFor.id, this.localNotes); } catch (e) {}
+      this.notesFor = null;
+    },
+    fmt(s) { if (!s) return ''; try { return new Date(s).toLocaleString(); } catch (e) { return s; } }
+  };
+}
+</script>
 {% endblock %}
