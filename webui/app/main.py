@@ -31,6 +31,11 @@ app.include_router(scanner_router)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
+# >>> agent3 routes
+from .parsers.routes import router as parsers_router  # noqa: E402
+app.include_router(parsers_router)
+# <<< agent3 routes
+
 
 @app.on_event("startup")
 def _startup() -> None:
