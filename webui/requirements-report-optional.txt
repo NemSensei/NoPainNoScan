@@ -1,0 +1,14 @@
+# Optional dependencies for PDF report export (Agent 5).
+#
+# The web UI never requires these: report generation always produces HTML, and
+# PDF export degrades gracefully when no backend is present. Install this file
+# only if you want `?format=pdf` to return a real PDF.
+#
+#   pip install -r webui/requirements-report-optional.txt
+#
+# Alternatively, install the system package `wkhtmltopdf`, which the exporter
+# also detects and uses (no Python dependency needed in that case).
+#
+# NOTE: weasyprint has native library dependencies (cairo, pango, gdk-pixbuf).
+# On Debian/Ubuntu: apt-get install libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0
+weasyprint>=60.0

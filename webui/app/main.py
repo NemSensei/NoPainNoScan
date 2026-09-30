@@ -36,6 +36,11 @@ from .parsers.routes import router as parsers_router  # noqa: E402
 app.include_router(parsers_router)
 # <<< agent3 routes
 
+# >>> agent5 routes
+from .reports.routes import router as reports_router  # noqa: E402
+app.include_router(reports_router)
+# <<< agent5 routes
+
 
 @app.on_event("startup")
 def _startup() -> None:
