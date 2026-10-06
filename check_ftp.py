@@ -9,13 +9,21 @@ import ipaddress
 class C:
     HEADER = '\033[95m'; BLUE = '\033[94m'; CYAN = '\033[96m'
     GREEN = '\033[92m'; WARN = '\033[93m'; FAIL = '\033[91m'
-    ENDC = '\033[0m'; BOLD = '\033[1m'
+    DIM = '\033[2m'; ENDC = '\033[0m'; BOLD = '\033[1m'
 
-def log_info(msg): print(f"{C.CYAN}[*]{C.ENDC} {msg}")
-def log_ok(msg):   print(f"{C.GREEN}[+]{C.ENDC} {msg}")
-def log_warn(msg): print(f"{C.WARN}[!]{C.ENDC} {msg}")
-def log_err(msg):  print(f"{C.FAIL}[X]{C.ENDC} {msg}")
-def log_step(msg): print(f"\n{C.HEADER}{C.BOLD}{'='*60}\n  {msg}\n{'='*60}{C.ENDC}")
+# Colors only on an interactive terminal; disabled when piped (web UI) or NO_COLOR.
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    for _k in ("HEADER", "BLUE", "CYAN", "GREEN", "WARN", "FAIL", "DIM", "ENDC", "BOLD"):
+        setattr(C, _k, "")
+
+RULE = "-" * 60
+
+# Fixed-width, color-coded level tags for aligned output.
+def log_info(msg): print(f"{C.CYAN}[INFO]{C.ENDC} {msg}")
+def log_ok(msg):   print(f"{C.GREEN}[ OK ]{C.ENDC} {msg}")
+def log_warn(msg): print(f"{C.WARN}[WARN]{C.ENDC} {msg}")
+def log_err(msg):  print(f"{C.FAIL}[FAIL]{C.ENDC} {msg}")
+def log_step(msg): print(f"\n{C.BOLD}==> {msg}{C.ENDC}\n{C.DIM}{RULE}{C.ENDC}")
 
 def run(cmd, timeout=30):
     try:
@@ -540,9 +548,8 @@ def _write_summary(output_dir, targets, banners, anon_success, anon_writable, cu
 
     log_ok(f"Summary: {summary_path}")
     # Print to terminal
-    print(f"\n{C.BOLD}{'='*60}")
-    print(f"  FTP SCAN SUMMARY")
-    print(f"{'='*60}{C.ENDC}")
+    print(f"\n{C.BOLD}FTP Scan Summary{C.ENDC}")
+    print(f"{C.DIM}{RULE}{C.ENDC}")
     print(f"  Targets scanned       : {len(targets)}")
     print(f"  Hosts with FTP banner : {len(banners)}")
     c_anon = C.FAIL if anon_success else C.GREEN
@@ -560,7 +567,7 @@ def _write_summary(output_dir, targets, banners, anon_success, anon_writable, cu
         for ip, path in anon_writable:
             print(f"    {ip}:{path}")
     print(f"\n  Output: {summary_path.parent}")
-    print(f"{'='*60}\n")
+    print(f"{C.DIM}{RULE}{C.ENDC}\n")
 
 
 if __name__ == '__main__':

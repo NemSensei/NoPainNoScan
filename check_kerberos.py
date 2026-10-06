@@ -20,15 +20,24 @@ class C:
     GREEN  = '\033[92m'
     WARN   = '\033[93m'
     FAIL   = '\033[91m'
+    DIM    = '\033[2m'
     ENDC   = '\033[0m'
     BOLD   = '\033[1m'
 
+# Colors only on an interactive terminal; disabled when piped (web UI) or NO_COLOR.
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    for _k in list(vars(C)):
+        if _k.isupper():
+            setattr(C, _k, "")
 
-def log_info(msg): print(f"{C.CYAN}[*]{C.ENDC} {msg}")
-def log_ok(msg):   print(f"{C.GREEN}[+]{C.ENDC} {msg}")
-def log_warn(msg): print(f"{C.WARN}[!]{C.ENDC} {msg}")
-def log_err(msg):  print(f"{C.FAIL}[X]{C.ENDC} {msg}")
-def log_step(msg): print(f"\n{C.HEADER}{C.BOLD}{'='*60}\n  {msg}\n{'='*60}{C.ENDC}")
+RULE = "-" * 60
+
+
+def log_info(msg): print(f"{C.CYAN}[INFO]{C.ENDC} {msg}")
+def log_ok(msg):   print(f"{C.GREEN}[ OK ]{C.ENDC} {msg}")
+def log_warn(msg): print(f"{C.WARN}[WARN]{C.ENDC} {msg}")
+def log_err(msg):  print(f"{C.FAIL}[FAIL]{C.ENDC} {msg}")
+def log_step(msg): print(f"\n{C.BOLD}==> {msg}{C.ENDC}\n{C.DIM}{RULE}{C.ENDC}")
 
 
 # ---------------------------------------------------------------------------

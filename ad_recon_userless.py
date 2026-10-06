@@ -66,20 +66,27 @@ class C:
     GREEN  = '\033[92m'
     WARN   = '\033[93m'
     FAIL   = '\033[91m'
+    DIM    = '\033[2m'
     ENDC   = '\033[0m'
     BOLD   = '\033[1m'
+
+# Colors only on an interactive terminal; disabled when piped (web UI) or NO_COLOR.
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    for _k in list(vars(C)):
+        if _k.isupper():
+            setattr(C, _k, "")
+
+RULE = "-" * 60
 
 
 # =============================================================================
 # LOGGING
 # =============================================================================
-def log_info(msg): print(f"{C.CYAN}[*]{C.ENDC} {msg}")
-def log_ok(msg):   print(f"{C.GREEN}[+]{C.ENDC} {msg}")
-def log_warn(msg): print(f"{C.WARN}[!]{C.ENDC} {msg}")
-def log_err(msg):  print(f"{C.FAIL}[X]{C.ENDC} {msg}")
-
-def log_step(msg):
-    print(f"\n{C.HEADER}{C.BOLD}{'='*60}\n  {msg}\n{'='*60}{C.ENDC}")
+def log_info(msg): print(f"{C.CYAN}[INFO]{C.ENDC} {msg}")
+def log_ok(msg):   print(f"{C.GREEN}[ OK ]{C.ENDC} {msg}")
+def log_warn(msg): print(f"{C.WARN}[WARN]{C.ENDC} {msg}")
+def log_err(msg):  print(f"{C.FAIL}[FAIL]{C.ENDC} {msg}")
+def log_step(msg): print(f"\n{C.BOLD}==> {msg}{C.ENDC}\n{C.DIM}{RULE}{C.ENDC}")
 
 
 # =============================================================================
@@ -590,9 +597,8 @@ def write_summary(base_path, target, hosts_list, host_ports, rate):
     summary_file.write_text(summary_txt)
     log_ok(f"summary.txt écrit → {summary_file}")
 
-    print(f"\n{C.BOLD}{'='*60}")
-    print(f"  SYNTHESE — {target}")
-    print(f"{'='*60}{C.ENDC}")
+    print(f"\n{C.BOLD}Synthèse — {target}{C.ENDC}")
+    print(f"{C.DIM}{RULE}{C.ENDC}")
     print(summary_txt)
     print(f"{C.BOLD}  Output : {base_path}/{C.ENDC}\n")
 
@@ -628,9 +634,8 @@ Fichier de cibles (targets.txt):
 
     targets = parse_targets(args.target)
 
-    print(f"\n{C.BOLD}{'='*60}")
-    print(f"    AD RECON USERLESS — PHASE 1: DISCOVERY + PORT SCAN")
-    print(f"{'='*60}{C.ENDC}")
+    print(f"\n{C.BOLD}AD Recon Userless — Phase 1: Discovery + Port Scan{C.ENDC}")
+    print(f"{C.DIM}{RULE}{C.ENDC}")
     if len(targets) == 1:
         print(f"  Cible   : {targets[0]}")
     else:
@@ -639,7 +644,7 @@ Fichier de cibles (targets.txt):
             print(f"            {t}")
     print(f"  Output  : {args.output}")
     print(f"  Rate    : {args.rate} pps")
-    print(f"{'='*60}\n")
+    print(f"{C.DIM}{RULE}{C.ENDC}\n")
 
     check_root()
 

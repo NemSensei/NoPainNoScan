@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """check_ldap.py - LDAP null bind testing and AD enumeration"""
 
-import argparse, subprocess, sys, re
+import argparse, subprocess, os, sys, re
 from datetime import datetime
 from pathlib import Path
 
@@ -12,13 +12,21 @@ from pathlib import Path
 class C:
     HEADER = '\033[95m'; BLUE = '\033[94m'; CYAN = '\033[96m'
     GREEN = '\033[92m'; WARN = '\033[93m'; FAIL = '\033[91m'
-    ENDC = '\033[0m'; BOLD = '\033[1m'
+    ENDC = '\033[0m'; BOLD = '\033[1m'; DIM = '\033[2m'
 
-def log_info(msg): print(f"{C.CYAN}[*]{C.ENDC} {msg}")
-def log_ok(msg):   print(f"{C.GREEN}[+]{C.ENDC} {msg}")
-def log_warn(msg): print(f"{C.WARN}[!]{C.ENDC} {msg}")
-def log_err(msg):  print(f"{C.FAIL}[X]{C.ENDC} {msg}")
-def log_step(msg): print(f"\n{C.HEADER}{C.BOLD}{'='*60}\n  {msg}\n{'='*60}{C.ENDC}")
+# Colors only on an interactive terminal; disabled when piped (web UI) or NO_COLOR.
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    for _k in list(vars(C)):
+        if _k.isupper():
+            setattr(C, _k, "")
+
+RULE = "-" * 60
+
+def log_info(msg): print(f"{C.CYAN}[INFO]{C.ENDC} {msg}")
+def log_ok(msg):   print(f"{C.GREEN}[ OK ]{C.ENDC} {msg}")
+def log_warn(msg): print(f"{C.WARN}[WARN]{C.ENDC} {msg}")
+def log_err(msg):  print(f"{C.FAIL}[FAIL]{C.ENDC} {msg}")
+def log_step(msg): print(f"\n{C.BOLD}==> {msg}{C.ENDC}\n{C.DIM}{RULE}{C.ENDC}")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -283,10 +291,10 @@ def step_bloodhound(hosts: list[str], user: str, password: str | None,
 def write_summary(outdir: Path, hosts: list[str], vulnerable_nb: list[str],
                   has_creds: bool):
     lines = [
-        "=" * 60,
-        "  LDAP ENUMERATION SUMMARY",
+        RULE,
+        "LDAP Enumeration Summary",
         f"  Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "=" * 60,
+        RULE,
         f"Targets scanned  : {len(hosts)}",
         f"Hosts with null bind [CRITICAL]: {len(vulnerable_nb)}",
     ]
@@ -307,11 +315,11 @@ def write_summary(outdir: Path, hosts: list[str], vulnerable_nb: list[str],
         for f in ("ldap_users.txt", "ldap_groups.txt", "ldap_no_preauth.txt",
                   "ldap_delegation.txt", "ldap_admin_count.txt"):
             lines.append(f"  {outdir}/{f}")
-    lines.append("=" * 60)
+    lines.append(RULE)
 
     summary = "\n".join(lines) + "\n"
     write_file(outdir / "ldap_summary.txt", summary)
-    print(f"\n{C.BOLD}{summary}{C.ENDC}")
+    print("\n" + summary)
 
 # ---------------------------------------------------------------------------
 # Argument parsing

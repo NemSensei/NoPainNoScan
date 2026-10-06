@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 """check_rdp.py - RDP enumeration and NLA checks"""
 
-import argparse, subprocess, sys, re, ipaddress
+import argparse, subprocess, os, sys, re, ipaddress
 from datetime import datetime
 from pathlib import Path
 
 class C:
     HEADER = '\033[95m'; BLUE = '\033[94m'; CYAN = '\033[96m'
     GREEN = '\033[92m'; WARN = '\033[93m'; FAIL = '\033[91m'
-    ENDC = '\033[0m'; BOLD = '\033[1m'
+    ENDC = '\033[0m'; BOLD = '\033[1m'; DIM = '\033[2m'
 
-def log_info(msg): print(f"{C.CYAN}[*]{C.ENDC} {msg}")
-def log_ok(msg):   print(f"{C.GREEN}[+]{C.ENDC} {msg}")
-def log_warn(msg): print(f"{C.WARN}[!]{C.ENDC} {msg}")
-def log_err(msg):  print(f"{C.FAIL}[X]{C.ENDC} {msg}")
-def log_step(msg): print(f"\n{C.HEADER}{C.BOLD}{'='*60}\n  {msg}\n{'='*60}{C.ENDC}")
+# Colors only on an interactive terminal; disabled when piped (web UI) or NO_COLOR.
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    for _k in list(vars(C)):
+        if _k.isupper():
+            setattr(C, _k, "")
+
+RULE = "-" * 60
+
+def log_info(msg): print(f"{C.CYAN}[INFO]{C.ENDC} {msg}")
+def log_ok(msg):   print(f"{C.GREEN}[ OK ]{C.ENDC} {msg}")
+def log_warn(msg): print(f"{C.WARN}[WARN]{C.ENDC} {msg}")
+def log_err(msg):  print(f"{C.FAIL}[FAIL]{C.ENDC} {msg}")
+def log_step(msg): print(f"\n{C.BOLD}==> {msg}{C.ENDC}\n{C.DIM}{RULE}{C.ENDC}")
 
 def run(cmd, timeout=300):
     try:
@@ -267,10 +275,10 @@ def step3_screenshot(hosts_file, out_dir, username, password, ntlm_hash, domain)
 def write_summary(out_dir, targets, results, successes, has_creds):
     """Write human-readable rdp_summary.txt."""
     lines = [
-        "=" * 60,
-        "  RDP CHECK SUMMARY",
+        RULE,
+        "RDP Check Summary",
         f"  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "=" * 60,
+        RULE,
         f"  Targets scanned  : {len(targets)}",
         f"  Hosts detected   : {len(results)}",
     ]
@@ -303,7 +311,7 @@ def write_summary(out_dir, targets, results, successes, has_creds):
     ]
     if has_creds:
         lines.append(f"    {out_dir / 'rdp_login_success.txt'}")
-    lines.append("=" * 60)
+    lines.append(RULE)
 
     summary_path = out_dir / "rdp_summary.txt"
     summary_path.write_text("\n".join(lines) + "\n")

@@ -4,6 +4,7 @@
 import argparse
 import shutil
 import subprocess
+import os
 import sys
 import re
 import tempfile
@@ -13,13 +14,21 @@ from pathlib import Path
 class C:
     HEADER = '\033[95m'; BLUE = '\033[94m'; CYAN = '\033[96m'
     GREEN = '\033[92m'; WARN = '\033[93m'; FAIL = '\033[91m'
-    ENDC = '\033[0m'; BOLD = '\033[1m'
+    DIM = '\033[2m'; ENDC = '\033[0m'; BOLD = '\033[1m'
 
-def log_info(msg):  print(f"{C.CYAN}[*]{C.ENDC} {msg}")
-def log_ok(msg):    print(f"{C.GREEN}[+]{C.ENDC} {msg}")
-def log_warn(msg):  print(f"{C.WARN}[!]{C.ENDC} {msg}")
-def log_err(msg):   print(f"{C.FAIL}[X]{C.ENDC} {msg}")
-def log_step(msg):  print(f"\n{C.HEADER}{C.BOLD}{'='*60}\n  {msg}\n{'='*60}{C.ENDC}")
+# Colors only on an interactive terminal; disabled when piped (web UI) or NO_COLOR.
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    for _k in list(vars(C)):
+        if _k.isupper():
+            setattr(C, _k, "")
+
+RULE = "-" * 60
+
+def log_info(msg): print(f"{C.CYAN}[INFO]{C.ENDC} {msg}")
+def log_ok(msg):   print(f"{C.GREEN}[ OK ]{C.ENDC} {msg}")
+def log_warn(msg): print(f"{C.WARN}[WARN]{C.ENDC} {msg}")
+def log_err(msg):  print(f"{C.FAIL}[FAIL]{C.ENDC} {msg}")
+def log_step(msg): print(f"\n{C.BOLD}==> {msg}{C.ENDC}\n{C.DIM}{RULE}{C.ENDC}")
 
 
 def run(cmd, timeout=120):
@@ -315,9 +324,8 @@ def main():
     out_dir = Path(args.output) if args.output else Path(f"./mssql_results_{start_time.strftime('%Y%m%d_%H%M%S')}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n{C.BOLD}{C.HEADER}{'='*60}")
-    print("        MSSQL ENUMERATION & DEFAULT CREDS CHECK")
-    print(f"{'='*60}{C.ENDC}")
+    print(f"\n{C.BOLD}MSSQL — Enumeration & Default Creds Check{C.ENDC}")
+    print(f"{C.DIM}{RULE}{C.ENDC}")
     log_info(f"Target  : {args.target}")
     log_info(f"Output  : {out_dir.resolve()}")
     if args.username:
@@ -358,9 +366,8 @@ def main():
 
     write_summary(out_dir, alive, default_hits, args.username, args.domain, start_time)
 
-    print(f"\n{C.BOLD}{C.GREEN}{'='*60}")
-    print("        MSSQL SCAN COMPLETE")
-    print(f"{'='*60}{C.ENDC}\n")
+    print(f"\n{C.BOLD}MSSQL Scan Complete{C.ENDC}")
+    print(f"{C.DIM}{RULE}{C.ENDC}\n")
     log_ok(f"Results in: {out_dir.resolve()}")
 
 

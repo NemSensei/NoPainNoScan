@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """check_ssh.py - SSH enumeration and cipher audit"""
 
-import argparse, subprocess, sys, re, socket
+import argparse, subprocess, os, sys, re, socket
 from datetime import datetime
 from pathlib import Path
 import ipaddress
@@ -18,13 +18,21 @@ _STEP_SEEN = 0
 class C:
     HEADER = '\033[95m'; CYAN = '\033[96m'
     GREEN = '\033[92m'; WARN = '\033[93m'; FAIL = '\033[91m'
-    ENDC = '\033[0m'; BOLD = '\033[1m'
+    ENDC = '\033[0m'; BOLD = '\033[1m'; DIM = '\033[2m'
 
-def log_info(msg): print(f"{C.CYAN}[*]{C.ENDC} {msg}")
-def log_ok(msg):   print(f"{C.GREEN}[+]{C.ENDC} {msg}")
-def log_warn(msg): print(f"{C.WARN}[!]{C.ENDC} {msg}")
-def log_err(msg):  print(f"{C.FAIL}[X]{C.ENDC} {msg}")
-def log_step(msg): print(f"\n{C.HEADER}{C.BOLD}{'='*60}\n  {msg}\n{'='*60}{C.ENDC}")
+# Colors only on an interactive terminal; disabled when piped (web UI) or NO_COLOR.
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    for _k in list(vars(C)):
+        if _k.isupper():
+            setattr(C, _k, "")
+
+RULE = "-" * 60
+
+def log_info(msg): print(f"{C.CYAN}[INFO]{C.ENDC} {msg}")
+def log_ok(msg):   print(f"{C.GREEN}[ OK ]{C.ENDC} {msg}")
+def log_warn(msg): print(f"{C.WARN}[WARN]{C.ENDC} {msg}")
+def log_err(msg):  print(f"{C.FAIL}[FAIL]{C.ENDC} {msg}")
+def log_step(msg): print(f"\n{C.BOLD}==> {msg}{C.ENDC}\n{C.DIM}{RULE}{C.ENDC}")
 
 def run(cmd, timeout=60):
     try:
@@ -277,9 +285,9 @@ def write_summary(out_dir, hosts, banners, weak_hosts, pw_hosts, successes, has_
     summary = out_dir / "ssh_summary.txt"
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
-        "=" * 60,
-        f"  SSH Audit Summary — {ts}",
-        "=" * 60,
+        RULE,
+        f"SSH Audit Summary — {ts}",
+        RULE,
         f"Hosts scanned       : {len(hosts)}",
         f"Banners collected   : {len(banners)}",
         f"Weak-algo hosts     : {len(weak_hosts)}",
@@ -340,11 +348,8 @@ def main():
         globals()["AUTO_ACCEPT"] = True
 
     # Banner
-    print(f"{C.BOLD}")
-    print("=" * 60)
-    print("       SSH ENUMERATION & CIPHER AUDIT")
-    print("=" * 60)
-    print(f"{C.ENDC}")
+    print(f"\n{C.BOLD}SSH — Enumeration & Cipher Audit{C.ENDC}")
+    print(f"{C.DIM}{RULE}{C.ENDC}")
 
     # Output directory
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -376,9 +381,8 @@ def main():
 
     write_summary(out_dir, hosts, banners, weak_hosts, pw_hosts, successes, has_creds)
 
-    print(f"\n{C.BOLD}{'='*60}")
-    print("  SCAN COMPLETE")
-    print(f"{'='*60}{C.ENDC}")
+    print(f"\n{C.BOLD}Scan Complete{C.ENDC}")
+    print(f"{C.DIM}{RULE}{C.ENDC}")
     log_ok(f"Results in: {out_dir.resolve()}")
 
 if __name__ == "__main__":

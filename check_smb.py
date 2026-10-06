@@ -52,23 +52,25 @@ class C:
     FAIL   = '\033[91m'
     ENDC   = '\033[0m'
     BOLD   = '\033[1m'
+    DIM    = '\033[2m'
+
+# Colors only on an interactive terminal; disabled when piped (web UI) or NO_COLOR.
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    for _k in list(vars(C)):
+        if _k.isupper():
+            setattr(C, _k, "")
+
+RULE = "-" * 60
 
 
 # =============================================================================
 # LOGGING
 # =============================================================================
-def _ts():
-    return datetime.now().strftime("%H:%M:%S")
-
-def log_info(msg):  print(f"{C.CYAN}[{_ts()}][*]{C.ENDC} {msg}")
-def log_ok(msg):    print(f"{C.GREEN}[{_ts()}][+]{C.ENDC} {msg}")
-def log_warn(msg):  print(f"{C.WARN}[{_ts()}][!]{C.ENDC} {msg}")
-def log_err(msg):   print(f"{C.FAIL}[{_ts()}][X]{C.ENDC} {msg}")
-
-def log_step(msg):
-    print(f"\n{C.HEADER}{C.BOLD}{'='*60}")
-    print(f"  {msg}")
-    print(f"{'='*60}{C.ENDC}")
+def log_info(msg): print(f"{C.CYAN}[INFO]{C.ENDC} {msg}")
+def log_ok(msg):   print(f"{C.GREEN}[ OK ]{C.ENDC} {msg}")
+def log_warn(msg): print(f"{C.WARN}[WARN]{C.ENDC} {msg}")
+def log_err(msg):  print(f"{C.FAIL}[FAIL]{C.ENDC} {msg}")
+def log_step(msg): print(f"\n{C.BOLD}==> {msg}{C.ENDC}\n{C.DIM}{RULE}{C.ENDC}")
 
 
 # =============================================================================
@@ -418,7 +420,7 @@ def write_summary(out_dir, unsigned, smbv1, null_shares, read_shares, write_shar
 
     lines = [
         f"SMB Enumeration Summary — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "=" * 60,
+        RULE,
         "",
         f"[SIGNING]  Hosts with SMB signing DISABLED (relay targets): {len(unsigned)}",
         f"[SMBv1]    Hosts with SMBv1 ENABLED:                         {len(smbv1)}",
