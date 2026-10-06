@@ -220,8 +220,9 @@ STATE_FILE = "state.json"
 def _default_state():
     return {
         "version": 1, "created": None, "updated": None, "rate": None,
-        "targets_scanned": [],   # subnets/cibles déjà découverts
-        "hosts_scanned": [],     # hôtes déjà port-scannés (masscan terminé)
+        "targets_scanned": [],         # subnets/cibles déjà découverts
+        "hosts_scanned": [],           # hôtes déjà port-scannés (AD, masscan terminé)
+        "hosts_exotic_scanned": [],    # hôtes déjà scannés sur les ports exotiques
         "last_phase": None,
     }
 
@@ -272,9 +273,9 @@ def merge_ports(a, b):
 def clean_output(base_path):
     """--fresh : supprime les artefacts d'un run précédent pour repartir à zéro."""
     bp = Path(base_path)
-    for pat in ("hosts_*.txt", "port_*.txt", "masscan_raw.json", "nmap_verify.xml",
-                "ports_summary.json", STATE_FILE, "paused.conf",
-                "_scan_list.txt", "_verify_list.txt"):
+    for pat in ("hosts_*.txt", "port_*.txt", "masscan_raw.json", "masscan_exotic.json",
+                "nmap_verify.xml", "ports_summary.json", "exotic_services.txt",
+                STATE_FILE, "paused.conf", "_scan_list.txt", "_verify_list.txt"):
         for f in bp.glob(pat):
             try:
                 f.unlink()
@@ -320,6 +321,44 @@ for _cat, _ports in PORT_CATEGORIES.items():
 
 # Ports utilisés pour la découverte TCP (SYN ping nmap) — ports AD/internes courants
 DISCOVERY_TCP_PORTS = "22,80,88,135,139,389,443,445,3389,5985,5986"
+
+
+# =============================================================================
+# PORTS EXOTIQUES (--exotic) — services internes à forte valeur, hors périmètre AD
+# Scannés en enrichissement sur les hôtes déjà découverts (hosts_alive).
+# =============================================================================
+EXOTIC_TCP_PORTS = {
+    # Bases de données
+    1521: "Oracle", 3306: "MySQL/MariaDB", 5432: "PostgreSQL", 6379: "Redis",
+    27017: "MongoDB", 9200: "Elasticsearch", 5984: "CouchDB", 11211: "Memcached",
+    8086: "InfluxDB", 1099: "Java RMI",
+    # Web / applicatif sur ports non standard
+    3000: "Grafana/Node", 5000: "Flask/UPnP", 5601: "Kibana", 8081: "HTTP-alt",
+    8088: "HTTP-alt", 8888: "HTTP-alt", 9000: "SonarQube/PHP-FPM", 9090: "Prometheus/HTTP",
+    9443: "HTTPS-alt", 10000: "Webmin", 15672: "RabbitMQ-mgmt",
+    # Conteneurs / orchestration
+    2375: "Docker", 2376: "Docker-TLS", 2379: "etcd", 6443: "Kubernetes-API",
+    10250: "Kubelet",
+    # Remote / fichiers / legacy
+    23: "Telnet", 111: "rpcbind", 512: "rexec", 513: "rlogin", 514: "rsh",
+    873: "rsync", 2049: "NFS", 5900: "VNC", 5901: "VNC", 548: "AFP",
+    # Mail
+    25: "SMTP", 110: "POP3", 143: "IMAP", 993: "IMAPS", 995: "POP3S",
+    # Impression
+    515: "LPD", 631: "IPP", 9100: "JetDirect",
+    # OT / ICS (forte valeur, réseaux industriels)
+    102: "Siemens-S7", 502: "Modbus", 44818: "EtherNet/IP", 47808: "BACnet",
+    # Divers
+    1883: "MQTT", 4786: "Cisco-SmartInstall",
+}
+
+EXOTIC_UDP_PORTS = {
+    137: "NetBIOS", 69: "TFTP", 500: "IKE/VPN", 1900: "SSDP", 5353: "mDNS",
+}
+
+# Libellés lisibles pour la synthèse / exotic_services.txt (exotiques uniquement).
+PORT_LABELS = dict(EXOTIC_TCP_PORTS)
+PORT_LABELS.update({p: f"{n} (UDP)" for p, n in EXOTIC_UDP_PORTS.items()})
 
 
 # =============================================================================
@@ -507,6 +546,17 @@ def _rewrite_output_files(base_path, host_ports):
         json.dumps(ports_summary, indent=2, sort_keys=True)
     )
 
+    # Services exotiques (--exotic) : liste dédiée + labels lisibles.
+    exotic_ports = set(EXOTIC_TCP_PORTS) | set(EXOTIC_UDP_PORTS)
+    exotic_hosts, exotic_lines = set(), []
+    for ip, open_ports in host_ports.items():
+        for port in sorted(open_ports & exotic_ports):
+            exotic_hosts.add(ip)
+            exotic_lines.append(f"{ip}\t{port}\t{PORT_LABELS.get(port, '?')}")
+    if exotic_lines:
+        write_list(base_path / "hosts_exotic.txt", list(exotic_hosts))
+        (base_path / "exotic_services.txt").write_text("\n".join(sorted(exotic_lines)) + "\n")
+
     log_ok(f"Hosts avec ports ouverts : {len(host_ports)}")
     log_ok(f"DC potentiels   : {len(categories['dc'])}")
     log_ok(f"SMB             : {len(categories['smb'])}")
@@ -519,39 +569,53 @@ def _rewrite_output_files(base_path, host_ports):
     log_ok(f"FTP             : {len(categories['ftp'])}")
     log_ok(f"SNMP (UDP 161)  : {len(udp_cat['snmp'])}")
     log_ok(f"IPMI (UDP 623)  : {len(udp_cat['ipmi'])}")
+    if exotic_lines:
+        log_ok(f"Exotiques       : {len(exotic_hosts)} hosts, {len(exotic_lines)} service(s) → exotic_services.txt")
     log_ok(f"Ports distincts : {len(port_to_ips)}")
 
 
-def masscan_scan(base_path, hosts_to_scan, rate=5000):
+def masscan_scan(base_path, hosts_to_scan, tcp_ports, udp_ports, rate=5000,
+                 raw_name="masscan_raw.json", label="AD/services"):
     """
-    Scan rapide des ports AD/services + UDP SNMP/IPMI sur les hôtes fournis.
+    Scan masscan d'un jeu de ports donné sur les hôtes fournis.
     N'écrit PAS les fichiers catégorisés (c'est main() qui merge puis appelle
     _rewrite_output_files sur l'ensemble accumulé).
 
+    Args:
+        tcp_ports: iterable[int] — ports TCP à scanner
+        udp_ports: iterable[int] — ports UDP à scanner
+        raw_name:  nom du fichier -oJ (distinct par passe pour ne pas s'écraser)
     Returns:
         (dict[str, set[int]], bool): ({ip: {ports}}, scan_terminé_proprement)
-        scan_terminé=False si masscan absent, aucun hôte, échec ou timeout
-        (dans ce cas les hôtes ne sont PAS marqués comme scannés → re-scan au prochain run).
+        completed=False si masscan absent, aucun hôte, échec ou timeout
+        (les hôtes ne sont alors PAS marqués scannés → re-scan au prochain run).
     """
-    log_step("ETAPE 2 — Port scan rapide (masscan)")
-
     if not tool_exists("masscan"):
         log_warn("masscan non installé — skipping (apt install masscan)")
         return {}, False
 
     if not hosts_to_scan:
-        log_info("Aucun nouvel hôte à scanner (masscan)")
+        log_info(f"Aucun hôte à scanner (masscan {label})")
+        return {}, False
+
+    tcp_ports = sorted(set(tcp_ports))
+    udp_ports = sorted(set(udp_ports))
+    if not tcp_ports and not udp_ports:
         return {}, False
 
     scan_list   = base_path / "_scan_list.txt"
     write_list(scan_list, list(hosts_to_scan))
-    output_file = base_path / "masscan_raw.json"
+    output_file = base_path / raw_name
 
-    tcp_ports_str = ",".join(str(p) for p in ALL_TCP_PORTS)
-    udp_ports_str = ",".join(f"U:{p}" for p in UDP_PORTS.values())
-    ports_arg     = f"{tcp_ports_str},{udp_ports_str}"
+    parts = []
+    if tcp_ports:
+        parts.append(",".join(str(p) for p in tcp_ports))
+    if udp_ports:
+        parts.append(",".join(f"U:{p}" for p in udp_ports))
+    ports_arg = ",".join(parts)
 
-    log_info(f"Scanning {len(hosts_to_scan)} hosts × TCP {len(ALL_TCP_PORTS)} ports + UDP 161,623 @ {rate} pps (retries=2)...")
+    log_info(f"masscan {label}: {len(hosts_to_scan)} hosts × {len(tcp_ports)} TCP + "
+             f"{len(udp_ports)} UDP @ {rate} pps (retries=2)...")
     _, err, code = run(
         f"masscan -iL {scan_list} -p{ports_arg} --rate={rate} --retries=2 -oJ {output_file}",
         timeout=900
@@ -568,7 +632,7 @@ def masscan_scan(base_path, hosts_to_scan, rate=5000):
         if err.strip():
             log_err(f"stderr: {err.strip()[:300]}")
     if not host_ports:
-        log_warn("masscan: aucun port ouvert trouvé")
+        log_warn(f"masscan {label}: aucun port ouvert trouvé")
 
     return host_ports, completed
 
@@ -737,6 +801,7 @@ Exemples:
   sudo python3 ad_recon_userless.py -t 192.168.1.0/24
   sudo python3 ad_recon_userless.py -t 10.10.10.0/24 -o /tmp/pentest -r 2000
   sudo python3 ad_recon_userless.py -t targets.txt -o /tmp/pentest --verify
+  sudo python3 ad_recon_userless.py -t targets.txt -o /tmp/pentest --exotic   # enrichit après un 1er run
 
 Fichier de cibles (targets.txt):
   10.0.0.0/24
@@ -754,6 +819,9 @@ Fichier de cibles (targets.txt):
                         help="Double-check nmap SYN après masscan (plus lent mais zéro faux négatif)")
     parser.add_argument("--fresh", action="store_true",
                         help="Ignore l'état précédent et rescanne tout (par défaut : reprise/incrémental)")
+    parser.add_argument("--exotic", action="store_true",
+                        help="Passe d'enrichissement : scanne des ports à forte valeur hors AD "
+                             "(bases de données, web exotique, VNC, conteneurs, NetBIOS...) sur les hôtes vivants")
     args = parser.parse_args()
 
     targets = parse_targets(args.target)
@@ -784,6 +852,7 @@ Fichier de cibles (targets.txt):
     prior_scanned = set(state.get("hosts_scanned", []))
     prior_alive   = set(read_list(base_path / "hosts_alive.txt"))
     prior_ports   = load_prior_ports(base_path)
+    prior_exotic  = set(state.get("hosts_exotic_scanned", []))
 
     # targets.txt = union de toutes les cibles connues (historique cumulé)
     all_known = sorted(prior_targets | set(targets))
@@ -817,12 +886,27 @@ Fichier de cibles (targets.txt):
         if not hosts_to_scan:
             log_info("Tous les hôtes vivants ont déjà été port-scannés")
 
-        # ── ETAPE 2 — masscan (nouveaux hôtes) + merge ───────────────────────
+        # ── ETAPE 2 — masscan AD/services (nouveaux hôtes) + merge ───────────
         emit_progress(2, total_steps, label="ÉTAPE 2 — Port scan (masscan)")
-        new_ports, scan_ok = masscan_scan(base_path, hosts_to_scan, rate=args.rate)
+        log_step("ETAPE 2 — Port scan rapide (masscan)")
+        new_ports, scan_ok = masscan_scan(
+            base_path, hosts_to_scan, ALL_TCP_PORTS, UDP_PORTS.values(),
+            rate=args.rate, raw_name="masscan_raw.json", label="AD/services")
         merged_ports = merge_ports(prior_ports, new_ports)
         # On ne marque "scannés" que si masscan a terminé proprement.
         scanned_now = prior_scanned | (set(hosts_to_scan) if scan_ok else set())
+
+        # ── ETAPE 2bis — passe exotique (--exotic) sur les hôtes vivants ──────
+        exotic_now = set(prior_exotic)
+        if args.exotic:
+            exotic_targets = sorted(merged_alive - prior_exotic)
+            log_step("ETAPE 2bis — Ports exotiques (--exotic)")
+            ex_ports, ex_ok = masscan_scan(
+                base_path, exotic_targets, EXOTIC_TCP_PORTS.keys(), EXOTIC_UDP_PORTS.keys(),
+                rate=args.rate, raw_name="masscan_exotic.json", label="exotiques")
+            merged_ports = merge_ports(merged_ports, ex_ports)
+            if ex_ok:
+                exotic_now |= set(exotic_targets)
 
         # ── ETAPE 3 — vérification nmap (optionnel) ──────────────────────────
         if args.verify:
@@ -834,10 +918,11 @@ Fichier de cibles (targets.txt):
         _rewrite_output_files(base_path, merged_ports)
 
         # ── Persistance de l'état ────────────────────────────────────────────
-        state["rate"]            = args.rate
-        state["targets_scanned"] = sorted(prior_targets | set(new_targets))
-        state["hosts_scanned"]   = sorted(scanned_now)
-        state["last_phase"]      = "done"
+        state["rate"]                 = args.rate
+        state["targets_scanned"]      = sorted(prior_targets | set(new_targets))
+        state["hosts_scanned"]        = sorted(scanned_now)
+        state["hosts_exotic_scanned"] = sorted(exotic_now)
+        state["last_phase"]           = "done"
         save_state(base_path, state)
 
         write_summary(base_path, args.target, sorted(merged_alive), merged_ports, args.rate)
