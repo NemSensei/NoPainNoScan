@@ -63,6 +63,8 @@ class CheckDefinition:
         optional_tools:tools that enhance the check but are not mandatory.
         arguments:     list of CheckArgument accepted by the script.
         needs_root:    True if the script requires root/raw sockets.
+        auto_yes_flag: flag the runner appends to run the script non-interactively
+                       (e.g. "--yes"); None if the script has no interactive prompts.
     """
     id: str
     script: str
@@ -73,6 +75,7 @@ class CheckDefinition:
     arguments: list[CheckArgument]
     optional_tools: list[str] = field(default_factory=list)
     needs_root: bool = False
+    auto_yes_flag: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Serialize to a plain dict (JSON-friendly) for the API/UI."""
@@ -363,6 +366,16 @@ REGISTRY: dict[str, CheckDefinition] = {
         ],
     ),
 }
+
+
+# Every check_*.py script runs its phases behind an interactive confirm_step()
+# prompt and now accepts a "--yes" flag to accept them all up front. The UI always
+# drives them non-interactively, so the runner appends that flag automatically.
+# "discovery" (ad_recon_userless.py) has no such prompt and is left untouched.
+import dataclasses as _dc  # noqa: E402
+for _cid, _cdef in list(REGISTRY.items()):
+    if _cid != "discovery":
+        REGISTRY[_cid] = _dc.replace(_cdef, auto_yes_flag="--yes")
 
 
 # --------------------------------------------------------------------------- #

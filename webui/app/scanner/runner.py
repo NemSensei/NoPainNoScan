@@ -168,6 +168,11 @@ def build_command(
             continue
         cmd.extend([flag, svalue])
 
+    # Run non-interactively: append the script's accept-all flag when it has one
+    # (every check_*.py; not discovery). Without it the script blocks on input().
+    if check_def.auto_yes_flag:
+        cmd.append(check_def.auto_yes_flag)
+
     # The per-run output directory is authoritative and always present.
     cmd.extend(["-o", str(run_dir)])
     return cmd

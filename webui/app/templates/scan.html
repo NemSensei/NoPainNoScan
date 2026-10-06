@@ -106,6 +106,26 @@
               <a class="btn secondary" :href="'/runs/'+runId" x-show="isTerminal" x-cloak>View results</a>
               <span class="muted small" x-text="logs.length + ' lines'"></span>
             </div>
+
+            <!-- Progress bar -->
+            <div class="progress-wrap" x-show="progress" x-cloak>
+              <div class="progress-head">
+                <span x-text="(progress && progress.label) ? progress.label : 'Working…'"></span>
+                <span class="spacer" style="flex:1"></span>
+                <template x-if="progress && progress.step && progress.steps">
+                  <span class="muted" x-text="'step ' + progress.step + '/' + progress.steps"></span>
+                </template>
+                <template x-if="progress && (progress.host || progress.host === 0) && progress.hosts">
+                  <span class="muted" x-text="'· host ' + progress.host + '/' + progress.hosts"></span>
+                </template>
+                <span class="progress-pct" x-text="((progress && progress.percent != null) ? progress.percent : 0) + '%'"></span>
+              </div>
+              <div class="progress-track">
+                <div class="progress-fill" :class="{done: status === 'done'}"
+                     :style="'width:' + ((progress && progress.percent != null) ? progress.percent : 0) + '%'"></div>
+              </div>
+            </div>
+
             <div class="logbox" x-ref="logbox">
               <template x-for="(l, i) in logs" :key="i">
                 <div class="ln" :class="{meta: l.meta}" x-text="l.text"></div>
@@ -133,7 +153,7 @@ function scanPage() {
     checks: [], selectedId: '', current: null,
     target: '', params: {}, formArgs: [], targetHelp: '',
     err: '', launching: false,
-    runId: null, status: '', logs: [], endInfo: null, es: null,
+    runId: null, status: '', logs: [], endInfo: null, es: null, progress: null,
 
     get isActive() { return ['running', 'queued'].includes(this.status); },
     get isTerminal() { return ['done', 'failed', 'cancelled'].includes(this.status); },
@@ -181,7 +201,7 @@ function scanPage() {
       if (!this.$store.campaign.id) { this.err = 'Select an active campaign first.'; return; }
       this.launching = true; this.err = '';
       this.closeStream();
-      this.logs = []; this.endInfo = null; this.status = 'queued'; this.runId = null;
+      this.logs = []; this.endInfo = null; this.status = 'queued'; this.runId = null; this.progress = null;
       try {
         const body = {
           campaign_id: this.$store.campaign.id,
@@ -219,8 +239,15 @@ function scanPage() {
           this.$nextTick(() => { const b = this.$refs.logbox; if (b) b.scrollTop = b.scrollHeight; });
         } catch (e) {}
       });
+      es.addEventListener('progress', (ev) => {
+        try { this.progress = JSON.parse(ev.data); } catch (e) {}
+      });
       es.addEventListener('end', (ev) => {
         try { this.endInfo = JSON.parse(ev.data); this.status = this.endInfo.status || this.status; } catch (e) {}
+        // Snap the bar to 100% on success; freeze where it was otherwise.
+        if (this.endInfo && this.endInfo.status === 'done') {
+          this.progress = { ...(this.progress || {}), percent: 100 };
+        }
         this.closeStream();
       });
       es.addEventListener('error', () => {

@@ -34,21 +34,34 @@ def tool_exists(name):
     return rc == 0
 
 
+# Progress reporting for the web UI (no-op fallback when run standalone).
+try:
+    from _npns_progress import emit_progress
+except Exception:
+    def emit_progress(*a, **k): pass
+
+TOTAL_STEPS = 2
+_STEP_SEEN = 0
+
 AUTO_ACCEPT = False
 
 def confirm_step(step_name, detail=None):
     """Ask the user to validate a step before launching its commands."""
-    global AUTO_ACCEPT
-    if AUTO_ACCEPT:
-        return True
-    print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
-    if detail:
-        print(f"    {C.CYAN}{detail}{C.ENDC}")
-    resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
-    if resp in ("a", "all"):
-        AUTO_ACCEPT = True
-        return True
-    if resp in ("y", "yes"):
+    global AUTO_ACCEPT, _STEP_SEEN
+    proceed = AUTO_ACCEPT
+    if not proceed:
+        print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
+        if detail:
+            print(f"    {C.CYAN}{detail}{C.ENDC}")
+        resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
+        if resp in ("a", "all"):
+            AUTO_ACCEPT = True
+            proceed = True
+        elif resp in ("y", "yes"):
+            proceed = True
+    if proceed:
+        _STEP_SEEN += 1
+        emit_progress(_STEP_SEEN, TOTAL_STEPS, label=step_name)
         return True
     log_warn(f"Skipped by user: {step_name}")
     return False
@@ -238,7 +251,11 @@ def main():
                         help='Request timeout in seconds (default: 10)')
     parser.add_argument('--workers', type=int, default=10,
                         help='Parallel workers (default: 10)')
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Non-interactive: accept all steps (for automation/UI)")
     args = parser.parse_args()
+    if getattr(args, "yes", False):
+        globals()["AUTO_ACCEPT"] = True
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     outdir = Path(args.output) if args.output else Path(f"./http_results_{timestamp}")

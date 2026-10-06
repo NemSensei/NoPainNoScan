@@ -21,7 +21,8 @@ NoPainNoScan/
 ├── check_ipmi.py          # IPMI : cipher-zero, RAKP, creds par défaut
 ├── check_winrm.py         # WinRM : auth methods, test creds, exec
 ├── check_kerberos.py      # Kerberos : user enum, AS-REP, Kerberoast
-└── generate_report.py     # Rapport HTML — agrège tous les outputs en un seul fichier
+├── generate_report.py     # Rapport HTML — agrège tous les outputs en un seul fichier
+└── webui/                 # Interface web FastAPI (optionnelle) — lancer, visualiser, rapporter
 ```
 
 ---
@@ -909,6 +910,55 @@ Le script scanne récursivement le répertoire fourni et détecte automatiquemen
 | WinRM | Hosts détectés, hosts accessibles avec creds |
 
 Les services non scannés affichent "Not scanned" en gris plutôt que de rester vides.
+
+---
+
+## Interface web
+
+Une interface web **optionnelle** (FastAPI) permet de piloter le toolkit depuis le navigateur : lancer les scans, suivre leur exécution en temps réel, explorer les résultats dans un dashboard et générer les rapports. Elle réutilise directement les scripts existants et `generate_report.py` — rien n'est dupliqué, le mode CLI reste pleinement utilisable.
+
+Elle est conçue pour un usage **local, mono-utilisateur** : le serveur n'écoute que sur `127.0.0.1` et il n'y a pas d'authentification.
+
+### Lancement
+
+```bash
+cd webui
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-web.txt
+# Optionnel : export PDF des rapports
+pip install -r requirements-report-optional.txt
+
+python -m app.main        # http://127.0.0.1:8000
+# ou : uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+### Fonctionnalités
+
+| Page | Rôle |
+|---|---|
+| **Campagnes** (`/`) | Créer une campagne (nom, client), l'activer, regrouper les scans associés |
+| **Scan** (`/scan`) | Formulaire piloté dynamiquement par les 13 checks : cible, champs de creds et options spécifiques selon le check, badges des outils requis. Progression live via SSE + annulation |
+| **Dashboard** (`/dashboard`) | Synthèse par sévérité (critical → info), hosts vivants, top ports, table de findings triable et filtrable par service/sévérité |
+| **Historique** (`/history`) | Liste des runs d'une campagne, statuts, comparaison côte-à-côte des compteurs |
+| **Rapport** | Génération du rapport HTML agrégé (via `generate_report.py`) et export PDF best-effort, téléchargeables |
+
+### Architecture
+
+```
+webui/app/
+├── main.py              # Application FastAPI, routes de pages
+├── config.py            # Chemins, host/port, dossiers de run
+├── scanner/
+│   ├── registry.py      # Métadonnées des 13 checks (args, outils requis)
+│   ├── runner.py        # Exécution asynchrone (argv, sans shell)
+│   ├── jobs.py          # Jobs en mémoire + streaming des logs
+│   └── routes.py        # API : /api/runs, SSE, cancel
+├── parsers/             # Normalisation des sorties → findings/sévérités (API results)
+├── reports/             # Agrégation multi-runs + export HTML/PDF
+└── campaigns/store.py   # Persistance SQLite (campagnes, runs)
+```
+
+> **Note sécurité (v1)** : les scans sont exécutés en passant les arguments sous forme de liste (`subprocess` sans `shell=True`), ce qui limite fortement le risque d'injection. La validation fine des cibles/credentials reste un durcissement prévu — à compléter avant toute exposition au-delà de `localhost`.
 
 ---
 

@@ -152,6 +152,8 @@ async def _event_stream(run_id: int):
                 yield _sse("log", {"line": msg["line"]})
             elif kind == "status":
                 yield _sse("status", {"run_id": run_id, "status": msg["status"]})
+            elif kind == "progress":
+                yield _sse("progress", {k: v for k, v in msg.items() if k != "type"})
             elif kind == "end":
                 yield _sse("end", {
                     "run_id": run_id,
@@ -169,9 +171,10 @@ async def api_stream_run(run_id: int) -> StreamingResponse:
     """Stream a run's logs live via Server-Sent Events (text/event-stream).
 
     Frames:
-        event: status  data: {"run_id", "status"}
-        event: log      data: {"line"}
-        event: end      data: {"run_id", "status", "exit_code", "error"}
+        event: status    data: {"run_id", "status"}
+        event: log       data: {"line"}
+        event: progress  data: {"run_id", "step", "steps", "label", "host", "hosts", "percent"}
+        event: end       data: {"run_id", "status", "exit_code", "error"}
     A ``: keep-alive`` comment is emitted on idle to hold the connection open.
     """
     return StreamingResponse(

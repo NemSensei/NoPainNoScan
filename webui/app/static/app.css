@@ -162,3 +162,21 @@ td.hosts { max-width: 340px; }
 .list-item .meta { color: var(--muted); font-size: 12px; }
 .link { color: var(--accent); cursor: pointer; text-decoration: none; }
 .link:hover { text-decoration: underline; }
+
+/* progress bar (live scan + run view) */
+.progress-wrap { margin: 4px 0 14px; }
+.progress-head {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; margin-bottom: 6px;
+}
+.progress-head .progress-pct { font-weight: 700; color: var(--fg); margin-left: 8px; }
+.progress-track {
+  height: 10px; border-radius: 6px; overflow: hidden;
+  background: var(--panel-2, #11141a); border: 1px solid var(--border);
+}
+.progress-fill {
+  height: 100%; width: 0;
+  background: linear-gradient(90deg, var(--accent), #7cc4f2);
+  transition: width .35s ease;
+}
+.progress-fill.done { background: linear-gradient(90deg, var(--ok, #3a9a5a), #6fce8c); }

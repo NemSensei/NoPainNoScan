@@ -38,6 +38,37 @@ _TERMINAL = {"done", "failed", "cancelled"}
 # How many log lines to retain per job for late-subscriber replay.
 _LOG_BUFFER_MAX = 5000
 
+# Prefix emitted by scripts via _npns_progress.emit_progress(). Must match that
+# module's PREFIX. Lines starting with it are parsed into progress events and are
+# NOT shown in the log stream.
+_PROGRESS_PREFIX = "@@PROGRESS "
+
+
+def _progress_percent(data: dict[str, Any]) -> Optional[int]:
+    """Compute an overall 0-100 percent from a progress payload.
+
+    Uses completed-step fraction, plus intra-step host fraction when present:
+        percent = ((step - 1) + host/hosts) / steps
+    Capped at 99 while running; the terminal `end` event drives it to 100.
+    """
+    try:
+        steps = int(data.get("steps") or 0)
+        step = int(data.get("step") or 0)
+        if steps <= 0:
+            return None
+        # Completed steps = step - 1 (the current step is in progress), plus the
+        # intra-step host fraction when the script reports it. Monotonic: a step
+        # gate shows (step-1)/steps, hosts climb it toward step/steps.
+        frac = max(step - 1, 0)
+        hosts = data.get("hosts")
+        host = data.get("host")
+        if hosts and host is not None:
+            frac += min(max(int(host), 0) / int(hosts), 1.0)
+        pct = int(min(frac / steps, 1.0) * 100)
+        return min(pct, 99)
+    except Exception:
+        return None
+
 
 # --------------------------------------------------------------------------- #
 # Job model
@@ -58,6 +89,7 @@ class Job:
     subscribers: set[asyncio.Queue] = field(default_factory=set)
     process: Optional[asyncio.subprocess.Process] = None
     task: Optional[asyncio.Task] = None
+    progress: Optional[dict[str, Any]] = None  # last progress event (incl. percent)
 
     def snapshot(self) -> dict[str, Any]:
         """JSON-friendly view of the current job state (no heavy fields)."""
@@ -72,6 +104,7 @@ class Job:
             "run_dir": self.run_dir,
             "command": self.command,
             "log_lines": len(self.logs),
+            "progress": self.progress,
         }
 
 
@@ -97,6 +130,34 @@ def _emit_log(job: Job, line: str) -> None:
     _publish(job, {"type": "log", "line": line})
 
 
+def _emit_progress(job: Job, data: dict[str, Any]) -> None:
+    """Store the latest progress on the job and publish a progress event."""
+    event = {
+        "type": "progress",
+        "run_id": job.run_id,
+        "step": data.get("step"),
+        "steps": data.get("steps"),
+        "label": data.get("label"),
+        "host": data.get("host"),
+        "hosts": data.get("hosts"),
+        "percent": _progress_percent(data),
+    }
+    job.progress = {k: v for k, v in event.items() if k != "type"}
+    _publish(job, event)
+
+
+def _handle_output_line(job: Job, line: str) -> None:
+    """Route one child-output line: progress marker -> event, else -> log."""
+    if line.startswith(_PROGRESS_PREFIX):
+        try:
+            data = json.loads(line[len(_PROGRESS_PREFIX):])
+            _emit_progress(job, data)
+            return
+        except Exception:
+            pass  # malformed marker: fall through and show it as a plain log
+    _emit_log(job, line)
+
+
 def _emit_end(job: Job) -> None:
     """Publish the terminal event describing how the job finished."""
     _publish(job, {
@@ -120,6 +181,8 @@ def subscribe(job: Job) -> asyncio.Queue:
     q.put_nowait({"type": "status", "run_id": job.run_id, "status": job.status})
     for line in list(job.logs):
         q.put_nowait({"type": "log", "line": line})
+    if job.progress is not None:
+        q.put_nowait({"type": "progress", **job.progress})
     if job.status in _TERMINAL:
         q.put_nowait({
             "type": "end",
@@ -157,7 +220,7 @@ async def _run(job: Job) -> None:
     try:
         job.process = await runner.spawn(job.command)
         async for line in runner.iter_output(job.process):
-            _emit_log(job, line)
+            _handle_output_line(job, line)
         await job.process.wait()
         code = job.process.returncode
         status = "done" if code == 0 else "failed"

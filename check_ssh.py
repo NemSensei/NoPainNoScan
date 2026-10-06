@@ -6,6 +6,15 @@ from datetime import datetime
 from pathlib import Path
 import ipaddress
 
+# Progress reporting for the web UI (no-op fallback when run standalone).
+try:
+    from _npns_progress import emit_progress
+except Exception:
+    def emit_progress(*a, **k): pass
+
+TOTAL_STEPS = 4
+_STEP_SEEN = 0
+
 class C:
     HEADER = '\033[95m'; CYAN = '\033[96m'
     GREEN = '\033[92m'; WARN = '\033[93m'; FAIL = '\033[91m'
@@ -34,17 +43,21 @@ AUTO_ACCEPT = False
 
 def confirm_step(step_name, detail=None):
     """Ask the user to validate a step before launching its commands."""
-    global AUTO_ACCEPT
-    if AUTO_ACCEPT:
-        return True
-    print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
-    if detail:
-        print(f"    {C.CYAN}{detail}{C.ENDC}")
-    resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
-    if resp in ("a", "all"):
-        AUTO_ACCEPT = True
-        return True
-    if resp in ("y", "yes"):
+    global AUTO_ACCEPT, _STEP_SEEN
+    proceed = AUTO_ACCEPT
+    if not proceed:
+        print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
+        if detail:
+            print(f"    {C.CYAN}{detail}{C.ENDC}")
+        resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
+        if resp in ("a", "all"):
+            AUTO_ACCEPT = True
+            proceed = True
+        elif resp in ("y", "yes"):
+            proceed = True
+    if proceed:
+        _STEP_SEEN += 1
+        emit_progress(_STEP_SEEN, TOTAL_STEPS, label=step_name)
         return True
     log_warn(f"Skipped by user: {step_name}")
     return False
@@ -93,7 +106,9 @@ def step_banner(hosts, port, out_dir):
         (out_dir / "ssh_banners.txt").write_text("")
         return {}
     banners = {}
-    for ip in hosts:
+    _n = len(hosts)
+    for _i, ip in enumerate(hosts, 1):
+        emit_progress(_STEP_SEEN, TOTAL_STEPS, label="STEP 1 — Banner grab", host=_i, hosts=_n)
         banner = grab_banner(ip, port)
         if banner:
             log_ok(f"{ip}:{port} → {banner}")
@@ -187,7 +202,9 @@ def step_auth_methods(hosts, port, out_dir):
         return []
     password_auth_hosts = []
 
-    for ip in hosts:
+    _n = len(hosts)
+    for _i, ip in enumerate(hosts, 1):
+        emit_progress(_STEP_SEEN, TOTAL_STEPS, label="STEP 3 — Authentication methods", host=_i, hosts=_n)
         cmd = (
             f"ssh -o BatchMode=yes -o ConnectTimeout=5 "
             f"-o PreferredAuthentications=none "
@@ -316,7 +333,11 @@ def main():
                         help="Not used for SSH (ignored)")
     parser.add_argument("--port", type=int, default=22,
                         help="SSH port (default: 22)")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Non-interactive: accept all steps (for automation/UI)")
     args = parser.parse_args()
+    if args.yes:
+        globals()["AUTO_ACCEPT"] = True
 
     # Banner
     print(f"{C.BOLD}")
@@ -359,6 +380,7 @@ def main():
     print("  SCAN COMPLETE")
     print(f"{'='*60}{C.ENDC}")
     log_ok(f"Results in: {out_dir.resolve()}")
+    emit_progress(TOTAL_STEPS, TOTAL_STEPS, label="done")
 
 if __name__ == "__main__":
     main()
