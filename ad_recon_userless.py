@@ -13,7 +13,17 @@ Input:
     -t peut être :
       • un CIDR     : 192.168.1.0/24
       • une IP      : 10.0.0.5
-      • un fichier  : targets.txt  (un CIDR/IP par ligne, # pour commentaires)
+      • un fichier  : targets.txt  (un CIDR/IP/plage par ligne, # pour commentaires)
+    Les lignes invalides du fichier sont ignorées avec un avertissement.
+
+Reprise / incrémental (façon feroxbuster):
+    L'outil est relançable sur le même dossier de sortie. Il ACCUMULE les
+    résultats : l'état est persisté dans state.json, et à chaque relance il ne
+    (re)découvre que les NOUVEAUX subnets et ne port-scanne que les hôtes jamais
+    scannés ; hosts_alive / ports sont fusionnés avec l'existant. Une exécution
+    interrompue (Ctrl-C) ou un masscan tronqué reprend proprement au run suivant.
+    --fresh efface l'état précédent et rescanne tout.
+    Le dossier de sortie est stable par source (nom du fichier de cibles, ou CIDR).
 
 Output files:
     targets.txt           cibles scannées (copie, si multi-cibles)
@@ -34,8 +44,9 @@ Output files:
     masscan_raw.json      résultats bruts masscan
     port_<PORT>.txt       IPs ayant ce port ouvert
     hosts_detail/<IP>.txt ports ouverts par host
-    ports_summary.json    {IP: [ports]} toutes IPs
+    ports_summary.json    {IP: [ports]} toutes IPs (accumulé entre runs)
     summary.txt           synthèse lisible
+    state.json            état de reprise (subnets/hôtes déjà traités)
 """
 
 import argparse
@@ -48,13 +59,13 @@ import subprocess
 import sys
 from collections import Counter
 from datetime import datetime
+from pathlib import Path
 
 # Progress reporting for the web UI (no-op fallback when run standalone).
 try:
     from _npns_progress import emit_progress
 except Exception:
     def emit_progress(*a, **k): pass
-from pathlib import Path
 
 
 # =============================================================================
@@ -113,38 +124,61 @@ def check_root():
         log_warn("Relancer avec sudo pour des résultats complets")
 
 
-def setup_output(base_dir, target):
-    safe = target.replace("/", "_")
-    path = Path(base_dir) / safe
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+_RANGE_RE = re.compile(r'^(\d{1,3}\.){3}\d{1,3}-\d{1,3}(\.\d{1,3}){0,3}$')
+
+
+def is_valid_target(token):
+    """True si token est une IP, un CIDR, ou une plage nmap/masscan (a.b.c.d-e[.f.g.h])."""
+    try:
+        ipaddress.ip_network(token, strict=False)  # couvre IP seule et CIDR
+        return True
+    except ValueError:
+        pass
+    return bool(_RANGE_RE.match(token))
 
 
 def parse_targets(target_arg):
     """
-    Retourne la liste des cibles depuis un CIDR/IP ou un fichier.
-    Le fichier accepte : CIDRs, IPs, plages (10.0.0.1-10.0.0.50), commentaires #.
+    Retourne la liste des cibles (dédupliquées, ordre préservé) depuis un CIDR/IP
+    ou un fichier. Le fichier accepte : CIDRs, IPs, plages (10.0.0.1-50), commentaires #.
+    Les lignes invalides sont ignorées avec un avertissement.
     """
     p = Path(target_arg)
     if p.is_file():
-        targets = []
+        targets, invalid, seen = [], [], set()
         for line in p.read_text().splitlines():
-            line = line.split("#")[0].strip()
-            if line:
-                targets.append(line)
+            tok = line.split("#")[0].strip()
+            if not tok:
+                continue
+            if not is_valid_target(tok):
+                invalid.append(tok)
+                continue
+            if tok not in seen:
+                seen.add(tok)
+                targets.append(tok)
+        for tok in invalid:
+            log_warn(f"Ligne invalide ignorée dans {target_arg}: {tok!r}")
         if not targets:
-            log_err(f"Fichier {target_arg} vide ou sans cibles valides")
+            log_err(f"Fichier {target_arg} : aucune cible valide")
             sys.exit(1)
-        log_ok(f"{len(targets)} cible(s) chargée(s) depuis {target_arg}")
+        log_ok(f"{len(targets)} cible(s) valide(s) depuis {target_arg}"
+               + (f" ({len(invalid)} ignorée(s))" if invalid else ""))
         return targets
+    # Argument direct (IP / CIDR / plage)
+    if not is_valid_target(target_arg):
+        log_err(f"Cible invalide: {target_arg!r} (attendu IP, CIDR ou plage a.b.c.d-e)")
+        sys.exit(1)
     return [target_arg]
 
 
 def setup_output_multi(base_dir, target_arg, targets):
-    """Choisit le répertoire de sortie : nom du fichier si multi-cibles, CIDR sinon."""
-    if len(targets) == 1:
-        return setup_output(base_dir, targets[0])
-    safe = Path(target_arg).stem.replace(" ", "_") if Path(target_arg).is_file() else "multi"
+    """Répertoire de sortie STABLE par source d'entrée (indispensable pour la
+    reprise/incrémental) : nom du fichier de cibles si c'en est un, sinon le CIDR/IP.
+    Ne dépend PAS du nombre de cibles (sinon ajouter un subnet changerait de dossier)."""
+    if Path(target_arg).is_file():
+        safe = Path(target_arg).stem.replace(" ", "_") or "targets"
+    else:
+        safe = target_arg.replace("/", "_")
     path = Path(base_dir) / safe
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -175,6 +209,80 @@ def read_list(path):
     if not p.exists():
         return []
     return [line.strip() for line in p.read_text().splitlines() if line.strip()]
+
+
+# =============================================================================
+# ETAT / REPRISE — merge incrémental + resume (façon feroxbuster)
+# =============================================================================
+STATE_FILE = "state.json"
+
+
+def _default_state():
+    return {
+        "version": 1, "created": None, "updated": None, "rate": None,
+        "targets_scanned": [],   # subnets/cibles déjà découverts
+        "hosts_scanned": [],     # hôtes déjà port-scannés (masscan terminé)
+        "last_phase": None,
+    }
+
+
+def load_state(base_path):
+    p = Path(base_path) / STATE_FILE
+    if not p.exists():
+        return _default_state()
+    try:
+        st = _default_state()
+        st.update(json.loads(p.read_text()))
+        return st
+    except (json.JSONDecodeError, OSError):
+        log_warn(f"{STATE_FILE} illisible — repart d'un état vierge")
+        return _default_state()
+
+
+def save_state(base_path, state):
+    state["updated"] = datetime.now().isoformat(timespec="seconds")
+    if not state.get("created"):
+        state["created"] = state["updated"]
+    (Path(base_path) / STATE_FILE).write_text(
+        json.dumps(state, indent=2, sort_keys=True)
+    )
+
+
+def load_prior_ports(base_path):
+    """Charge ports_summary.json accumulé → {ip: set(int)} ({} si absent/illisible)."""
+    p = Path(base_path) / "ports_summary.json"
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+        return {ip: set(int(x) for x in ports) for ip, ports in data.items()}
+    except (json.JSONDecodeError, OSError, ValueError):
+        log_warn("ports_summary.json illisible — ports précédents ignorés")
+        return {}
+
+
+def merge_ports(a, b):
+    """Union des ports par IP de deux dicts {ip: set(int)}."""
+    out = {ip: set(ports) for ip, ports in a.items()}
+    for ip, ports in b.items():
+        out.setdefault(ip, set()).update(ports)
+    return out
+
+
+def clean_output(base_path):
+    """--fresh : supprime les artefacts d'un run précédent pour repartir à zéro."""
+    bp = Path(base_path)
+    for pat in ("hosts_*.txt", "port_*.txt", "masscan_raw.json", "nmap_verify.xml",
+                "ports_summary.json", STATE_FILE, "paused.conf",
+                "_scan_list.txt", "_verify_list.txt"):
+        for f in bp.glob(pat):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    detail = bp / "hosts_detail"
+    if detail.is_dir():
+        shutil.rmtree(detail, ignore_errors=True)
 
 
 # =============================================================================
@@ -217,18 +325,23 @@ DISCOVERY_TCP_PORTS = "22,80,88,135,139,389,443,445,3389,5985,5986"
 # =============================================================================
 # ETAPE 1 — DECOUVERTE DES HOSTS
 # =============================================================================
-def discover_hosts(base_path, targets):
+def discover_hosts(targets):
     """
-    Découverte via ICMP (fping) + TCP SYN ping (nmap).
-    Les deux sources sont fusionnées et dédupliquées.
+    Découverte via ICMP (fping) + TCP SYN ping (nmap) sur `targets`.
+    Fonction pure : ne lit/écrit aucun fichier, le merge et l'écriture de
+    hosts_alive.txt sont gérés par main() (pour l'accumulation incrémentale).
 
     Args:
-        targets: list[str] — CIDRs/IPs à scanner
+        targets: list[str] — CIDRs/IPs/plages à découvrir (les NOUVEAUX en mode incrémental)
     Returns:
-        list[str]: IPs découvertes, triées
+        set[str]: IPs vivantes trouvées sur ce run
     """
     log_step("ETAPE 1 — Découverte des hôtes")
     hosts = set()
+
+    if not targets:
+        log_info("Aucun nouveau subnet à découvrir — étape sautée")
+        return hosts
 
     # --- fping: ICMP echo (une exécution par cible) ---
     if tool_exists("fping"):
@@ -275,13 +388,10 @@ def discover_hosts(base_path, targets):
         log_warn("nmap non installé — TCP port ping désactivé (apt install nmap)")
 
     if not hosts:
-        log_err("Aucun host découvert — vérifier le réseau ou les permissions (root requis pour SYN)")
-        return []
-
-    hosts_list = sort_ips(list(hosts))
-    write_list(base_path / "hosts_alive.txt", hosts_list)
-    log_ok(f"{len(hosts_list)} hosts uniques → hosts_alive.txt")
-    return hosts_list
+        log_warn("Aucun host découvert sur les cibles de ce run")
+    else:
+        log_ok(f"{len(hosts)} hôte(s) vivant(s) découvert(s) sur ce run")
+    return set(hosts)
 
 
 # =============================================================================
@@ -296,16 +406,29 @@ def parse_masscan_json(filepath):
         dict[str, set[int]]: {ip: {port1, port2, ...}}
     """
     content = Path(filepath).read_text().strip()
-    content = re.sub(r',\s*\]', ']', content)
-    content = re.sub(r',\s*$', '', content)
-
-    if not content or content in ('[]', ''):
+    if not content or content == '[]':
         return {}
 
+    cleaned = re.sub(r',\s*\]', ']', content)
+    cleaned = re.sub(r',\s*$', '', cleaned)
+
     try:
-        entries = json.loads(content)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"JSON masscan invalide après nettoyage: {e}")
+        entries = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # JSON tronqué (timeout/interruption) : on récupère ligne par ligne.
+        # masscan -oJ écrit un objet par ligne ; une dernière ligne coupée est
+        # simplement ignorée au lieu de perdre tout le reste.
+        entries = []
+        for line in content.splitlines():
+            line = line.strip().rstrip(',')
+            if not (line.startswith('{') and line.endswith('}')):
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        if entries:
+            log_warn(f"JSON masscan tronqué — {len(entries)} enregistrement(s) récupéré(s)")
 
     host_ports = {}
     for entry in entries:
@@ -399,66 +522,64 @@ def _rewrite_output_files(base_path, host_ports):
     log_ok(f"Ports distincts : {len(port_to_ips)}")
 
 
-def masscan_scan(base_path, hosts_list, rate=5000):
+def masscan_scan(base_path, hosts_to_scan, rate=5000):
     """
-    Scan rapide des ports AD/services + UDP SNMP/IPMI.
-    Génère les fichiers hosts_*.txt, port_*.txt, hosts_detail/, ports_summary.json.
+    Scan rapide des ports AD/services + UDP SNMP/IPMI sur les hôtes fournis.
+    N'écrit PAS les fichiers catégorisés (c'est main() qui merge puis appelle
+    _rewrite_output_files sur l'ensemble accumulé).
 
     Returns:
-        dict[str, set[int]]: {ip: {open ports}}
+        (dict[str, set[int]], bool): ({ip: {ports}}, scan_terminé_proprement)
+        scan_terminé=False si masscan absent, aucun hôte, échec ou timeout
+        (dans ce cas les hôtes ne sont PAS marqués comme scannés → re-scan au prochain run).
     """
     log_step("ETAPE 2 — Port scan rapide (masscan)")
 
     if not tool_exists("masscan"):
         log_warn("masscan non installé — skipping (apt install masscan)")
-        return {}
+        return {}, False
 
-    if not hosts_list:
-        log_warn("Aucun host à scanner")
-        return {}
+    if not hosts_to_scan:
+        log_info("Aucun nouvel hôte à scanner (masscan)")
+        return {}, False
 
-    hosts_file  = base_path / "hosts_alive.txt"
+    scan_list   = base_path / "_scan_list.txt"
+    write_list(scan_list, list(hosts_to_scan))
     output_file = base_path / "masscan_raw.json"
 
     tcp_ports_str = ",".join(str(p) for p in ALL_TCP_PORTS)
     udp_ports_str = ",".join(f"U:{p}" for p in UDP_PORTS.values())
     ports_arg     = f"{tcp_ports_str},{udp_ports_str}"
 
-    log_info(f"Scanning {len(hosts_list)} hosts × TCP {len(ALL_TCP_PORTS)} ports + UDP 161,623 @ {rate} pps (retries=2)...")
+    log_info(f"Scanning {len(hosts_to_scan)} hosts × TCP {len(ALL_TCP_PORTS)} ports + UDP 161,623 @ {rate} pps (retries=2)...")
     _, err, code = run(
-        f"masscan -iL {hosts_file} -p{ports_arg} --rate={rate} --retries=2 -oJ {output_file}",
+        f"masscan -iL {scan_list} -p{ports_arg} --rate={rate} --retries=2 -oJ {output_file}",
         timeout=900
     )
 
-    if not output_file.exists() or output_file.stat().st_size == 0:
-        log_err(f"masscan a échoué ou 0 résultat. Code={code}")
+    # Récupère tout résultat disponible (même partiel en cas de timeout).
+    host_ports = {}
+    if output_file.exists() and output_file.stat().st_size > 0:
+        host_ports = parse_masscan_json(output_file)
+
+    completed = (code == 0)
+    if not completed:
+        log_warn(f"masscan interrompu/timeout (code={code}) — hôtes conservés pour re-scan")
         if err.strip():
             log_err(f"stderr: {err.strip()[:300]}")
-        return {}
-
-    try:
-        host_ports = parse_masscan_json(output_file)
-    except ValueError as e:
-        log_err(str(e))
-        return {}
-
     if not host_ports:
         log_warn("masscan: aucun port ouvert trouvé")
-        return {}
 
-    _rewrite_output_files(base_path, host_ports)
-    return host_ports
+    return host_ports, completed
 
 
 # =============================================================================
 # ETAPE 3 — VERIFICATION NMAP (optionnel)
 # =============================================================================
-def nmap_verify(base_path, hosts_list, host_ports_masscan):
+def nmap_verify(base_path, hosts_to_verify, host_ports_in):
     """
-    Second pass nmap SYN sur les hosts découverts pour compléter masscan.
-    - Lance nmap sur les mêmes ports TCP que masscan (--retries déjà dans masscan pour UDP)
-    - Merge les résultats avec ceux de masscan
-    - Met à jour tous les fichiers hosts_*.txt / port_*.txt
+    Second pass nmap SYN sur les hôtes fournis pour compléter masscan.
+    Merge les résultats dans host_ports_in et retourne le dict fusionné.
 
     Typiquement 30-120s sur un /24 avec 50 hosts (ports limités, pas de service detection).
     Returns:
@@ -468,28 +589,29 @@ def nmap_verify(base_path, hosts_list, host_ports_masscan):
 
     if not tool_exists("nmap"):
         log_warn("nmap non installé — skipping verify (apt install nmap)")
-        return host_ports_masscan
+        return host_ports_in
 
-    if not hosts_list:
+    if not hosts_to_verify:
         log_warn("Aucun host pour nmap verify")
-        return host_ports_masscan
+        return host_ports_in
 
-    hosts_file  = base_path / "hosts_alive.txt"
+    verify_list = base_path / "_verify_list.txt"
+    write_list(verify_list, list(hosts_to_verify))
     nmap_output = base_path / "nmap_verify.xml"
     tcp_ports_str = ",".join(str(p) for p in ALL_TCP_PORTS)
 
-    log_info(f"nmap SYN scan sur {len(hosts_list)} hosts, ports TCP {tcp_ports_str}")
+    log_info(f"nmap SYN scan sur {len(hosts_to_verify)} hosts, ports TCP {tcp_ports_str}")
     log_info("Paramètres: -sS --open --max-retries 2 --min-rate 500 (fiable, pas agressif)")
 
     _, err, code = run(
         f"nmap -sS --open -p {tcp_ports_str} --max-retries 2 --min-rate 500 "
-        f"-iL {hosts_file} -oX {nmap_output} -n 2>/dev/null",
+        f"-iL {verify_list} -oX {nmap_output} -n 2>/dev/null",
         timeout=600
     )
 
     if not nmap_output.exists() or nmap_output.stat().st_size == 0:
         log_warn(f"nmap n'a pas produit de résultats (code={code})")
-        return host_ports_masscan
+        return host_ports_in
 
     # ── Parse XML nmap ────────────────────────────────────────────────────────
     nmap_ports: dict[str, set[int]] = {}
@@ -513,12 +635,12 @@ def nmap_verify(base_path, hosts_list, host_ports_masscan):
                 nmap_ports[ip] = ports_found
     except ET.ParseError as e:
         log_warn(f"Erreur parsing XML nmap: {e}")
-        return host_ports_masscan
+        return host_ports_in
 
     # ── Stats diff ────────────────────────────────────────────────────────────
     new_ports_total = 0
     new_hosts_total = 0
-    merged = {ip: set(ports) for ip, ports in host_ports_masscan.items()}
+    merged = {ip: set(ports) for ip, ports in host_ports_in.items()}
 
     for ip, ports in nmap_ports.items():
         if ip not in merged:
@@ -630,6 +752,8 @@ Fichier de cibles (targets.txt):
                         help="Taux masscan en pps (défaut: 5000)")
     parser.add_argument("--verify", action="store_true",
                         help="Double-check nmap SYN après masscan (plus lent mais zéro faux négatif)")
+    parser.add_argument("--fresh", action="store_true",
+                        help="Ignore l'état précédent et rescanne tout (par défaut : reprise/incrémental)")
     args = parser.parse_args()
 
     targets = parse_targets(args.target)
@@ -650,28 +774,83 @@ Fichier de cibles (targets.txt):
 
     base_path = setup_output_multi(args.output, args.target, targets)
 
-    # Sauvegarde la liste des cibles pour référence
-    (base_path / "targets.txt").write_text("\n".join(targets) + "\n")
+    if args.fresh:
+        clean_output(base_path)
+        log_info("--fresh : état précédent effacé, scan complet")
 
-    # Progress phases (for the web UI): discovery, masscan, [nmap verify].
+    # ── Charge l'état accumulé (merge incrémental + reprise) ──────────────────
+    state         = load_state(base_path)
+    prior_targets = set(state.get("targets_scanned", []))
+    prior_scanned = set(state.get("hosts_scanned", []))
+    prior_alive   = set(read_list(base_path / "hosts_alive.txt"))
+    prior_ports   = load_prior_ports(base_path)
+
+    # targets.txt = union de toutes les cibles connues (historique cumulé)
+    all_known = sorted(prior_targets | set(targets))
+    (base_path / "targets.txt").write_text("\n".join(all_known) + "\n")
+
+    # Incrémental : on ne (re)découvre que les subnets pas encore traités.
+    new_targets = [t for t in targets if t not in prior_targets]
+    if prior_targets:
+        if new_targets:
+            log_info(f"Reprise : {len(new_targets)} nouveau(x) subnet(s) à découvrir")
+        else:
+            log_info("Reprise : aucun nouveau subnet depuis le dernier run")
+
     total_steps = 3 if args.verify else 2
 
-    emit_progress(1, total_steps, label="ÉTAPE 1 — Découverte des hôtes")
-    hosts_list = discover_hosts(base_path, targets)
+    try:
+        # ── ETAPE 1 — découverte (nouveaux subnets) + merge ──────────────────
+        emit_progress(1, total_steps, label="ÉTAPE 1 — Découverte des hôtes")
+        discovered   = discover_hosts(new_targets)
+        merged_alive = prior_alive | discovered
+        write_list(base_path / "hosts_alive.txt", list(merged_alive))
+        if discovered:
+            log_ok(f"{len(merged_alive)} hôtes vivants cumulés "
+                   f"(+{len(discovered - prior_alive)} nouveaux)")
+        if not merged_alive:
+            log_err("Aucun host vivant (ni nouveau ni accumulé) — rien à scanner")
+            sys.exit(1)
 
-    if not hosts_list:
-        sys.exit(1)
+        # Incrémental : on ne masscanne que les hôtes jamais scannés.
+        hosts_to_scan = sorted(merged_alive - prior_scanned)
+        if not hosts_to_scan:
+            log_info("Tous les hôtes vivants ont déjà été port-scannés")
 
-    emit_progress(2, total_steps, label="ÉTAPE 2 — Port scan (masscan)")
-    host_ports = masscan_scan(base_path, hosts_list, rate=args.rate)
+        # ── ETAPE 2 — masscan (nouveaux hôtes) + merge ───────────────────────
+        emit_progress(2, total_steps, label="ÉTAPE 2 — Port scan (masscan)")
+        new_ports, scan_ok = masscan_scan(base_path, hosts_to_scan, rate=args.rate)
+        merged_ports = merge_ports(prior_ports, new_ports)
+        # On ne marque "scannés" que si masscan a terminé proprement.
+        scanned_now = prior_scanned | (set(hosts_to_scan) if scan_ok else set())
 
-    if args.verify and host_ports is not None:
-        emit_progress(3, total_steps, label="ÉTAPE 3 — Vérification nmap")
-        host_ports = nmap_verify(base_path, hosts_list, host_ports)
-        # Réécrire les fichiers hosts_*.txt / port_*.txt avec les résultats mergés
-        _rewrite_output_files(base_path, host_ports)
+        # ── ETAPE 3 — vérification nmap (optionnel) ──────────────────────────
+        if args.verify:
+            emit_progress(3, total_steps, label="ÉTAPE 3 — Vérification nmap")
+            verify_hosts = hosts_to_scan or sorted(merged_alive)
+            merged_ports = nmap_verify(base_path, verify_hosts, merged_ports)
 
-    write_summary(base_path, args.target, hosts_list, host_ports, args.rate)
+        # ── Écriture des fichiers catégorisés depuis l'ensemble accumulé ─────
+        _rewrite_output_files(base_path, merged_ports)
+
+        # ── Persistance de l'état ────────────────────────────────────────────
+        state["rate"]            = args.rate
+        state["targets_scanned"] = sorted(prior_targets | set(new_targets))
+        state["hosts_scanned"]   = sorted(scanned_now)
+        state["last_phase"]      = "done"
+        save_state(base_path, state)
+
+        write_summary(base_path, args.target, sorted(merged_alive), merged_ports, args.rate)
+
+    except KeyboardInterrupt:
+        log_warn("Interruption (Ctrl-C) — sauvegarde de l'état pour reprise")
+        # On ne valide ni les nouveaux subnets ni les hôtes du run en cours,
+        # pour qu'ils soient repris au prochain lancement.
+        state["rate"]       = args.rate
+        state["last_phase"] = "interrupted"
+        save_state(base_path, state)
+        log_info(f"Relancez la même commande pour reprendre (état : {base_path}/{STATE_FILE})")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
