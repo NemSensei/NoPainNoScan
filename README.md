@@ -33,7 +33,6 @@ NoPainNoScan/
 |---|---|---|
 | `masscan` | ad_recon_userless | `apt install masscan` |
 | `fping` | ad_recon_userless | `apt install fping` |
-| `arp-scan` | ad_recon_userless | `apt install arp-scan` |
 | `nmap` | ad_recon_userless (discovery TCP + `--verify`) | `apt install nmap` |
 | `nxc` / `netexec` | smb, ldap, rdp, mssql, ssh, ftp, winrm, kerberos | `pip install netexec` |
 | `ldapsearch` | ldap | `apt install ldap-utils` |
@@ -83,11 +82,60 @@ Chaque script vérifie les outils requis au démarrage et signale les manquants 
 
 ---
 
+## Interface web
+
+Une interface web **optionnelle** (FastAPI) permet de piloter le toolkit depuis le navigateur : lancer les scans, suivre leur exécution en temps réel, explorer les résultats dans un dashboard et générer les rapports. Elle réutilise directement les scripts existants et `generate_report.py` — rien n'est dupliqué, le mode CLI reste pleinement utilisable.
+
+Elle est conçue pour un usage **local, mono-utilisateur** : le serveur n'écoute que sur `127.0.0.1` et il n'y a pas d'authentification.
+
+### Lancement
+
+```bash
+cd webui
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-web.txt
+# Optionnel : export PDF des rapports
+pip install -r requirements-report-optional.txt
+
+python -m app.main        # http://127.0.0.1:8000
+# ou : uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+### Fonctionnalités
+
+| Page | Rôle |
+|---|---|
+| **Campagnes** (`/`) | Créer une campagne (nom, client), l'activer, regrouper les scans associés |
+| **Scan** (`/scan`) | Formulaire piloté dynamiquement par les 13 checks : cible, champs de creds et options spécifiques selon le check, badges des outils requis. Progression live via SSE + annulation |
+| **Dashboard** (`/dashboard`) | Synthèse par sévérité (critical → info), hosts vivants, top ports, table de findings triable et filtrable par service/sévérité |
+| **Historique** (`/history`) | Liste des runs d'une campagne, statuts, comparaison côte-à-côte des compteurs |
+| **Rapport** | Génération du rapport HTML agrégé (via `generate_report.py`) et export PDF best-effort, téléchargeables |
+
+### Architecture
+
+```
+webui/app/
+├── main.py              # Application FastAPI, routes de pages
+├── config.py            # Chemins, host/port, dossiers de run
+├── scanner/
+│   ├── registry.py      # Métadonnées des 13 checks (args, outils requis)
+│   ├── runner.py        # Exécution asynchrone (argv, sans shell)
+│   ├── jobs.py          # Jobs en mémoire + streaming des logs
+│   └── routes.py        # API : /api/runs, SSE, cancel
+├── parsers/             # Normalisation des sorties → findings/sévérités (API results)
+├── reports/             # Agrégation multi-runs + export HTML/PDF
+└── campaigns/store.py   # Persistance SQLite (campagnes, runs)
+```
+
+> **Note sécurité (v1)** : les scans sont exécutés en passant les arguments sous forme de liste (`subprocess` sans `shell=True`), ce qui limite fortement le risque d'injection. La validation fine des cibles/credentials reste un durcissement prévu — à compléter avant toute exposition au-delà de `localhost`.
+
+---
+
 ## Phase 0 — Discovery réseau
 
 ### `ad_recon_userless.py`
 
-**Prérequis :** root (arp-scan, nmap SYN ping et masscan nécessitent des sockets raw)
+**Prérequis :** root (nmap SYN ping et masscan nécessitent des sockets raw)
 
 ```bash
 # Cible unique
@@ -119,10 +167,9 @@ Le répertoire de sortie est nommé d'après le CIDR (cible unique) ou le nom du
 
 **ETAPE 1 — Découverte des hôtes**
 
-Trois méthodes complémentaires, toutes sources mergées et dédupliquées → **`hosts_alive.txt`** :
+Deux méthodes complémentaires, toutes sources mergées et dédupliquées → **`hosts_alive.txt`** :
 
 - `fping -a -g -q <CIDR>` — ICMP sweep, liste les hosts qui répondent au ping
-- `arp-scan --localnet` — ARP sweep, détecte les hosts qui bloquent ICMP (réseau local uniquement)
 - `nmap -sn -PS22,80,88,135,139,389,443,445,3389,5985,5986` — TCP SYN ping sur ports AD/internes courants, détecte les hosts routés ou avec ICMP filtré mais avec des services ouverts (SMB, RDP, LDAP, WinRM…)
 
 Le terminal indique combien de hosts chaque méthode ajoute par rapport aux précédentes.
@@ -161,7 +208,7 @@ sudo python3 ad_recon_userless.py -t targets.txt -o /tmp/pentest --verify
 | Fichier | Contenu |
 |---|---|
 | `targets.txt` | Cibles scannées (copie du fichier d'entrée ou CIDR unique) |
-| `hosts_alive.txt` | Tous les hôtes vivants (ICMP + ARP + TCP SYN ping) |
+| `hosts_alive.txt` | Tous les hôtes vivants (ICMP + TCP SYN ping) |
 | `hosts_dc.txt` | DC potentiels : ports Kerberos (88 ou 464) **ET** LDAP (389 ou 3268) |
 | `hosts_smb.txt` | Hôtes avec SMB (139 ou 445) |
 | `hosts_ldap.txt` | Hôtes avec LDAP/LDAPS (389, 636, 3268, 3269) |
@@ -910,55 +957,6 @@ Le script scanne récursivement le répertoire fourni et détecte automatiquemen
 | WinRM | Hosts détectés, hosts accessibles avec creds |
 
 Les services non scannés affichent "Not scanned" en gris plutôt que de rester vides.
-
----
-
-## Interface web
-
-Une interface web **optionnelle** (FastAPI) permet de piloter le toolkit depuis le navigateur : lancer les scans, suivre leur exécution en temps réel, explorer les résultats dans un dashboard et générer les rapports. Elle réutilise directement les scripts existants et `generate_report.py` — rien n'est dupliqué, le mode CLI reste pleinement utilisable.
-
-Elle est conçue pour un usage **local, mono-utilisateur** : le serveur n'écoute que sur `127.0.0.1` et il n'y a pas d'authentification.
-
-### Lancement
-
-```bash
-cd webui
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements-web.txt
-# Optionnel : export PDF des rapports
-pip install -r requirements-report-optional.txt
-
-python -m app.main        # http://127.0.0.1:8000
-# ou : uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
-
-### Fonctionnalités
-
-| Page | Rôle |
-|---|---|
-| **Campagnes** (`/`) | Créer une campagne (nom, client), l'activer, regrouper les scans associés |
-| **Scan** (`/scan`) | Formulaire piloté dynamiquement par les 13 checks : cible, champs de creds et options spécifiques selon le check, badges des outils requis. Progression live via SSE + annulation |
-| **Dashboard** (`/dashboard`) | Synthèse par sévérité (critical → info), hosts vivants, top ports, table de findings triable et filtrable par service/sévérité |
-| **Historique** (`/history`) | Liste des runs d'une campagne, statuts, comparaison côte-à-côte des compteurs |
-| **Rapport** | Génération du rapport HTML agrégé (via `generate_report.py`) et export PDF best-effort, téléchargeables |
-
-### Architecture
-
-```
-webui/app/
-├── main.py              # Application FastAPI, routes de pages
-├── config.py            # Chemins, host/port, dossiers de run
-├── scanner/
-│   ├── registry.py      # Métadonnées des 13 checks (args, outils requis)
-│   ├── runner.py        # Exécution asynchrone (argv, sans shell)
-│   ├── jobs.py          # Jobs en mémoire + streaming des logs
-│   └── routes.py        # API : /api/runs, SSE, cancel
-├── parsers/             # Normalisation des sorties → findings/sévérités (API results)
-├── reports/             # Agrégation multi-runs + export HTML/PDF
-└── campaigns/store.py   # Persistance SQLite (campagnes, runs)
-```
-
-> **Note sécurité (v1)** : les scans sont exécutés en passant les arguments sous forme de liste (`subprocess` sans `shell=True`), ce qui limite fortement le risque d'injection. La validation fine des cibles/credentials reste un durcissement prévu — à compléter avant toute exposition au-delà de `localhost`.
 
 ---
 

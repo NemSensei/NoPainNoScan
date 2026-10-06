@@ -132,7 +132,7 @@ REGISTRY: dict[str, CheckDefinition] = {
                     "produces the hosts_*.txt files consumed by every other check.",
         supports_creds=False,
         needs_root=True,
-        required_tools=["masscan", "fping", "arp-scan", "nmap"],
+        required_tools=["masscan", "fping", "nmap"],
         optional_tools=[],
         arguments=[
             CheckArgument(name="--target", short="-t", dest="target", type="str",

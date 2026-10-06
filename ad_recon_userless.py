@@ -6,9 +6,8 @@ Usage: sudo python3 ad_recon_userless.py -t 192.168.1.0/24
 
 Workflow:
     1. fping      — ICMP sweep (hosts alive)
-    2. arp-scan   — ARP sweep (hosts silencieux ICMP, réseau local)
-    3. nmap       — TCP SYN ping sur ports AD/internes courants (hosts bloquant ICMP/ARP)
-    4. masscan    — port scan rapide (ports AD + services communs + UDP SNMP/IPMI)
+    2. nmap       — TCP SYN ping sur ports AD/internes courants (hosts bloquant ICMP)
+    3. masscan    — port scan rapide (ports AD + services communs + UDP SNMP/IPMI)
 
 Input:
     -t peut être :
@@ -18,7 +17,7 @@ Input:
 
 Output files:
     targets.txt           cibles scannées (copie, si multi-cibles)
-    hosts_alive.txt       tous les hosts répondants (ICMP/ARP/TCP)
+    hosts_alive.txt       tous les hosts répondants (ICMP/TCP)
     hosts_dc.txt          DCs potentiels (Kerberos 88/464 + LDAP 389/3268)
     hosts_smb.txt         SMB (445/139)
     hosts_ldap.txt        LDAP/LDAPS (389,636,3268,3269)
@@ -207,8 +206,8 @@ DISCOVERY_TCP_PORTS = "22,80,88,135,139,389,443,445,3389,5985,5986"
 # =============================================================================
 def discover_hosts(base_path, targets):
     """
-    Découverte via ICMP (fping) + ARP (arp-scan) + TCP SYN ping (nmap).
-    Les trois sources sont fusionnées et dédupliquées.
+    Découverte via ICMP (fping) + TCP SYN ping (nmap).
+    Les deux sources sont fusionnées et dédupliquées.
 
     Args:
         targets: list[str] — CIDRs/IPs à scanner
@@ -232,23 +231,8 @@ def discover_hosts(base_path, targets):
     else:
         log_warn("fping non installé — skipping ICMP (apt install fping)")
 
-    # --- arp-scan: ARP (réseau local uniquement, une seule exécution) ---
-    if tool_exists("arp-scan"):
-        log_info("arp-scan ARP sweep (réseau local)...")
-        out, _, _ = run("arp-scan --localnet --quiet 2>/dev/null", timeout=60)
-        arp_hosts = set()
-        for line in out.splitlines():
-            match = re.match(r'^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s', line)
-            if match:
-                arp_hosts.add(match.group(1))
-        if arp_hosts:
-            log_ok(f"arp-scan: {len(arp_hosts)} hosts ARP")
-            hosts.update(arp_hosts)
-    else:
-        log_warn("arp-scan non installé — hosts silencieux ICMP non détectés (apt install arp-scan)")
-
     # --- nmap: TCP SYN ping sur ports AD/internes courants ---
-    # Détecte les hosts qui bloquent ICMP et ARP (hôtes routés, VLANs distants,
+    # Détecte les hosts qui bloquent ICMP (hôtes routés, VLANs distants,
     # machines Windows avec pare-feu bloquant le ping).
     if tool_exists("nmap"):
         for target in targets:
@@ -269,7 +253,7 @@ def discover_hosts(base_path, targets):
             if tcp_hosts:
                 log_ok(
                     f"nmap TCP ping [{target}]: {len(tcp_hosts)} hosts répondent"
-                    + (f" ({len(new_hosts)} nouveaux vs ICMP/ARP)" if new_hosts else "")
+                    + (f" ({len(new_hosts)} nouveaux vs ICMP)" if new_hosts else "")
                 )
                 hosts.update(tcp_hosts)
             else:
@@ -278,7 +262,7 @@ def discover_hosts(base_path, targets):
         log_warn("nmap non installé — TCP port ping désactivé (apt install nmap)")
 
     if not hosts:
-        log_err("Aucun host découvert — vérifier le réseau ou les permissions (root requis pour ARP/SYN)")
+        log_err("Aucun host découvert — vérifier le réseau ou les permissions (root requis pour SYN)")
         return []
 
     hosts_list = sort_ips(list(hosts))
