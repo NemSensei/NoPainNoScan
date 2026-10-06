@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """check_rdp.py - RDP enumeration and NLA checks"""
 
-import argparse, subprocess, os, sys, re, ipaddress
+import argparse, subprocess, os, sys, re, ipaddress, shlex
 from datetime import datetime
 from pathlib import Path
 
@@ -164,13 +164,13 @@ def parse_auth_output(stdout):
 
 def _build_cred_args(hosts_file, username, password, ntlm_hash, domain):
     """Build nxc rdp command parts for credential-based scanning."""
-    parts = [f"nxc rdp {hosts_file}", f"-u '{username}'"]
+    parts = [f"nxc rdp {hosts_file}", f"-u {shlex.quote(username)}"]
     if ntlm_hash:
-        parts.append(f"-H '{ntlm_hash}'")
+        parts.append(f"-H {shlex.quote(ntlm_hash)}")
     elif password:
-        parts.append(f"-p '{password}'")
+        parts.append(f"-p {shlex.quote(password)}")
     if domain:
-        parts.append(f"-d '{domain}'")
+        parts.append(f"-d {shlex.quote(domain)}")
     return parts
 
 def step1_nla_check(hosts_file, out_dir):

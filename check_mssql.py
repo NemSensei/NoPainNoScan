@@ -7,6 +7,7 @@ import subprocess
 import os
 import sys
 import re
+import shlex
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -111,7 +112,7 @@ def step_hosts_info(hosts_file: str, out_dir: Path) -> list:
         out_file.write_text("# Skipped by user request\n")
         return []
 
-    stdout, _, _ = run(f"nxc mssql {hosts_file} 2>/dev/null", timeout=180)
+    stdout, _, _ = run(f"nxc mssql {shlex.quote(hosts_file)} 2>/dev/null", timeout=180)
     lines = [l for l in stdout.splitlines() if l.strip()]
 
     if lines:
@@ -141,7 +142,7 @@ def step_default_creds(hosts_file: str, out_dir: Path) -> list:
         display_pwd = pwd or "<empty>"
         log_info(f"Testing {user}:{display_pwd}")
         stdout, _, _ = run(
-            f"nxc mssql {hosts_file} -u '{user}' -p '{pwd}' --no-bruteforce 2>/dev/null",
+            f"nxc mssql {shlex.quote(hosts_file)} -u {shlex.quote(user)} -p {shlex.quote(pwd)} --no-bruteforce 2>/dev/null",
             timeout=180,
         )
         for line in stdout.splitlines():
@@ -167,13 +168,13 @@ def build_cred_str(username, password, ntlm_hash, domain):
     """Build nxc credential fragment."""
     parts = []
     if username:
-        parts.append(f"-u '{username}'")
+        parts.append(f"-u {shlex.quote(username)}")
     if ntlm_hash:
-        parts.append(f"-H '{ntlm_hash}'")
+        parts.append(f"-H {shlex.quote(ntlm_hash)}")
     elif password is not None:
-        parts.append(f"-p '{password}'")
+        parts.append(f"-p {shlex.quote(password)}")
     if domain:
-        parts.append(f"-d '{domain}'")
+        parts.append(f"-d {shlex.quote(domain)}")
     return " ".join(parts)
 
 
@@ -188,34 +189,42 @@ def step_authenticated(hosts_file: str, out_dir: Path,
             (out_dir / fname).write_text("# Skipped by user request\n")
         return
 
-    # Prefer explicit creds; fall back to first successful default hit
+    # Prefer explicit creds; fall back to first successful default hit.
+    # Determine the auth mode ONCE so every query below uses the same mode as
+    # the login that actually succeeded:
+    #   - explicit creds  -> local auth unless a domain was supplied
+    #   - default SA hits -> local SQL auth (built-in sa account) => --local-auth
     if username:
         user, pwd, h, dom = username, password, ntlm_hash, domain
+        use_local_auth = not dom
     elif default_hits:
         user, pwd, h, dom = default_hits[0][1], default_hits[0][2], None, None
+        use_local_auth = True
     else:
         log_warn("No credentials available — skipping authenticated checks")
         return
 
     creds = build_cred_str(user, pwd, h, dom)
+    auth = " --local-auth" if use_local_auth else ""
+    hf = shlex.quote(hosts_file)
     accessible_lines = []
     cmdexec_lines = []
     linked_lines = []
 
     log_info(f"Querying instance info as {user}")
     q1 = "SELECT @@version, system_user, is_srvrolemember('sysadmin')"
-    stdout, _, _ = run(f"nxc mssql {hosts_file} {creds} -q \"{q1}\" 2>/dev/null", timeout=180)
+    stdout, _, _ = run(f"nxc mssql {hf} {creds}{auth} -q \"{q1}\" 2>/dev/null", timeout=180)
     for line in stdout.splitlines():
         if "[+]" in line or "sysadmin" in line.lower() or "@@version" in line.lower():
             accessible_lines.append(line.strip())
 
     log_info(f"Listing databases as {user}")
     q2 = "SELECT name FROM sys.databases"
-    stdout, _, _ = run(f"nxc mssql {hosts_file} {creds} --local-auth -q \"{q2}\" 2>/dev/null", timeout=180)
+    stdout, _, _ = run(f"nxc mssql {hf} {creds}{auth} -q \"{q2}\" 2>/dev/null", timeout=180)
     accessible_lines.extend(l.strip() for l in stdout.splitlines() if l.strip())
 
     log_info(f"Testing xp_cmdshell (whoami) as {user}")
-    stdout, _, _ = run(f"nxc mssql {hosts_file} {creds} -x 'whoami' 2>/dev/null", timeout=180)
+    stdout, _, _ = run(f"nxc mssql {hf} {creds}{auth} -x 'whoami' 2>/dev/null", timeout=180)
     for line in stdout.splitlines():
         if "[+]" in line or "Pwn3d!" in line or "\\" in line:
             m = re.search(r'MSSQL\s+([\d.]+)', line)
@@ -225,7 +234,7 @@ def step_authenticated(hosts_file: str, out_dir: Path,
 
     log_info(f"Checking linked servers as {user}")
     q3 = "SELECT name FROM sys.servers"
-    stdout, _, _ = run(f"nxc mssql {hosts_file} {creds} -q \"{q3}\" 2>/dev/null", timeout=180)
+    stdout, _, _ = run(f"nxc mssql {hf} {creds}{auth} -q \"{q3}\" 2>/dev/null", timeout=180)
     linked_lines.extend(l.strip() for l in stdout.splitlines() if l.strip())
 
     acc_file = out_dir / "mssql_accessible.txt"

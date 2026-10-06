@@ -4,6 +4,7 @@
 import argparse
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -120,13 +121,13 @@ def resolve_targets(target: str) -> list[str]:
 
 def build_cred_args(username: str, password: str | None, hash_: str | None, domain: str | None) -> str:
     """Return nxc credential arguments."""
-    args = f"-u '{username}'"
+    args = f"-u {shlex.quote(username)}"
     if hash_:
-        args += f" -H '{hash_}'"
+        args += f" -H {shlex.quote(hash_)}"
     elif password is not None:
-        args += f" -p '{password}'"
+        args += f" -p {shlex.quote(password)}"
     if domain:
-        args += f" -d '{domain}'"
+        args += f" -d {shlex.quote(domain)}"
     return args
 
 

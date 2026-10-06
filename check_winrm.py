@@ -4,6 +4,7 @@
 import argparse
 import ipaddress
 import os
+import shlex
 import re
 import subprocess
 import sys
@@ -127,6 +128,19 @@ def write_hosts_file(ips, path):
 # Step helpers
 # ---------------------------------------------------------------------------
 
+def _probe_targets(port):
+    """Return the list of (scheme, port) pairs to probe for the chosen port.
+
+    5986 -> https only, 5985 -> http only. Any other (custom) port has unknown
+    TLS status, so both schemes are probed on it (never an empty list).
+    """
+    if port == 5986:
+        return [("https", 5986)]
+    if port == 5985:
+        return [("http", 5985)]
+    return [("http", port), ("https", port)]
+
+
 def step1_detect(hosts_file, port, out_dir):
     """WinRM detection + auth method check — no credentials required."""
     log_step("STEP 1 — WinRM Detection & Auth Methods")
@@ -139,7 +153,7 @@ def step1_detect(hosts_file, port, out_dir):
 
     # --- nxc winrm sweep ---
     log_info("Running nxc winrm sweep...")
-    nxc_out, nxc_err, _ = run(f"nxc winrm {hosts_file}", timeout=300)
+    nxc_out, nxc_err, _ = run(f"nxc winrm {hosts_file} --port {port}", timeout=300)
 
     info_path = out_dir / "winrm_hosts_info.txt"
     lines_nxc = [l for l in nxc_out.splitlines() if l.strip()]
@@ -159,9 +173,7 @@ def step1_detect(hosts_file, port, out_dir):
     header_results = []
 
     for ip in ips:
-        for (scheme, p) in [("http", 5985), ("https", 5986)]:
-            if port != 5985 and p != port:
-                continue
+        for (scheme, p) in _probe_targets(port):
             url = f"{scheme}://{ip}:{p}/wsman"
             log_info(f"Checking headers: {url}")
             curl_cmd = f"curl -sk {url} -D - --max-time 5 2>&1 | head -20"
@@ -200,23 +212,23 @@ def step1_detect(hosts_file, port, out_dir):
     return combined
 
 
-def step2_auth(hosts_file, username, password, ntlm_hash, domain, out_dir):
+def step2_auth(hosts_file, username, password, ntlm_hash, domain, out_dir, port):
     """Test provided credentials against WinRM."""
     log_step("STEP 2 — Authentication Test")
 
-    if not confirm_step("STEP 2 — Authentication Test", f"nxc winrm {hosts_file} -u {username} ..."):
+    if not confirm_step("STEP 2 — Authentication Test", f"nxc winrm {hosts_file} --port {port} -u {username} ..."):
         (out_dir / "winrm_accessible.txt").write_text("# Skipped by user request\n")
         return []
 
-    cred_part = f"-u '{username}'"
+    cred_part = f"-u {shlex.quote(username)}"
     if ntlm_hash:
-        cred_part += f" -H '{ntlm_hash}'"
+        cred_part += f" -H {shlex.quote(ntlm_hash)}"
     elif password:
-        cred_part += f" -p '{password}'"
+        cred_part += f" -p {shlex.quote(password)}"
     if domain:
-        cred_part += f" -d '{domain}'"
+        cred_part += f" -d {shlex.quote(domain)}"
 
-    cmd = f"nxc winrm {hosts_file} {cred_part}"
+    cmd = f"nxc winrm {hosts_file} --port {port} {cred_part}"
     log_info(f"Running: {cmd}")
     out, err, _ = run(cmd, timeout=300)
 
@@ -242,21 +254,21 @@ def step2_auth(hosts_file, username, password, ntlm_hash, domain, out_dir):
     return accessible
 
 
-def step3_exec(hosts_file, username, password, ntlm_hash, domain, out_dir):
+def step3_exec(hosts_file, username, password, ntlm_hash, domain, out_dir, port):
     """Execute commands on accessible WinRM hosts."""
     log_step("STEP 3 — Command Execution")
 
-    if not confirm_step("STEP 3 — Command Execution", f"nxc winrm {hosts_file} -u {username} ... -x 'whoami /all' / 'hostname' / 'ipconfig /all'"):
+    if not confirm_step("STEP 3 — Command Execution", f"nxc winrm {hosts_file} --port {port} -u {username} ... -x 'whoami /all' / 'hostname' / 'ipconfig /all'"):
         (out_dir / "winrm_cmd_results.txt").write_text("# Skipped by user request\n")
         return
 
-    cred_part = f"-u '{username}'"
+    cred_part = f"-u {shlex.quote(username)}"
     if ntlm_hash:
-        cred_part += f" -H '{ntlm_hash}'"
+        cred_part += f" -H {shlex.quote(ntlm_hash)}"
     elif password:
-        cred_part += f" -p '{password}'"
+        cred_part += f" -p {shlex.quote(password)}"
     if domain:
-        cred_part += f" -d '{domain}'"
+        cred_part += f" -d {shlex.quote(domain)}"
 
     commands = [
         ("whoami /all", "whoami"),
@@ -270,7 +282,7 @@ def step3_exec(hosts_file, username, password, ntlm_hash, domain, out_dir):
 
         for (win_cmd, label) in commands:
             log_info(f"Executing: {win_cmd}")
-            nxc_cmd = f"nxc winrm {hosts_file} {cred_part} -x '{win_cmd}'"
+            nxc_cmd = f"nxc winrm {hosts_file} --port {port} {cred_part} -x '{win_cmd}'"
             out, err, _ = run(nxc_cmd, timeout=120)
             f.write(f"\n{'='*50}\n## {label}\n{'='*50}\n")
             f.write(out + "\n")
@@ -382,12 +394,12 @@ def main():
     if has_creds:
         accessible = step2_auth(
             tmp_hosts, args.username, args.password,
-            args.hash, args.domain, out_dir
+            args.hash, args.domain, out_dir, args.port
         )
         if accessible:
             step3_exec(
                 tmp_hosts, args.username, args.password,
-                args.hash, args.domain, out_dir
+                args.hash, args.domain, out_dir, args.port
             )
         else:
             log_warn("Skipping command execution — no successful authentications.")

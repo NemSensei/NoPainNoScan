@@ -189,7 +189,7 @@ def enumerate_host(ip, community, version, output_dir):
     sys_out, _, _ = run(f"snmpwalk -v{ver} -c {community} {ip} system", timeout=20)
     for line in sys_out.splitlines():
         if "sysDescr" in line:
-            info["sysDescr"] = line.split("STRING:", 1)[-1].strip().split("\"")[-2] if "STRING:" in line else line
+            info["sysDescr"] = line.split("STRING:", 1)[-1].strip().strip('"') if "STRING:" in line else line
         if "sysName" in line:
             info["sysName"] = line.split("STRING:", 1)[-1].strip().strip('"')
 

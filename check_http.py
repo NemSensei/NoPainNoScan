@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """check_http.py - HTTP/HTTPS service enumeration and ADCS/WebDAV detection"""
 
-import argparse, subprocess, sys, os, re
+import argparse, subprocess, sys, os, re, shlex
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -205,7 +205,7 @@ def step4_services(ip, port, scheme, timeout):
 
 def step5_whatweb(url):
     """Run whatweb on a URL, return output line."""
-    cmd = f"whatweb --no-errors -q {url}"
+    cmd = f"whatweb --no-errors -q {shlex.quote(url)}"
     out, _, _ = run(cmd, timeout=60)
     return out.strip()
 
@@ -352,7 +352,7 @@ def main():
         for t in all_titles:
             if t['status'] not in ('000', '') and t['url'] not in seen_urls:
                 seen_urls.add(t['url'])
-                out = step5_whatweb(t['ip'], t['port'], t['scheme'])
+                out = step5_whatweb(t['url'])
                 if out:
                     all_whatweb.append(out)
                     log_info(f"whatweb: {out[:120]}")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """check_ldap.py - LDAP null bind testing and AD enumeration"""
 
-import argparse, subprocess, os, sys, re
+import argparse, subprocess, os, sys, re, shlex
 from datetime import datetime
 from pathlib import Path
 
@@ -225,8 +225,8 @@ def step_nullbind_dump(vulnerable: list[str], host_map: dict[str, str], outdir: 
 
 def build_cred_part(user: str, password: str | None, nt_hash: str | None) -> str:
     if nt_hash:
-        return f"-u '{user}' -H '{nt_hash}'"
-    return f"-u '{user}' -p '{password or ''}'"
+        return f"-u {shlex.quote(user)} -H {shlex.quote(nt_hash)}"
+    return f"-u {shlex.quote(user)} -p {shlex.quote(password or '')}"
 
 def step_auth_enum(hosts: list[str], user: str, password: str | None,
                    nt_hash: str | None, domain: str, outdir: Path):
@@ -247,7 +247,7 @@ def step_auth_enum(hosts: list[str], user: str, password: str | None,
 
     for flag, filename, label in checks:
         log_info(f"Running nxc ldap {flag} ...")
-        cmd = f"nxc ldap {targets} {cred} -d '{domain}' {flag} 2>/dev/null"
+        cmd = f"nxc ldap {targets} {cred} -d {shlex.quote(domain)} {flag} 2>/dev/null"
         out, _, rc = run(cmd, timeout=120)
         write_file(outdir / filename, out)
         if rc == 0 and out.strip():
@@ -268,11 +268,11 @@ def step_bloodhound(hosts: list[str], user: str, password: str | None,
     bh_dir.mkdir(parents=True, exist_ok=True)
 
     dc_ip = hosts[0]
-    cred = f"--hashes '{nt_hash}'" if nt_hash else f"-p '{password or ''}'"
+    cred = f"--hashes {shlex.quote(nt_hash)}" if nt_hash else f"-p {shlex.quote(password or '')}"
 
     cmd = (
-        f"cd '{bh_dir}' && bloodhound-python "
-        f"-u '{user}' {cred} -d '{domain}' -ns {dc_ip} -c All --zip 2>/dev/null"
+        f"cd {shlex.quote(str(bh_dir))} && bloodhound-python "
+        f"-u {shlex.quote(user)} {cred} -d {shlex.quote(domain)} -ns {dc_ip} -c All --zip 2>/dev/null"
     )
     log_info(f"Running bloodhound-python against {dc_ip} ...")
     out, _, rc = run(cmd, timeout=300)

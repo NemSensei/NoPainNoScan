@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """check_ftp.py - FTP anonymous access testing and enumeration"""
 
-import argparse, subprocess, os, sys, re, ftplib, socket
+import argparse, subprocess, os, sys, re, ftplib, socket, shlex
 from datetime import datetime
 from pathlib import Path
 import ipaddress
@@ -263,7 +263,7 @@ def enumerate_ftp(ip, ftp, output_dir):
 
 def run_nxc_ftp(hosts_file, user, password, output_dir, label=''):
     """Run nxc ftp against a hosts file and parse successful logins."""
-    cmd = f"nxc ftp '{hosts_file}' -u '{user}' -p '{password}'"
+    cmd = f"nxc ftp {shlex.quote(str(hosts_file))} -u {shlex.quote(user)} -p {shlex.quote(password)}"
     log_info(f"Running: {cmd}")
     out, err, rc = run(cmd, timeout=120)
 

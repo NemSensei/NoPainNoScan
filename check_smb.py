@@ -33,6 +33,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -184,13 +185,13 @@ def build_creds_args(args):
     """Build nxc credential arguments string."""
     parts = []
     if args.username:
-        parts += ["-u", args.username]
+        parts += ["-u", shlex.quote(args.username)]
     if args.hash:
-        parts += ["-H", args.hash]
+        parts += ["-H", shlex.quote(args.hash)]
     elif args.password is not None:
-        parts += ["-p", f"'{args.password}'"]
+        parts += ["-p", shlex.quote(args.password)]
     if args.domain:
-        parts += ["-d", args.domain]
+        parts += ["-d", shlex.quote(args.domain)]
     return " ".join(parts)
 
 

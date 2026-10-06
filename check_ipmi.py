@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """check_ipmi.py - IPMI vulnerability assessment (cipher zero, RAKP, default creds)"""
 
-import argparse, subprocess, os, sys, re, ipaddress
+import argparse, subprocess, os, sys, re, shlex, ipaddress
 from datetime import datetime
 from pathlib import Path
 
@@ -112,20 +112,47 @@ def _expand(token: str) -> list:
 # STEP 1 — IPMI presence / version probe
 # ---------------------------------------------------------------------------
 
+# Markers that mean the host did NOT answer at the IPMI layer (unreachable,
+# refused, timed out, tool missing). These MUST take precedence: ipmitool's
+# own failure message "Error: Unable to establish IPMI v2 / RMCP+ session"
+# contains the words "error", "rmcp" AND "session", so matching those words
+# alone would wrongly flag every unreachable host as present.
+_IPMI_ABSENT_MARKERS = [
+    "unable to establish", "error: unable", "no route",
+    "connection refused", "connection timed out", "timed out",
+    "timeout", "command not found", "no such file", "could not open",
+    "address already in use", "network is unreachable", "host is down",
+]
+
+# Substrings that only appear in a genuine IPMI-layer response (valid chassis
+# reply, or a RAKP/auth response that proves the BMC answered).
+_IPMI_PRESENT_MARKERS = [
+    "system power", "power state", "chassis power", "rakp 2",
+    "unauthorized name", "insufficient privilege", "invalid user name",
+    "invalid user", "requested data not found",
+]
+
+
+def _classify_ipmi_presence(combined: str, rc: int) -> bool:
+    """Decide IPMI presence from command output + return code.
+
+    Absence/failure markers win first (so an unreachable host is never marked
+    present just because its error text mentions 'error'/'rmcp'/'session').
+    Presence is concluded only on a real IPMI-layer reply (rc==0 or a known
+    response marker).
+    """
+    low = combined.lower()
+    if any(m in low for m in _IPMI_ABSENT_MARKERS):
+        return False
+    return rc == 0 or any(k in low for k in _IPMI_PRESENT_MARKERS)
+
+
 def check_ipmi_info(ip: str) -> tuple:
     """Return (output_str, is_present)."""
-    cmd = f"ipmitool -I lanplus -H {ip} -U '' -P '' -C 3 chassis status 2>&1"
+    cmd = f"ipmitool -I lanplus -H {shlex.quote(ip)} -U '' -P '' -C 3 chassis status 2>&1"
     out, err, rc = run(cmd, timeout=15)
     combined = (out + err).strip()
-    # "Get Session Info command failed" or "chassis" output both indicate IPMI presence
-    # A refused connection / no route means absent
-    absent_markers = ["Unable to establish", "timed out", "TIMEOUT", "No route", "Connection refused"]
-    present = rc == 0 or any(m.lower() not in combined.lower() for m in absent_markers)
-    # More reliable: if we got any IPMI-layer response it's present
-    ipmi_response = any(k in combined.lower() for k in [
-        "chassis", "session", "unauthorized", "rakp", "authentication", "rmcp", "error"
-    ])
-    return combined, ipmi_response
+    return combined, _classify_ipmi_presence(combined, rc)
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +161,7 @@ def check_ipmi_info(ip: str) -> tuple:
 
 def check_cipher_zero(ip: str, username: str = "ADMIN") -> tuple:
     """Return (output_str, is_vulnerable)."""
-    cmd = f"ipmitool -I lanplus -C 0 -H {ip} -U {username} -P anypassword chassis status 2>&1"
+    cmd = f"ipmitool -I lanplus -C 0 -H {shlex.quote(ip)} -U {shlex.quote(username)} -P anypassword chassis status 2>&1"
     out, err, rc = run(cmd, timeout=15)
     combined = (out + err).strip()
     # Success (rc==0 and actual chassis output) = vulnerable
@@ -153,7 +180,7 @@ def check_anonymous_auth(ip: str) -> tuple:
 
     for user in ['', 'anonymous']:
         label = f"user='{user}'"
-        cmd = f"ipmitool -I lanplus -H {ip} -U '{user}' -P '' chassis status 2>&1"
+        cmd = f"ipmitool -I lanplus -H {shlex.quote(ip)} -U {shlex.quote(user)} -P '' chassis status 2>&1"
         out, err, rc = run(cmd, timeout=15)
         combined = (out + err).strip()
         success = rc == 0 and any(k in combined.lower() for k in ["system power", "chassis", "power state"])
@@ -182,7 +209,7 @@ def capture_rakp_hash(ip: str, usernames: list) -> list:
     # Prefer ipmipwner if available
     if tool_exists("ipmipwner"):
         for user in usernames:
-            cmd = f"ipmipwner --target {ip} --user {user} 2>&1"
+            cmd = f"ipmipwner --target {shlex.quote(ip)} --user {shlex.quote(user)} 2>&1"
             out, err, rc = run(cmd, timeout=30)
             combined = (out + err).strip()
             # ipmipwner outputs hashcat-ready hashes
@@ -193,7 +220,7 @@ def capture_rakp_hash(ip: str, usernames: list) -> list:
 
     # Fallback: use ipmitool -vvv and parse RAKP material from stderr
     for user in usernames:
-        cmd = f"ipmitool -I lanplus -H {ip} -U '{user}' -P 'dummypassword' -vvv chassis status 2>&1"
+        cmd = f"ipmitool -I lanplus -H {shlex.quote(ip)} -U {shlex.quote(user)} -P 'dummypassword' -vvv chassis status 2>&1"
         out, err, rc = run(cmd, timeout=20)
         combined = out + err
 
@@ -243,7 +270,7 @@ def check_default_creds(ip: str, extra_user: str = None, extra_pass: str = None)
 
     valid = []
     for user, passwd in creds_to_try:
-        cmd = f"ipmitool -I lanplus -H {ip} -U '{user}' -P '{passwd}' chassis status 2>&1"
+        cmd = f"ipmitool -I lanplus -H {shlex.quote(ip)} -U {shlex.quote(user)} -P {shlex.quote(passwd)} chassis status 2>&1"
         out, err, rc = run(cmd, timeout=15)
         combined = (out + err).strip()
         if rc == 0 and any(k in combined.lower() for k in ["system power", "chassis", "power state"]):

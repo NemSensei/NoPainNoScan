@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """check_ssh.py - SSH enumeration and cipher audit"""
 
-import argparse, subprocess, os, sys, re, socket
+import argparse, subprocess, os, sys, re, socket, shlex
 from datetime import datetime
 from pathlib import Path
 import ipaddress
@@ -168,6 +168,7 @@ def step_audit(hosts, port, out_dir):
         log_warn("ssh-audit not found. Install: apt install ssh-audit  OR  pip install ssh-audit")
         if not has_nxc:
             log_warn("nxc not found either — skipping algorithm audit")
+            (out_dir / "ssh_weak_algos.txt").write_text("")
             return {}
 
     weak_hosts = {}
@@ -249,6 +250,7 @@ def step_cred_test(hosts, port, username, password, out_dir):
         return []
     if not tool_exists("nxc"):
         log_err("nxc not found — cannot run credential test")
+        (out_dir / "ssh_login_success.txt").write_text("")
         return []
 
     # Write a temporary hosts file for nxc
@@ -256,7 +258,7 @@ def step_cred_test(hosts, port, username, password, out_dir):
     tmp_hosts.write_text("\n".join(hosts) + "\n")
 
     out, err, rc = run(
-        f"nxc ssh {tmp_hosts} --port {port} -u {username} -p {password}",
+        f"nxc ssh {tmp_hosts} --port {port} -u {shlex.quote(username)} -p {shlex.quote(password)}",
         timeout=120,
     )
     full_output = out + err
@@ -378,6 +380,7 @@ def main():
         successes = step_cred_test(hosts, args.port, args.username, args.password, out_dir)
     else:
         log_info("No credentials provided — skipping step 4 (credential test)")
+        (out_dir / "ssh_login_success.txt").write_text("")
 
     write_summary(out_dir, hosts, banners, weak_hosts, pw_hosts, successes, has_creds)
 
