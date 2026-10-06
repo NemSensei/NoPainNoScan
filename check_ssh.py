@@ -380,7 +380,6 @@ def main():
     print("  SCAN COMPLETE")
     print(f"{'='*60}{C.ENDC}")
     log_ok(f"Results in: {out_dir.resolve()}")
-    emit_progress(TOTAL_STEPS, TOTAL_STEPS, label="done")
 
 if __name__ == "__main__":
     main()

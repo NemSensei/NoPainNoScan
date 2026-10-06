@@ -21,6 +21,7 @@ touches the store or the in-memory job registry.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
@@ -194,11 +195,14 @@ async def spawn(cmd: list[str], cwd: Optional[Path] = None) -> asyncio.subproces
     Returns:
         The started asyncio subprocess Process.
     """
+    # Enable progress emission in the child scripts (they stay silent in a CLI run).
+    env = {**os.environ, "NPNS_PROGRESS": "1"}
     return await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         cwd=str(cwd) if cwd is not None else None,
+        env=env,
     )
 
 

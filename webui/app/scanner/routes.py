@@ -17,15 +17,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..campaigns.store import (
     create_campaign, list_campaigns, get_campaign, get_run,
 )
+from ..config import DATA_DIR
 from . import jobs
 from .runner import TargetValidationError
 
@@ -63,6 +66,37 @@ def api_create_campaign(body: CampaignCreate) -> dict:
 def api_list_campaigns() -> list[dict]:
     """List all campaigns, newest first."""
     return list_campaigns()
+
+
+# --------------------------------------------------------------------------- #
+# Targets file upload
+# --------------------------------------------------------------------------- #
+@router.post("/targets")
+async def api_upload_targets(file: UploadFile = File(...)) -> dict:
+    """Save an uploaded targets file and return its server-side path.
+
+    The scripts accept ``-t`` as a file of one CIDR/IP per line, so the UI uploads
+    the file here and then passes the returned ``path`` as the run target.
+    Returns: {path, name, count} where count is the number of meaningful lines
+    (non-empty, non-comment).
+    """
+    raw = await file.read()
+    if not raw or not raw.strip():
+        raise HTTPException(status_code=400, detail="empty targets file")
+    text = raw.decode("utf-8", errors="replace")
+    count = sum(1 for ln in text.splitlines()
+                if ln.strip() and not ln.strip().startswith("#"))
+    if count == 0:
+        raise HTTPException(status_code=400,
+                            detail="no targets found (only blank/comment lines)")
+
+    targets_dir = DATA_DIR / "targets"
+    targets_dir.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", (file.filename or "targets.txt"))[:80] or "targets.txt"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    dest = targets_dir / f"{stamp}_{safe}"
+    dest.write_text(text, encoding="utf-8")
+    return {"path": str(dest), "name": file.filename or safe, "count": count}
 
 
 # --------------------------------------------------------------------------- #

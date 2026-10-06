@@ -20,6 +20,7 @@ emitted by scripts that loop over hosts in Python; tool-delegated steps omit the
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from typing import Optional
@@ -29,6 +30,10 @@ _STEP_RE = re.compile(r"STEP\s+(\d+)")
 #: Prefix the runner matches on. Kept here so producer and consumer agree.
 PREFIX = "@@PROGRESS "
 
+#: Progress lines are only useful to the web UI. The runner sets this env var so
+#: they are emitted there and NEVER pollute an interactive CLI run.
+_ENV_FLAG = "NPNS_PROGRESS"
+
 
 def emit_progress(
     step: int,
@@ -37,7 +42,9 @@ def emit_progress(
     host: Optional[int] = None,
     hosts: Optional[int] = None,
 ) -> None:
-    """Write one progress line to stdout. Never raises."""
+    """Write one progress line to stdout (only when enabled). Never raises."""
+    if not os.environ.get(_ENV_FLAG):
+        return
     try:
         payload: dict = {"step": int(step), "steps": int(steps)}
         if label:

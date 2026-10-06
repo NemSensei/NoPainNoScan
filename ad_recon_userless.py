@@ -48,6 +48,12 @@ import subprocess
 import sys
 from collections import Counter
 from datetime import datetime
+
+# Progress reporting for the web UI (no-op fallback when run standalone).
+try:
+    from _npns_progress import emit_progress
+except Exception:
+    def emit_progress(*a, **k): pass
 from pathlib import Path
 
 
@@ -642,14 +648,20 @@ Fichier de cibles (targets.txt):
     # Sauvegarde la liste des cibles pour référence
     (base_path / "targets.txt").write_text("\n".join(targets) + "\n")
 
+    # Progress phases (for the web UI): discovery, masscan, [nmap verify].
+    total_steps = 3 if args.verify else 2
+
+    emit_progress(1, total_steps, label="ÉTAPE 1 — Découverte des hôtes")
     hosts_list = discover_hosts(base_path, targets)
 
     if not hosts_list:
         sys.exit(1)
 
+    emit_progress(2, total_steps, label="ÉTAPE 2 — Port scan (masscan)")
     host_ports = masscan_scan(base_path, hosts_list, rate=args.rate)
 
     if args.verify and host_ports is not None:
+        emit_progress(3, total_steps, label="ÉTAPE 3 — Vérification nmap")
         host_ports = nmap_verify(base_path, hosts_list, host_ports)
         # Réécrire les fichiers hosts_*.txt / port_*.txt avec les résultats mergés
         _rewrite_output_files(base_path, host_ports)

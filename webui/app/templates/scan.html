@@ -41,7 +41,24 @@
 
             <form class="mt" @submit.prevent="launch()">
               <label for="f-target">Target * <span class="field-help" style="display:inline" x-text="targetHelp"></span></label>
-              <input id="f-target" type="text" x-model="target" required placeholder="10.0.0.0/24, 10.0.0.5 or hosts file">
+              <!-- Type a CIDR/IP, or upload a targets file (one CIDR/IP per line) -->
+              <template x-if="!uploadInfo">
+                <div>
+                  <input id="f-target" type="text" x-model="target" placeholder="10.0.0.0/24, 10.0.0.5 or a hosts file">
+                  <div class="field-help">
+                    or <span class="link" @click="$refs.tfile.click()">load a targets file</span> (one CIDR/IP per line, # comments ok)
+                  </div>
+                  <input type="file" x-ref="tfile" accept=".txt,.lst,.csv,text/plain" style="display:none" @change="uploadTargets($event)">
+                  <template x-if="uploading"><div class="muted small">uploading…</div></template>
+                </div>
+              </template>
+              <template x-if="uploadInfo">
+                <div class="notice info" style="display:flex;align-items:center;gap:8px;margin:6px 0">
+                  <span>&#128196; <b x-text="uploadInfo.name"></b> &mdash; <span x-text="uploadInfo.count + ' targets'"></span></span>
+                  <span class="spacer" style="flex:1"></span>
+                  <button type="button" class="secondary" @click="clearFile()">change</button>
+                </div>
+              </template>
 
               <!-- Dynamic args (target & output excluded; output is server-injected) -->
               <template x-for="a in formArgs" :key="a.dest">
@@ -152,6 +169,7 @@ function scanPage() {
   return {
     checks: [], selectedId: '', current: null,
     target: '', params: {}, formArgs: [], targetHelp: '',
+    uploading: false, uploadInfo: null,
     err: '', launching: false,
     runId: null, status: '', logs: [], endInfo: null, es: null, progress: null,
 
@@ -183,6 +201,26 @@ function scanPage() {
     },
     fieldLabel(a) { return a.name + (a.required ? ' *' : '') + (a.short ? ' (' + a.short + ')' : ''); },
     isSecret(a) { return a.dest === 'password' || a.dest === 'hash'; },
+
+    async uploadTargets(e) {
+      const f = e.target && e.target.files && e.target.files[0];
+      if (!f) return;
+      this.uploading = true; this.err = '';
+      try {
+        const fd = new FormData(); fd.append('file', f);
+        const r = await fetch('/api/targets', { method: 'POST', body: fd });
+        if (!r.ok) {
+          let d = 'HTTP ' + r.status;
+          try { const j = await r.json(); if (j.detail) d = j.detail; } catch (_) {}
+          throw new Error(d);
+        }
+        const j = await r.json();
+        this.target = j.path;                       // server-side path passed as -t
+        this.uploadInfo = { name: j.name, count: j.count };
+      } catch (err) { this.err = 'Upload failed: ' + err; }
+      finally { this.uploading = false; if (e.target) e.target.value = ''; }
+    },
+    clearFile() { this.uploadInfo = null; this.target = ''; },
 
     buildParams() {
       const out = {};
