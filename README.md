@@ -9,7 +9,7 @@ Toolkit Python d'automatisation pour les **pentests internes Active Directory**.
 ## Caractéristiques
 
 - **Scripts standalone** — un script par service, utilisables indépendamment ou en chaîne.
-- **Découverte relançable** — `ad_recon_userless.py` accumule les résultats, reprend après interruption et ne rescanne que le nouveau (idéal quand les subnets arrivent au fil de l'eau via LDAP).
+- **Découverte relançable** — `ad_recon_userless.py` accumule les résultats, reprend après interruption et ne rescanne que le nouveau (idéal quand les subnets arrivent au fil de l'eau via LDAP) ; passe `--exotic` pour enrichir avec les services hors AD.
 - **Sorties structurées** — fichiers `hosts_<service>.txt`, `ports_summary.json`, etc., consommés par le rapport et l'UI.
 - **Rapport HTML** self-contained (un seul fichier, zéro dépendance).
 - **Interface web** optionnelle (FastAPI) : lancement, suivi live, dashboard, export.
@@ -112,12 +112,14 @@ sudo python3 ad_recon_userless.py -t targets.txt  -o /tmp/pentest [--fresh]
 - Seuls les **nouveaux subnets** sont redécouverts et seuls les **hôtes jamais scannés** sont port-scannés.
 - L'état est persisté dans `state.json` ; une interruption (Ctrl-C) ou un masscan tronqué **reprend proprement** au run suivant.
 - `--fresh` ignore l'état et rescanne tout.
+- `--exotic` ajoute une passe d'enrichissement sur les hôtes vivants : services à forte valeur hors AD (bases de données, web sur ports exotiques, VNC, NFS, conteneurs/k8s, mail, imprimantes, NetBIOS/mDNS UDP, quelques ports OT/ICS) → `hosts_exotic.txt` + `exotic_services.txt` (IP, port, service).
 - Le `targets.txt` accepte IP / CIDR / plage `a.b.c.d-e` ; les lignes invalides sont ignorées avec un avertissement.
 
 | Flag | Rôle |
 |---|---|
 | `-r` | Taux masscan en pps (défaut 5000) |
 | `--verify` | Second passage nmap SYN après masscan |
+| `--exotic` | Passe d'enrichissement : ports à forte valeur hors AD |
 | `--fresh` | Repart de zéro (ignore `state.json`) |
 
 ---
@@ -154,5 +156,7 @@ NoPainNoScan/
 ├── ad_recon_userless.py   # Phase 0 — découverte + port scan
 ├── check_*.py             # 12 checks par service
 ├── generate_report.py     # Rapport HTML
+├── npns_common.py         # Plomberie partagée (couleurs, logs, étapes)
+├── _npns_progress.py      # Émission de progression (barre UI web)
 └── webui/                 # Interface web (FastAPI, optionnelle)
 ```
