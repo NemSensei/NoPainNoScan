@@ -165,6 +165,21 @@ def write_list(path, items):
         f.write("\n".join(sorted_items) + ("\n" if sorted_items else ""))
 
 
+def atomic_write_text(path, text):
+    """Écrit `text` dans `path` de façon atomique (tmp + os.replace).
+
+    state.json et ports_summary.json sont la source de vérité de la reprise
+    incrémentale : une coupure pendant un write_text() direct (kill -9, OOM,
+    coupure secteur pendant un long masscan) laisse un JSON tronqué, et le
+    run suivant repart alors d'un état/ports vides — réécrivant tous les
+    fichiers agrégés avec les seuls résultats du run courant.
+    """
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
 def read_list(path):
     """Lit une liste d'IPs depuis un fichier. Retourne [] si absent."""
     p = Path(path)
@@ -206,7 +221,8 @@ def save_state(base_path, state):
     state["updated"] = datetime.now().isoformat(timespec="seconds")
     if not state.get("created"):
         state["created"] = state["updated"]
-    (Path(base_path) / STATE_FILE).write_text(
+    atomic_write_text(
+        Path(base_path) / STATE_FILE,
         json.dumps(state, indent=2, sort_keys=True)
     )
 
@@ -548,7 +564,8 @@ def _rewrite_output_files(base_path, host_ports):
         )
 
     ports_summary = {ip: sorted(ports) for ip, ports in host_ports.items()}
-    (base_path / "ports_summary.json").write_text(
+    atomic_write_text(
+        base_path / "ports_summary.json",
         json.dumps(ports_summary, indent=2, sort_keys=True)
     )
 
