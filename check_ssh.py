@@ -8,6 +8,7 @@ import ipaddress
 
 
 from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
+                         nxc_login_ok, strip_ansi,
                          tool_exists, confirm_step, set_total_steps, enable_auto_accept,
                          sub_progress)
 
@@ -214,14 +215,16 @@ def step_cred_test(hosts, port, username, password, out_dir):
     tmp_hosts.write_text("\n".join(hosts) + "\n")
 
     out, err, rc = run(
-        f"nxc ssh {tmp_hosts} --port {port} -u {shlex.quote(username)} -p {shlex.quote(password)}",
+        f"nxc ssh {shlex.quote(str(tmp_hosts))} --port {port} -u {shlex.quote(username)} -p {shlex.quote(password)}",
         timeout=120,
     )
-    full_output = out + err
+    full_output = strip_ansi(out + err)
 
     successes = []
     for line in full_output.splitlines():
-        if "[+]" in line or "pwned" in line.lower() or "success" in line.lower():
+        # Helper commun (cf. DETECTION.md) au lieu du motif naïf
+        # "[+]/pwned/success" qui remontait aussi des lignes d'info nxc.
+        if nxc_login_ok(line):
             successes.append(line.strip())
 
     success_file = out_dir / "ssh_login_success.txt"
