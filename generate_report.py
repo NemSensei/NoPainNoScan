@@ -68,6 +68,23 @@ def read_all(base: Path, name: str) -> list[str]:
     return out
 
 
+def read_any(base: Path, *names: str) -> list[str]:
+    """read_all() sur plusieurs motifs/noms, union dédupliquée.
+
+    Nécessaire quand un même type de donnée est écrit sous plusieurs noms :
+    check_ldap produit `ldap_users_<ip>.txt` (dump null-bind) ET
+    `ldap_users.txt` (énumération authentifiée) — `ldap_users_*.txt` seul
+    manque le second, d'où des compteurs à 0 sur les runs avec creds.
+    """
+    seen, out = set(), []
+    for name in names:
+        for line in read_all(base, name):
+            if line not in seen:
+                seen.add(line)
+                out.append(line)
+    return out
+
+
 def merge_ports_summary(base: Path) -> dict:
     """Fusionne tous les ports_summary.json trouvés → {ip: set(ports)}."""
     merged: dict = {}
@@ -111,17 +128,22 @@ def collect(base: Path) -> dict:
         "accessible_shares": read_all(base, "smb_shares_accessible.txt"),
         "read_shares": read_all(base, "smb_shares_read.txt"),
         "write_shares":read_all(base, "smb_shares_write.txt"),
+        "admin":       read_all(base, "smb_admin.txt"),
         "sysvol":      read_all(base, "sysvol_files.txt"),
         "spider":      read_all(base, "smb_spider.txt"),
         "gpp":         read_all(base, "sysvol_gpp.txt"),
     }
 
-    # LDAP (union dédupliquée des users/groups/computers sur tous les runs)
-    users     = read_all(base, "ldap_users_*.txt")
-    groups    = read_all(base, "ldap_groups_*.txt")
-    computers = read_all(base, "ldap_computers_*.txt")
+    # LDAP (union dédupliquée des users/groups/computers sur tous les runs).
+    # Deux familles de fichiers existent : `ldap_users_<ip>.txt` (dump
+    # null-bind) et `ldap_users.txt` (énumération authentifiée) — on lit les
+    # deux, sinon les runs avec creds affichent "Users found: 0".
+    users     = read_any(base, "ldap_users_*.txt", "ldap_users.txt")
+    groups    = read_any(base, "ldap_groups_*.txt", "ldap_groups.txt")
+    computers = read_any(base, "ldap_computers_*.txt", "ldap_computers.txt")
     d["ldap"] = {
-        "scanned":         scanned("ldap_nullbind.txt", "ldap_domain_info.txt"),
+        "scanned":         scanned("ldap_nullbind.txt", "ldap_domain_info.txt",
+                                   "ldap_summary.txt", "ldap_users_*.txt"),
         "nullbind":        read_all(base, "ldap_nullbind.txt"),
         "no_preauth":      read_all(base, "ldap_no_preauth.txt"),
         "delegation":      read_all(base, "ldap_delegation.txt"),
@@ -227,6 +249,7 @@ def get_criticals(d: dict) -> list[tuple[str, str, str]]:
     if smb["unsigned"]:    c.append(("SMB",      f"{len(smb['unsigned'])} hosts SMB signing disabled — NTLM relay possible", "critical"))
     if smb["v1"]:          c.append(("SMB",      f"{len(smb['v1'])} hosts with SMBv1 enabled (EternalBlue)", "critical"))
     if smb["write_shares"]:c.append(("SMB",      f"{len(smb['write_shares'])} writable shares found", "critical"))
+    if smb["admin"]:       c.append(("SMB",      f"{len(smb['admin'])} host(s) where provided creds have admin access (Pwn3d!)", "critical"))
     if smb["gpp"]:         c.append(("SMB",      f"{len(smb['gpp'])} GPP credential finding(s) in SYSVOL (cleartext/decryptable)", "critical"))
     if smb["sysvol"]:      c.append(("SMB",      f"{len(smb['sysvol'])} interesting files in SYSVOL/NETLOGON", "warning"))
 
@@ -416,6 +439,10 @@ def build_smb(d: dict) -> str:
     if s["login_success"]:
         parts.append(subsec(f"Hosts where credentials authenticate ({len(s['login_success'])})",
                             ip_table(s["login_success"]), "info"))
+
+    if s["admin"]:
+        parts.append(subsec(f"Hosts where credentials grant admin access ({len(s['admin'])})",
+                            text_table(s["admin"], "Host / Access (Pwn3d! / admin)"), "critical"))
 
     if s["null_shares"]:
         parts.append(subsec(f"Null session shares ({len(s['null_shares'])} entries)",
