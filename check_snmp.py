@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """check_snmp.py - SNMP community string brute force and enumeration"""
 
-import argparse, subprocess, os, sys, re
+import argparse, subprocess, os, sys, re, shlex, tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -64,8 +64,15 @@ def parse_targets(target_arg):
     return targets
 
 
-def write_communities_file(communities, path="/tmp/snmp_communities.txt"):
-    """Write community strings to a temp file for onesixtyone."""
+def write_communities_file(communities, path=None):
+    """Write community strings to a temp file for onesixtyone.
+
+    Uses a random temp path (not a predictable /tmp name) so two concurrent
+    runs cannot clobber each other and the file is not world-guessable.
+    """
+    if path is None:
+        fd, path = tempfile.mkstemp(prefix="npns_snmp_communities_", suffix=".txt")
+        os.close(fd)
     Path(path).write_text("\n".join(communities) + "\n")
     return path
 
@@ -75,13 +82,14 @@ def brute_onesixtyone(hosts, communities, versions):
 
     Returns dict: {ip: [community, ...]}
     """
-    hosts_file = "/tmp/snmp_hosts.txt"
+    fd, hosts_file = tempfile.mkstemp(prefix="npns_snmp_hosts_", suffix=".txt")
+    os.close(fd)
     comm_file  = write_communities_file(communities)
     Path(hosts_file).write_text("\n".join(hosts) + "\n")
 
     found = {}
     log_info(f"Running onesixtyone against {len(hosts)} host(s) with {len(communities)} community string(s)...")
-    out, err, rc = run(f"onesixtyone -c {comm_file} -i {hosts_file}", timeout=120)
+    out, err, rc = run(f"onesixtyone -c {shlex.quote(comm_file)} -i {shlex.quote(hosts_file)}", timeout=120)
     if rc != 0 and not out:
         log_warn(f"onesixtyone returned code {rc}: {err.strip()}")
         return found
@@ -91,6 +99,10 @@ def brute_onesixtyone(hosts, communities, versions):
         m = re.match(r'^(\S+)\s+\[(\S+)\]', line)
         if m:
             ip, comm = m.group(1), m.group(2)
+            # Communities come from a remote answer: refuse anything that could
+            # be interpreted as a command-line option downstream.
+            if comm.startswith("-"):
+                continue
             found.setdefault(ip, [])
             if comm not in found[ip]:
                 found[ip].append(comm)
@@ -107,7 +119,7 @@ def brute_snmpwalk(ip, communities, versions):
     for comm in communities:
         for ver in ver_list:
             out, err, rc = run(
-                f"snmpwalk -v{ver} -c {comm} {ip} system 2>/dev/null",
+                f"snmpwalk -v{shlex.quote(ver)} -c {shlex.quote(comm)} {shlex.quote(ip)} system 2>/dev/null",
                 timeout=10
             )
             if out.strip() and "No Such Object" not in out and "Timeout" not in out:
@@ -132,12 +144,12 @@ def enumerate_host(ip, community, version, output_dir):
     for label, oid in SNMP_OIDS.items():
         if label.startswith("win_"):
             continue
-        out, _, _ = run(f"snmpwalk -v{ver} -c {community} {ip} {oid}", timeout=30)
+        out, _, _ = run(f"snmpwalk -v{shlex.quote(ver)} -c {shlex.quote(community)} {shlex.quote(ip)} {oid}", timeout=30)
         if out.strip():
             lines_collected.append(f"\n### {label.upper()} ###\n{out}")
 
     # Parse sysDescr / sysName from system walk
-    sys_out, _, _ = run(f"snmpwalk -v{ver} -c {community} {ip} system", timeout=20)
+    sys_out, _, _ = run(f"snmpwalk -v{shlex.quote(ver)} -c {shlex.quote(community)} {shlex.quote(ip)} system", timeout=20)
     for line in sys_out.splitlines():
         if "sysDescr" in line:
             info["sysDescr"] = line.split("STRING:", 1)[-1].strip().strip('"') if "STRING:" in line else line
@@ -156,7 +168,7 @@ def enumerate_windows(ip, community, version, output_dir):
 
     for label in ("win_users", "win_shares"):
         oid = SNMP_OIDS[label]
-        out, _, _ = run(f"snmpwalk -v{ver} -c {community} {ip} {oid}", timeout=20)
+        out, _, _ = run(f"snmpwalk -v{shlex.quote(ver)} -c {shlex.quote(community)} {shlex.quote(ip)} {oid}", timeout=20)
         if out.strip() and "No Such Object" not in out:
             results.append(f"### {label.upper()} ###\n{out}")
 

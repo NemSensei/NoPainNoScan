@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """check_dns.py - DNS zone transfer and reverse lookup enumeration"""
 
-import argparse, subprocess, os, sys, re, ipaddress
+import argparse, subprocess, os, sys, re, ipaddress, shlex
 from datetime import datetime
 from pathlib import Path
 
@@ -117,7 +117,7 @@ def step_soa(servers, guessed_domains, outdir):
 
         # Try well-known domain guesses first
         for dom in guessed_domains:
-            out, _, rc = run(f"dig SOA {dom} @{ip} +time=5 +tries=1", timeout=10)
+            out, _, rc = run(f"dig SOA {shlex.quote(dom)} @{shlex.quote(ip)} +time=5 +tries=1", timeout=10)
             if out and _SOA_RE.search(out):
                 d = detect_domain_from_soa(out)
                 if d:
@@ -126,17 +126,17 @@ def step_soa(servers, guessed_domains, outdir):
                 soa_lines.append(f"# {ip} — SOA {dom}\n{out}")
 
         # Generic root query
-        out, _, rc = run(f"dig +short -t SOA . @{ip} +time=5 +tries=1", timeout=10)
+        out, _, rc = run(f"dig +short -t SOA . @{shlex.quote(ip)} +time=5 +tries=1", timeout=10)
         if out.strip():
             soa_lines.append(f"# {ip} — SOA .\n{out}")
 
         # NS root query
-        out, _, _ = run(f"dig @{ip} -t NS . +time=5 +tries=1", timeout=10)
+        out, _, _ = run(f"dig @{shlex.quote(ip)} -t NS . +time=5 +tries=1", timeout=10)
         if out.strip():
             soa_lines.append(f"# {ip} — NS .\n{out}")
 
         # _msdcs hint
-        out, _, _ = run(f"dig @{ip} -t ANY _msdcs +time=5 +tries=1", timeout=10)
+        out, _, _ = run(f"dig @{shlex.quote(ip)} -t ANY _msdcs +time=5 +tries=1", timeout=10)
         if out.strip() and 'ANSWER' in out:
             soa_lines.append(f"# {ip} — _msdcs\n{out}")
             d = detect_domain_from_soa(out)
@@ -174,7 +174,7 @@ def step_axfr(servers, domains, outdir):
         for domain in domains:
             for dom_variant in [domain, domain + '.']:
                 log_info(f"AXFR {dom_variant} @{ip}")
-                out, err, rc = run(f"dig axfr {dom_variant} @{ip} +time=10 +tries=1", timeout=30)
+                out, err, rc = run(f"dig axfr {shlex.quote(dom_variant)} @{shlex.quote(ip)} +time=10 +tries=1", timeout=30)
                 if out and ('Transfer failed' not in out) and ('AXFR' in out or '; <<>> DiG' in out):
                     # Check there are actual records (not just SOA / error)
                     record_lines = [l for l in out.splitlines()
@@ -228,7 +228,7 @@ def step_enum_hosts(servers, domains, outdir):
         for domain in domains:
             for name in COMMON_NAMES:
                 fqdn = f"{name}.{domain}"
-                out, _, rc = run(f"dig +short {fqdn} @{ip} +time=5 +tries=1", timeout=10)
+                out, _, rc = run(f"dig +short {shlex.quote(fqdn)} @{shlex.quote(ip)} +time=5 +tries=1", timeout=10)
                 result = out.strip()
                 if result and not result.startswith(';'):
                     for addr in result.splitlines():
@@ -292,7 +292,7 @@ def step_reverse(servers, target_range, outdir):
     ptr_map = {}  # ip → hostname
     for host in host_list:
         ip_str = str(host)
-        out, _, _ = run(f"dig +short -x {ip_str} @{dns_server} +time=3 +tries=1", timeout=8)
+        out, _, _ = run(f"dig +short -x {shlex.quote(ip_str)} @{shlex.quote(dns_server)} +time=3 +tries=1", timeout=8)
         result = out.strip().rstrip('.')
         if result and not result.startswith(';'):
             ptr_map[ip_str] = result
