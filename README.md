@@ -104,7 +104,7 @@ sudo python3 ad_recon_userless.py -t 10.10.0.0/24 -o /tmp/pentest [--verify]
 sudo python3 ad_recon_userless.py -t targets.txt  -o /tmp/pentest [--fresh]
 ```
 
-Étapes : **fping** (ICMP) + **nmap** (TCP SYN ping, détecte les hosts filtrant l'ICMP) → **masscan** (ports AD/services + UDP SNMP/IPMI) → **nmap `--verify`** (optionnel, double-check TCP). Produit `hosts_alive.txt`, un `hosts_<service>.txt` par service, `port_<n>.txt`, `ports_summary.json`, `summary.txt`.
+Étapes : **fping** (ICMP) ‖ **nmap** (TCP SYN ping, détecte les hosts filtrant l'ICMP) — lancés **en parallèle par chunks de cibles** pour tenir un gros scope — → **masscan** (ports AD/services + UDP SNMP/IPMI, `--wait` court) → **nmap `--verify`** (optionnel, double-check TCP). Produit `hosts_alive.txt`, un `hosts_<service>.txt` par service, `port_<n>.txt`, `ports_summary.json`, `summary.txt`.
 
 **Relançable / incrémental** (pensé pour des subnets découverts progressivement) :
 
