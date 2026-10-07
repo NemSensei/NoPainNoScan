@@ -20,8 +20,18 @@ chaque script (timeouts par défaut et logique de parsing qui diffèrent).
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
+
+# Codes couleur ANSI (SGR) — nxc/outils colorent souvent leur sortie même piped selon
+# la version. Les retirer avant tout parsing regex évite des matchs ratés.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text):
+    """Retire les séquences de couleur ANSI d'une chaîne (équiv. sed 's/\\x1b\\[[0-9;]*m//g')."""
+    return _ANSI_RE.sub("", text or "")
 
 # Progression pour l'UI web ; no-op si le helper est absent (exécution standalone).
 try:

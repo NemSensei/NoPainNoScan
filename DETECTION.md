@@ -75,11 +75,12 @@ Centralisée dans [`npns_common.py`](npns_common.py) :
 |---|---|---|---|
 | SMB signing désactivé | `(signing:False)` | `smb_unsigned.txt` | 🔴 |
 | SMBv1 | `(SMBv1:True)` | `smb_v1.txt` | 🔴 |
-| Partage inscriptible | share listé `READ,WRITE`/`WRITE` | `smb_shares_write.txt` | 🔴 |
+| Partage inscriptible | share listé `READ,WRITE`/`WRITE` (hors `$`) | `smb_shares_write.txt` | 🔴 |
+| Shares accessibles (R/W) | tout share non-`$` avec READ/WRITE (creds) | `smb_shares_accessible.txt` | ⚠️ |
 | Null session | partages via session nulle | `smb_shares_null.txt` | ⚠️ |
 | SYSVOL/Spider | fichiers intéressants | `sysvol_files.txt` | ⚠️ |
 
-> Pas de faux positif admin ici (ne s'appuie pas sur `(Pwn3d!)`). **⚠ Fiabilité en attente** (non traité, à ta demande) : spider_plus JSON + `--pattern` SYSVOL quasi toujours vides, regex null-session `READ,WRITE` mal classée.
+> Pas de faux positif admin ici (ne s'appuie pas sur `(Pwn3d!)`). STEP 3 nettoie les codes ANSI (`strip_ansi`) avant parsing et **exclut les partages administratifs `$`** (ADMIN$, C$, IPC$…) de tous les fichiers shares. STEP 4/5 (SYSVOL/NETLOGON + spider_plus) corrigés et fonctionnels. **⚠ Reste** : regex null-session `READ,WRITE` de STEP 2 (sans creds) toujours mal classée.
 
 ### LDAP, Kerberos, SSH, DNS, SNMP, FTP
 Détection inchangée sur cette passe (**en attente** selon ta consigne), sauf le bug SSH ci-dessous. Points connus à fiabiliser : Kerberos (suffixe realm qui casse la userlist AS-REP + clock-skew), LDAP (`rc==0` log succès sur bind échoué ; `--password-not-required` mal étiqueté « no_preauth »), SNMP (version de brute non réutilisée → énum vide), DNS (crash IPv6 `cidr_from_ip`), FTP (listing non borné / filtre trop large).

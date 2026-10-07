@@ -107,6 +107,7 @@ def collect(base: Path) -> dict:
         "unsigned":    read_all(base, "smb_unsigned.txt"),
         "v1":          read_all(base, "smb_v1.txt"),
         "null_shares": read_all(base, "smb_shares_null.txt"),
+        "accessible_shares": read_all(base, "smb_shares_accessible.txt"),
         "read_shares": read_all(base, "smb_shares_read.txt"),
         "write_shares":read_all(base, "smb_shares_write.txt"),
         "sysvol":      read_all(base, "sysvol_files.txt"),
@@ -417,6 +418,10 @@ def build_smb(d: dict) -> str:
                         text_table(s["write_shares"], "Share") if s["write_shares"]
                         else '<p class="empty">No writable shares found.</p>',
                         write_lvl))
+
+    if s["accessible_shares"]:
+        parts.append(subsec(f"Accessible shares — R/W, non-admin ({len(s['accessible_shares'])} entries)",
+                            text_table(s["accessible_shares"], "IP / Share / Perms"), "warning"))
 
     if s["read_shares"]:
         parts.append(subsec(f"Readable shares ({len(s['read_shares'])} entries)",

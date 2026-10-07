@@ -46,7 +46,7 @@ from pathlib import Path
 # =============================================================================
 from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
                          tool_exists, confirm_step, set_total_steps, enable_auto_accept,
-                         emit_progress)
+                         emit_progress, strip_ansi)
 
 
 set_total_steps(4)
@@ -233,18 +233,30 @@ def step2_null_session(hosts_file, out_dir):
 # STEP 3 — AUTHENTICATED SHARE ENUMERATION
 # =============================================================================
 def step3_auth_shares(hosts_file, out_dir, creds_args):
-    """Enumerate shares with credentials, separate READ vs WRITE."""
+    """Enumerate accessible shares with credentials.
+
+    Produit trois vues (les shares administratifs en `$` — ADMIN$, C$, IPC$… — sont
+    exclus partout, ce ne sont pas des findings d'accès pertinents) :
+      • smb_shares_read.txt        — shares lisibles (sans WRITE)
+      • smb_shares_write.txt       — shares inscriptibles [CRITICAL]
+      • smb_shares_accessible.txt  — liste consolidée READ|WRITE (ip / share / perms)
+
+    La sortie nxc est nettoyée de ses codes couleur ANSI avant parsing (robustesse).
+    """
     log_step("STEP 3 — Authenticated Share Enumeration")
 
     if not confirm_step("STEP 3 — Authenticated Share Enumeration", f"nxc smb '{hosts_file}' {creds_args} --shares"):
         write_file(out_dir / "smb_shares_read.txt", [])
         write_file(out_dir / "smb_shares_write.txt", [])
-        return [], []
+        write_file(out_dir / "smb_shares_accessible.txt", [])
+        return [], [], []
 
     out, err, rc = run(f"nxc smb '{hosts_file}' {creds_args} --shares", timeout=300)
+    out = strip_ansi(out)
 
-    read_shares  = []
-    write_shares = []
+    read_shares       = []
+    write_shares      = []
+    accessible_shares = []
 
     share_line = re.compile(
         r"SMB\s+(\d+\.\d+\.\d+\.\d+)\s+\d+\s+\S+\s+(\S+)\s+(READ(?:,WRITE)?|WRITE)"
@@ -254,7 +266,10 @@ def step3_auth_shares(hosts_file, out_dir, creds_args):
         if not m:
             continue
         ip, share, perms = m.groups()
+        if share.endswith("$"):          # exclure les partages administratifs
+            continue
         entry = f"{ip}  {share}  [{perms}]"
+        accessible_shares.append(entry)
         if "WRITE" in perms:
             write_shares.append(entry)
         else:
@@ -262,11 +277,13 @@ def step3_auth_shares(hosts_file, out_dir, creds_args):
 
     write_file(out_dir / "smb_shares_read.txt", read_shares, sort=False, label="Readable shares")
     write_file(out_dir / "smb_shares_write.txt", write_shares, sort=False, label="Writable shares [CRITICAL]")
+    write_file(out_dir / "smb_shares_accessible.txt", accessible_shares, sort=False,
+               label="Accessible shares (R/W, non-admin)")
 
     if write_shares:
         log_warn(f"[CRITICAL] {len(write_shares)} writable share(s) found!")
 
-    return read_shares, write_shares
+    return read_shares, write_shares, accessible_shares
 
 
 # =============================================================================
@@ -404,7 +421,7 @@ def step5_spider_summary(hosts_file, out_dir, creds_args):
 # SUMMARY
 # =============================================================================
 def write_summary(out_dir, unsigned, smbv1, null_shares, read_shares, write_shares,
-                  sysvol_files, spider_files, has_creds):
+                  accessible_shares, sysvol_files, spider_files, has_creds):
     """Write a human-readable summary file and print it."""
     log_step("SUMMARY")
 
@@ -419,6 +436,7 @@ def write_summary(out_dir, unsigned, smbv1, null_shares, read_shares, write_shar
 
     if has_creds:
         lines += [
+            f"[AUTH]     Accessible shares (R/W, non-admin):             {len(accessible_shares)}",
             f"[AUTH]     Readable shares (with creds):                   {len(read_shares)}",
             f"[CRITICAL] Writable shares (with creds):                   {len(write_shares)}",
             f"[SYSVOL]   Interesting SYSVOL/NETLOGON files:              {len(sysvol_files)}",
@@ -526,24 +544,25 @@ def main():
 
     read_shares  = []
     write_shares = []
+    accessible_shares = []
     sysvol_files = []
     spider_files = []
 
     if has_creds:
-        read_shares, write_shares = step3_auth_shares(hosts_tmp, out_dir, creds_args)
+        read_shares, write_shares, accessible_shares = step3_auth_shares(hosts_tmp, out_dir, creds_args)
         sysvol_files = step4_sysvol(hosts_tmp, out_dir, creds_args)
         spider_files = step5_spider_summary(hosts_tmp, out_dir, creds_args)
     else:
         log_info("No credentials provided — skipping authenticated checks (steps 3-5)")
         for fname in ["smb_shares_read.txt", "smb_shares_write.txt",
-                      "sysvol_files.txt", "smb_spider.txt"]:
+                      "smb_shares_accessible.txt", "sysvol_files.txt", "smb_spider.txt"]:
             (out_dir / fname).write_text("")
 
     # -------------------------------------------------------------------------
     # SUMMARY
     # -------------------------------------------------------------------------
     write_summary(out_dir, unsigned, smbv1, null_shares, read_shares, write_shares,
-                  sysvol_files, spider_files, has_creds)
+                  accessible_shares, sysvol_files, spider_files, has_creds)
 
     # Cleanup temp file
     try:
