@@ -49,7 +49,7 @@ from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
                          emit_progress, strip_ansi)
 
 
-set_total_steps(4)
+set_total_steps(6)
 
 
 # =============================================================================
@@ -346,6 +346,60 @@ def step4_sysvol(hosts_file, out_dir, creds_args):
 
 
 # =============================================================================
+# STEP 6 — GPP CREDENTIALS (SYSVOL)
+# =============================================================================
+# Lignes à retenir dans la sortie des modules GPP (le reste = bannière/énum SYSVOL).
+_GPP_FINDING_RE = re.compile(
+    r"(?i)(cpassword|password|username|credential|autologin|decrypt|found .*\.xml)"
+)
+# …sauf les lignes négatives ("No autologin found", "No GPP files found", etc.).
+# Phrases explicites (pas de mots isolés : un '0' d'octet d'IP matcherait sinon).
+_GPP_NEGATIVE_RE = re.compile(
+    r"(?i)(no (gpp|autologin|credential|password|result|xml|file)"
+    r"|not found|nothing found|could ?n'?t|could not|failed to)"
+)
+
+
+def step_gpp(hosts_file, out_dir, creds_args):
+    """Extract GPP credentials from SYSVOL via nxc gpp_password / gpp_autologin.
+
+    gpp_password déchiffre les cpassword des fichiers de préférences GPP
+    (Groups.xml, Services.xml, ScheduledTasks.xml, DataSources.xml, Drives.xml,
+    Printers.xml) ; gpp_autologin extrait les identifiants d'autologon de
+    registry.xml. Les deux lisent SYSVOL. Toute trouvaille = creds en clair → 🔴.
+    """
+    log_step("STEP 6 — GPP credentials (SYSVOL)")
+
+    findings = []
+    if not confirm_step("STEP 6 — GPP credentials (SYSVOL)",
+                        f"nxc smb '{hosts_file}' {creds_args} -M gpp_password  +  -M gpp_autologin"):
+        write_file(out_dir / "sysvol_gpp.txt", [])
+        return findings
+
+    raw_parts = []
+    for module in ("gpp_password", "gpp_autologin"):
+        log_info(f"Running {module} on SYSVOL ...")
+        out, err, rc = run(f"nxc smb '{hosts_file}' {creds_args} -M {module}", timeout=300)
+        out = strip_ansi(out)
+        raw_parts.append(f"# === {module} ===\n{out}")
+        for line in out.splitlines():
+            if _GPP_FINDING_RE.search(line) and not _GPP_NEGATIVE_RE.search(line):
+                findings.append(line.strip())
+
+    (out_dir / "sysvol_gpp_raw.txt").write_text("\n".join(raw_parts) + "\n")
+    findings = list(dict.fromkeys(findings))
+    write_file(out_dir / "sysvol_gpp.txt", findings, sort=False,
+               label="GPP credentials [CRITICAL]")
+
+    if findings:
+        log_warn(f"[CRITICAL] {len(findings)} GPP credential finding(s) in SYSVOL!")
+    else:
+        log_info("No GPP credentials found (see sysvol_gpp_raw.txt for raw module output).")
+
+    return findings
+
+
+# =============================================================================
 # STEP 5 — SPIDER PLUS (tous les partages lisibles)
 # =============================================================================
 # Emplacements où d'anciennes versions de nxc écrivent le JSON spider_plus, en
@@ -421,7 +475,7 @@ def step5_spider_summary(hosts_file, out_dir, creds_args):
 # SUMMARY
 # =============================================================================
 def write_summary(out_dir, unsigned, smbv1, null_shares, read_shares, write_shares,
-                  accessible_shares, sysvol_files, spider_files, has_creds):
+                  accessible_shares, sysvol_files, spider_files, gpp_findings, has_creds):
     """Write a human-readable summary file and print it."""
     log_step("SUMMARY")
 
@@ -441,6 +495,7 @@ def write_summary(out_dir, unsigned, smbv1, null_shares, read_shares, write_shar
             f"[CRITICAL] Writable shares (with creds):                   {len(write_shares)}",
             f"[SYSVOL]   Interesting SYSVOL/NETLOGON files:              {len(sysvol_files)}",
             f"[SPIDER]   Files found via spider_plus:                    {len(spider_files)}",
+            f"[CRITICAL] GPP credential findings (SYSVOL):               {len(gpp_findings)}",
         ]
 
     lines += ["", "Output directory: " + str(out_dir)]
@@ -458,6 +513,10 @@ def write_summary(out_dir, unsigned, smbv1, null_shares, read_shares, write_shar
     if write_shares:
         lines += ["", "[CRITICAL] WRITABLE SHARES:"]
         lines += [f"    {s}" for s in write_shares]
+
+    if gpp_findings:
+        lines += ["", "[CRITICAL] GPP CREDENTIALS (SYSVOL):"]
+        lines += [f"    {g}" for g in gpp_findings]
 
     summary_text = "\n".join(lines)
     (out_dir / "smb_summary.txt").write_text(summary_text + "\n")
@@ -547,22 +606,25 @@ def main():
     accessible_shares = []
     sysvol_files = []
     spider_files = []
+    gpp_findings = []
 
     if has_creds:
         read_shares, write_shares, accessible_shares = step3_auth_shares(hosts_tmp, out_dir, creds_args)
         sysvol_files = step4_sysvol(hosts_tmp, out_dir, creds_args)
         spider_files = step5_spider_summary(hosts_tmp, out_dir, creds_args)
+        gpp_findings = step_gpp(hosts_tmp, out_dir, creds_args)
     else:
-        log_info("No credentials provided — skipping authenticated checks (steps 3-5)")
+        log_info("No credentials provided — skipping authenticated checks (steps 3-6)")
         for fname in ["smb_shares_read.txt", "smb_shares_write.txt",
-                      "smb_shares_accessible.txt", "sysvol_files.txt", "smb_spider.txt"]:
+                      "smb_shares_accessible.txt", "sysvol_files.txt",
+                      "smb_spider.txt", "sysvol_gpp.txt"]:
             (out_dir / fname).write_text("")
 
     # -------------------------------------------------------------------------
     # SUMMARY
     # -------------------------------------------------------------------------
     write_summary(out_dir, unsigned, smbv1, null_shares, read_shares, write_shares,
-                  accessible_shares, sysvol_files, spider_files, has_creds)
+                  accessible_shares, sysvol_files, spider_files, gpp_findings, has_creds)
 
     # Cleanup temp file
     try:

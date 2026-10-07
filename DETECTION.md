@@ -79,6 +79,7 @@ Centralisée dans [`npns_common.py`](npns_common.py) :
 | Shares accessibles (R/W) | tout share non-`$` avec READ/WRITE (creds) | `smb_shares_accessible.txt` | ⚠️ |
 | Null session | partages via session nulle | `smb_shares_null.txt` | ⚠️ |
 | SYSVOL/Spider | fichiers intéressants | `sysvol_files.txt` | ⚠️ |
+| Creds GPP (SYSVOL) | `-M gpp_password`/`-M gpp_autologin` → ligne cred (hors négatives) | `sysvol_gpp.txt` (brut: `sysvol_gpp_raw.txt`) | 🔴 |
 
 > Pas de faux positif admin ici (ne s'appuie pas sur `(Pwn3d!)`). STEP 3 nettoie les codes ANSI (`strip_ansi`) avant parsing et **exclut les partages administratifs `$`** (ADMIN$, C$, IPC$…) de tous les fichiers shares. STEP 4/5 (SYSVOL/NETLOGON + spider_plus) corrigés et fonctionnels. **⚠ Reste** : regex null-session `READ,WRITE` de STEP 2 (sans creds) toujours mal classée.
 

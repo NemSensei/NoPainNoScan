@@ -112,6 +112,7 @@ def collect(base: Path) -> dict:
         "write_shares":read_all(base, "smb_shares_write.txt"),
         "sysvol":      read_all(base, "sysvol_files.txt"),
         "spider":      read_all(base, "smb_spider.txt"),
+        "gpp":         read_all(base, "sysvol_gpp.txt"),
     }
 
     # LDAP (union dédupliquée des users/groups/computers sur tous les runs)
@@ -225,6 +226,7 @@ def get_criticals(d: dict) -> list[tuple[str, str, str]]:
     if smb["unsigned"]:    c.append(("SMB",      f"{len(smb['unsigned'])} hosts SMB signing disabled — NTLM relay possible", "critical"))
     if smb["v1"]:          c.append(("SMB",      f"{len(smb['v1'])} hosts with SMBv1 enabled (EternalBlue)", "critical"))
     if smb["write_shares"]:c.append(("SMB",      f"{len(smb['write_shares'])} writable shares found", "critical"))
+    if smb["gpp"]:         c.append(("SMB",      f"{len(smb['gpp'])} GPP credential finding(s) in SYSVOL (cleartext/decryptable)", "critical"))
     if smb["sysvol"]:      c.append(("SMB",      f"{len(smb['sysvol'])} interesting files in SYSVOL/NETLOGON", "warning"))
 
     ldap = d["ldap"]
@@ -426,6 +428,11 @@ def build_smb(d: dict) -> str:
     if s["read_shares"]:
         parts.append(subsec(f"Readable shares ({len(s['read_shares'])} entries)",
                             text_table(s["read_shares"], "Share"), "info"))
+
+    if s["gpp"]:
+        parts.append(subsec(f"GPP credentials in SYSVOL ({len(s['gpp'])} findings)",
+                            text_table(s["gpp"], "GPP finding (cleartext / decryptable creds)"),
+                            "critical"))
 
     if s["sysvol"] or s["spider"]:
         combined = list(dict.fromkeys(s["sysvol"] + s["spider"]))
