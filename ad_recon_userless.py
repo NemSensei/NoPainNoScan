@@ -339,11 +339,13 @@ def _chunks(lst, size):
         yield lst[i:i + size]
 
 
-def _fping_sweep(tokens):
-    """ICMP sweep fping sur un chunk de cibles (IP/CIDR). Retourne les IP vivantes."""
-    if not tokens:
-        return set()
-    out, _, _ = run(f"fping -a -q {' '.join(tokens)} 2>/dev/null", timeout=600)
+def _fping_sweep(token):
+    """ICMP sweep fping sur UNE cible. `-g` est requis pour expandre un CIDR
+    (sans lui, fping prend l'argument pour un nom d'hôte). Un IP seule passe sans -g.
+    Retourne les IP vivantes."""
+    cmd = (f"fping -a -g -q {token} 2>/dev/null" if "/" in token
+           else f"fping -a -q {token} 2>/dev/null")
+    out, _, _ = run(cmd, timeout=600)
     return {line.strip() for line in out.splitlines() if line.strip()}
 
 
@@ -394,30 +396,36 @@ def discover_hosts(targets):
     fping_tokens = [t for t in targets if not _RANGE_RE.match(t)]  # fping: pas de plages
     nmap_tokens = list(targets)
 
-    tasks = []  # (méthode, callable, chunk)
+    # fping : une tâche par cible (le -g ne prend qu'un CIDR à la fois).
+    # nmap  : une tâche par chunk (il gère plusieurs cibles d'un coup).
+    tasks = []  # (méthode, callable, arg, label)
     if have_fping:
-        tasks += [("fping", _fping_sweep, ch) for ch in _chunks(fping_tokens, DISCOVERY_CHUNK_SIZE)]
+        tasks += [("fping", _fping_sweep, t, t) for t in fping_tokens]
     if have_nmap:
-        tasks += [("nmap", _nmap_sweep, ch) for ch in _chunks(nmap_tokens, DISCOVERY_CHUNK_SIZE)]
+        tasks += [("nmap", _nmap_sweep, ch, f"{len(ch)} cible(s)")
+                  for ch in _chunks(nmap_tokens, DISCOVERY_CHUNK_SIZE)]
 
-    n_chunks = max(1, (len(targets) + DISCOVERY_CHUNK_SIZE - 1) // DISCOVERY_CHUNK_SIZE)
-    log_info(f"Découverte parallèle : {len(targets)} cible(s), {n_chunks} chunk(s), "
-             f"{len(tasks)} tâche(s), {DISCOVERY_MAX_WORKERS} workers max...")
+    total = len(tasks)
+    log_info(f"Découverte parallèle : {len(targets)} cible(s), {total} tâche(s), "
+             f"{DISCOVERY_MAX_WORKERS} workers max...")
 
     icmp_hosts, tcp_hosts = set(), set()
+    done = 0
     with ThreadPoolExecutor(max_workers=DISCOVERY_MAX_WORKERS) as ex:
-        futs = {ex.submit(fn, ch): method for method, fn, ch in tasks}
+        futs = {ex.submit(fn, arg): (method, label) for method, fn, arg, label in tasks}
         for fut in as_completed(futs):
-            method = futs[fut]
+            method, label = futs[fut]
+            done += 1
             try:
                 res = fut.result()
             except Exception as e:  # noqa: BLE001
-                log_warn(f"découverte {method}: tâche échouée ({e})")
+                log_warn(f"  [{done}/{total}] {method} {label}: échec ({e})")
                 continue
             if method == "fping":
                 icmp_hosts |= res
             else:
                 tcp_hosts |= res
+            log_info(f"  [{done}/{total}] {method:<5} {label} → {len(res)} hôte(s)")
 
     hosts = icmp_hosts | tcp_hosts
     if have_fping:
@@ -613,11 +621,15 @@ def masscan_scan(base_path, hosts_to_scan, tcp_ports, udp_ports, rate=5000,
     ports_arg = ",".join(parts)
 
     log_info(f"masscan {label}: {len(hosts_to_scan)} hosts × {len(tcp_ports)} TCP + "
-             f"{len(udp_ports)} UDP @ {rate} pps (retries=2)...")
-    _, err, code = run(
-        f"masscan -iL {scan_list} -p{ports_arg} --rate={rate} --retries=2 --wait=3 -oJ {output_file}",
-        timeout=900
-    )
+             f"{len(udp_ports)} UDP @ {rate} pps (retries=2) — progression masscan ci-dessous :")
+    cmd = (f"masscan -iL {scan_list} -p{ports_arg} --rate={rate} "
+           f"--retries=2 --wait=3 -oJ {output_file}")
+    # On NE capture PAS la sortie : la barre de progression native de masscan
+    # (rate / % done, sur stderr) s'affiche en direct. Les résultats vont dans -oJ.
+    try:
+        code = subprocess.run(cmd, shell=True, timeout=900).returncode
+    except subprocess.TimeoutExpired:
+        code = -1
 
     # Récupère tout résultat disponible (même partiel en cas de timeout).
     host_ports = {}
@@ -627,8 +639,6 @@ def masscan_scan(base_path, hosts_to_scan, tcp_ports, udp_ports, rate=5000,
     completed = (code == 0)
     if not completed:
         log_warn(f"masscan interrompu/timeout (code={code}) — hôtes conservés pour re-scan")
-        if err.strip():
-            log_err(f"stderr: {err.strip()[:300]}")
     if not host_ports:
         log_warn(f"masscan {label}: aucun port ouvert trouvé")
 
