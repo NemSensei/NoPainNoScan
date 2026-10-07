@@ -14,7 +14,7 @@ from pathlib import Path
 
 from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
                          tool_exists, confirm_step, set_total_steps, enable_auto_accept,
-                         emit_progress, nxc_is_admin)
+                         emit_progress, nxc_is_admin, nxc_login_ok, strip_ansi)
 
 
 set_total_steps(3)
@@ -68,7 +68,9 @@ def step_hosts_info(hosts_file: str, out_dir: Path) -> list:
         return []
 
     stdout, _, _ = run(f"nxc mssql {shlex.quote(hosts_file)} 2>/dev/null", timeout=180)
-    lines = [l for l in stdout.splitlines() if l.strip()]
+    # nxc colore sa sortie même pipée : sans strip_ansi, les regex de parsing
+    # peuvent rater les lignes (faux négatifs).
+    lines = [l for l in strip_ansi(stdout).splitlines() if l.strip()]
 
     if lines:
         out_file.write_text("\n".join(lines) + "\n")
@@ -77,9 +79,11 @@ def step_hosts_info(hosts_file: str, out_dir: Path) -> list:
         out_file.write_text("# No MSSQL hosts responded\n")
         log_warn("No MSSQL hosts responded or nxc produced no output")
 
+    # (\S+) : le premier token après MSSQL est la cible (IP **ou hostname** —
+    # les fichiers cibles peuvent contenir des hostnames, supportés par nxc).
     alive = list(dict.fromkeys(
         m.group(1) for l in lines
-        for m in [re.search(r'MSSQL\s+([\d.]+)', l)] if m
+        for m in [re.search(r'MSSQL\s+(\S+)', l)] if m
     ))
     return alive
 
@@ -100,9 +104,12 @@ def step_default_creds(hosts_file: str, out_dir: Path) -> list:
             f"nxc mssql {shlex.quote(hosts_file)} -u {shlex.quote(user)} -p {shlex.quote(pwd)} --no-bruteforce 2>/dev/null",
             timeout=180,
         )
-        for line in stdout.splitlines():
-            if "[+]" in line or "Pwn3d!" in line:
-                m = re.search(r'MSSQL\s+([\d.]+)', line)
+        for line in strip_ansi(stdout).splitlines():
+            # nxc_login_ok (helper commun) au lieu du littéral "Pwn3d!" :
+            # un hit de cred = login valide ([+]), pas forcément admin ; et
+            # les builds nxc récents marquent "(admin)" au lieu de "(Pwn3d!)".
+            if nxc_login_ok(line):
+                m = re.search(r'MSSQL\s+(\S+)', line)
                 if m:
                     ip = m.group(1)
                     log_ok(f"[CRITICAL] Default creds work on {ip} — {user}:{display_pwd}")
@@ -169,14 +176,14 @@ def step_authenticated(hosts_file: str, out_dir: Path,
     log_info(f"Querying instance info as {user}")
     q1 = "SELECT @@version, system_user, is_srvrolemember('sysadmin')"
     stdout, _, _ = run(f"nxc mssql {hf} {creds}{auth} -q \"{q1}\" 2>/dev/null", timeout=180)
-    for line in stdout.splitlines():
+    for line in strip_ansi(stdout).splitlines():
         if "[+]" in line or "sysadmin" in line.lower() or "@@version" in line.lower():
             accessible_lines.append(line.strip())
 
     log_info(f"Listing databases as {user}")
     q2 = "SELECT name FROM sys.databases"
     stdout, _, _ = run(f"nxc mssql {hf} {creds}{auth} -q \"{q2}\" 2>/dev/null", timeout=180)
-    accessible_lines.extend(l.strip() for l in stdout.splitlines() if l.strip())
+    accessible_lines.extend(l.strip() for l in strip_ansi(stdout).splitlines() if l.strip())
 
     log_info(f"Testing xp_cmdshell (whoami) as {user}")
     stdout, _, _ = run(f"nxc mssql {hf} {creds}{auth} -x 'whoami' 2>/dev/null", timeout=180)
@@ -184,10 +191,10 @@ def step_authenticated(hosts_file: str, out_dir: Path,
     # admin/Pwn3d!. Un simple [+] = login SA valide mais xp_cmdshell peut être désactivé
     # ou le compte non-sysadmin ; l'ancien "\\" ramassait aussi la ligne d'auth et tout
     # DOMAIN\user → faux positif critique.
-    exec_hosts = [line.strip() for line in stdout.splitlines() if nxc_is_admin(line)]
+    exec_hosts = [line.strip() for line in strip_ansi(stdout).splitlines() if nxc_is_admin(line)]
     if exec_hosts:
         for line in exec_hosts:
-            m = re.search(r'MSSQL\s+([\d.]+)', line)
+            m = re.search(r'MSSQL\s+(\S+)', line)
             if m:
                 log_ok(f"[CRITICAL] xp_cmdshell works on {m.group(1)} as {user}")
         cmdexec_lines.extend(exec_hosts)
@@ -200,7 +207,7 @@ def step_authenticated(hosts_file: str, out_dir: Path,
     log_info(f"Checking linked servers as {user}")
     q3 = "SELECT name FROM sys.servers"
     stdout, _, _ = run(f"nxc mssql {hf} {creds}{auth} -q \"{q3}\" 2>/dev/null", timeout=180)
-    linked_lines.extend(l.strip() for l in stdout.splitlines() if l.strip())
+    linked_lines.extend(l.strip() for l in strip_ansi(stdout).splitlines() if l.strip())
 
     acc_file = out_dir / "mssql_accessible.txt"
     if accessible_lines:
@@ -308,6 +315,12 @@ def main():
 
     if not shutil.which("nxc"):
         log_err("nxc not found in PATH — install NetExec (https://github.com/Pennyw0rth/NetExec)")
+        sys.exit(1)
+
+    # -u seul : nxc demanderai le mot de passe sur stdin et pendrait jusqu'au
+    # timeout à chaque requête → refuser proprement dès le départ.
+    if args.username and args.password is None and not args.hash:
+        log_err("-u given without -p/-H: provide a password or a hash (use '' for an empty password)")
         sys.exit(1)
 
     hosts_file, hosts_list = resolve_targets(args.target)
