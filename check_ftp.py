@@ -128,6 +128,35 @@ INTERESTING_EXTENSIONS = {
     '.pem', '.db', '.sql', '.xlsx', '.docx', '.pdf',
 }
 
+_DOS_LIST_RE = re.compile(
+    # Windows/IIS LIST format: "04-01-21  10:00AM  <DIR>  folder"
+    #                     or:  "04-01-21  10:00AM     1234  file.txt"
+    r'^\d{2}-\d{2}-\d{2}\s+\d{1,2}:\d{2}[AP]M\s+(?:<DIR>|\d+)\s+(?P<name>.+?)\s*$',
+    re.IGNORECASE,
+)
+
+
+def parse_list_line(item):
+    """Parse one LIST line → (name, is_dir), or None if unparseable.
+
+    Handles both Unix format (9 whitespace-separated fields, perms in
+    first) and Windows/IIS format (date, time, <DIR>|size, name). The
+    Unix-only parse silently dropped every entry on IIS/Windows servers
+    — the main targets of this toolkit.
+    """
+    parts = item.split(None, 8)
+    if len(parts) >= 9:                      # Unix format
+        name = parts[8].strip()
+        is_dir = parts[0].startswith('d')
+        return name, is_dir
+    m = _DOS_LIST_RE.match(item.strip())     # Windows/IIS format
+    if m:
+        name = m.group('name').strip()
+        is_dir = '<DIR>' in item
+        return name, is_dir
+    return None
+
+
 def list_files_recursive(ftp, path='/', depth=0, max_depth=3):
     """Return list of (path, is_dir) tuples up to max_depth."""
     if depth > max_depth:
@@ -137,15 +166,13 @@ def list_files_recursive(ftp, path='/', depth=0, max_depth=3):
         items = []
         ftp.retrlines(f'LIST {path}', items.append)
         for item in items:
-            parts = item.split(None, 8)
-            if len(parts) < 9:
+            parsed = parse_list_line(item)
+            if not parsed:
                 continue
-            perms = parts[0]
-            name = parts[8].strip()
+            name, is_dir = parsed
             if name in ('.', '..'):
                 continue
             full_path = f"{path.rstrip('/')}/{name}"
-            is_dir = perms.startswith('d')
             entries.append((full_path, is_dir))
             if is_dir and depth < max_depth:
                 entries.extend(list_files_recursive(ftp, full_path, depth + 1, max_depth))
