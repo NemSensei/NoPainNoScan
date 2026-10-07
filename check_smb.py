@@ -6,34 +6,39 @@ Usage:
     python3 check_smb.py -t 192.168.1.0/24 -u admin -p 'P@ssw0rd' -d CORP
 
 Workflow:
-    1. SMB info + signing check (always, no creds needed)
-       - Detect signing:False → relay targets
-       - Detect SMBv1:True → legacy hosts
-    2. Null session share listing (no creds)
-    3. Authenticated share enumeration (with creds)
-       - READ access shares
-       - WRITE access shares (critical)
-    4. SYSVOL/NETLOGON browsing (with creds)
-    5. Spider plus — interesting files discovery (with creds)
+    1. Recon (no creds, then creds if given)
+       - host info, signing:False → relay targets, SMBv1:True → legacy hosts
+       - reachable SMB hosts
+       - with creds: hosts where auth succeeds ([+]) / admin (Pwn3d!/admin)
+         → this reduced host set feeds the heavy authenticated steps (fast on big scope)
+    2. Null session share listing (no creds, on reachable hosts)
+    3. Authenticated share enumeration (on auth hosts): READ / WRITE / accessible (non-$)
+    4. GPP credentials in SYSVOL (on auth hosts): gpp_password / gpp_autologin
+
+    NB: file spidering (--spider SYSVOL/NETLOGON and -M spider_plus) was removed on
+    purpose — too noisy; GPP covers the high-value SYSVOL secrets, the rest is manual.
 
 Output files:
-    smb_unsigned.txt       IPs with SMB signing disabled (relay targets)
-    smb_v1.txt             IPs with SMBv1 enabled
-    smb_hosts_info.txt     Full host info table
-    smb_shares_null.txt    Shares accessible via null session
-    smb_shares_read.txt    Shares readable with creds
-    smb_shares_write.txt   Shares writable with creds [CRITICAL]
-    sysvol_files.txt       Interesting files in SYSVOL/NETLOGON
-    smb_spider.txt         Interesting files from spider_plus
-    smb_summary.txt        Human-readable findings summary
+    smb_hosts_info.txt         Full host info table
+    smb_unsigned.txt           IPs with SMB signing disabled (relay targets)
+    smb_v1.txt                 IPs with SMBv1 enabled
+    smb_login_success.txt      Hosts where supplied creds authenticate ([+])
+    smb_admin.txt              Hosts where creds are admin (Pwn3d!/admin), if any
+    smb_shares_null.txt        Shares accessible via null session
+    smb_shares_read.txt        Readable shares with creds (non-$)
+    smb_shares_write.txt       Writable shares with creds (non-$) [CRITICAL]
+    smb_shares_accessible.txt  Consolidated R/W accessible shares (non-$)
+    sysvol_gpp.txt             GPP credentials from SYSVOL [CRITICAL]
+    sysvol_gpp_raw.txt         Raw gpp_password/gpp_autologin output
+    smb_summary.txt            Human-readable findings summary
 """
 
 import argparse
 import ipaddress
-import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -46,10 +51,14 @@ from pathlib import Path
 # =============================================================================
 from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
                          tool_exists, confirm_step, set_total_steps, enable_auto_accept,
-                         emit_progress, strip_ansi)
+                         emit_progress, strip_ansi, nxc_is_admin, nxc_login_ok)
 
 
-set_total_steps(6)
+set_total_steps(4)
+
+# Concurrence nxc, fixée depuis --threads dans main(). nxc gère le fan-out par hôte ;
+# plus de threads = plus rapide sur gros scope.
+_THREADS = 100
 
 
 # =============================================================================
@@ -64,6 +73,53 @@ def run(cmd, timeout=600):
         return "", "TIMEOUT", 1
     except Exception as e:
         return "", str(e), 1
+
+
+def run_nxc(cmd, timeout):
+    """Run an nxc command, returning (stdout, returncode).
+
+    Pensé pour les gros scopes : la sortie est redirigée vers un fichier temporaire
+    (pas de deadlock de pipe), et sur timeout on tue TOUT le groupe de processus
+    (le shell ET nxc, via start_new_session + killpg) puis on relit la sortie
+    PARTIELLE déjà écrite — au lieu de tout perdre comme le faisait run() qui
+    renvoyait "" sur TimeoutExpired (cause du « plus rien ne remonte » sur gros scan).
+    rc = -1 si le process a été tué sur timeout.
+    """
+    tf = tempfile.NamedTemporaryFile(mode="w", suffix=".nxcout", delete=False)
+    tf.close()
+    try:
+        with open(tf.name, "w") as fout:
+            proc = subprocess.Popen(cmd, shell=True, stdout=fout,
+                                    stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                proc.wait()
+                rc = -1
+                log_warn(f"nxc timeout ({timeout}s) — sortie partielle conservée")
+        return Path(tf.name).read_text(errors="replace"), rc
+    finally:
+        try:
+            os.unlink(tf.name)
+        except OSError:
+            pass
+
+
+def scaled_timeout(n_hosts, base=180, per_host=5, cap=3600):
+    """Timeout proportionnel au nombre d'hôtes (évite la troncature sur gros scope)."""
+    return min(base + per_host * max(0, n_hosts), cap)
+
+
+def _nxc(hosts_file, extra, creds=""):
+    """Construit une commande `nxc smb` (chemin quoté, --threads injecté)."""
+    base = f"nxc smb {shlex.quote(str(hosts_file))}"
+    if creds:
+        base += f" {creds}"
+    return f"{base} --threads {_THREADS} {extra}".strip()
 
 
 def sort_ips(ips):
@@ -136,88 +192,125 @@ def build_creds_args(args):
 
 
 # =============================================================================
-# STEP 1 — SMB INFO + SIGNING
+# STEP 1 — RECON : info/signing + hôtes joignables + hôtes où l'auth passe
 # =============================================================================
-def step1_smb_info(hosts_file, out_dir):
-    """Collect SMB host info, detect signing:False and SMBv1:True."""
-    log_step("STEP 1 — SMB Info + Signing Check")
+def step1_recon(hosts_file, out_dir, creds_args, n_hosts):
+    """Recon SMB en un ou deux balayages nxc.
 
-    unsigned_ips = []
-    smbv1_ips    = []
-    host_rows    = []
+    1) Sweep SANS creds : infos hôte, signing:False (cibles relais), SMBv1:True, et
+       la liste des hôtes SMB JOIGNABLES.
+    2) Sweep AVEC creds (si fournis) : hôtes où l'authentification réussit ([+]) et
+       ceux en admin (Pwn3d!/admin). Cette liste d'hôtes authentifiés sert de cible
+       RÉDUITE aux étapes lourdes (shares, GPP) → beaucoup plus rapide sur gros scope.
 
+    Returns: (unsigned, smbv1, host_rows, reachable, auth_hosts)
+    """
+    log_step("STEP 1 — SMB Recon (info, signing, reachable, auth)")
+
+    unsigned_ips, smbv1_ips, host_rows = [], [], []
+    reachable, auth_hosts, admin_hosts = [], [], []
     relay_file = out_dir / "smb_unsigned.txt"
 
-    if not confirm_step("STEP 1 — SMB Info + Signing Check", f"nxc smb '{hosts_file}' --gen-relay-list"):
+    detail = "nxc smb <hosts> --gen-relay-list" + (
+        "  ; puis  nxc smb <hosts> -u .. -p/-H .. (sweep auth)" if creds_args else "")
+    if not confirm_step("STEP 1 — SMB Recon", detail):
         write_file(relay_file, [])
         write_file(out_dir / "smb_v1.txt", [])
         (out_dir / "smb_hosts_info.txt").write_text("# Skipped by user request\n")
-        return unsigned_ips, smbv1_ips, host_rows
+        write_file(out_dir / "smb_login_success.txt", [])
+        return unsigned_ips, smbv1_ips, host_rows, reachable, auth_hosts
 
-    # Single run: --gen-relay-list also prints full host info on stdout
-    log_info("Running nxc smb (host details + relay list) ...")
-    out, err, rc = run(f"nxc smb '{hosts_file}' --gen-relay-list '{relay_file}'", timeout=300)
-    if rc != 0 and "TIMEOUT" not in err:
-        log_warn(f"nxc smb returned rc={rc}")
+    # --- 1) Sweep sans creds : infos + signing + SMBv1 + joignables ---
+    log_info("nxc smb sweep (infos hôte + relay list) ...")
+    out, rc = run_nxc(_nxc(hosts_file, f"--gen-relay-list {shlex.quote(str(relay_file))}"),
+                      timeout=scaled_timeout(n_hosts))
+    out = strip_ansi(out)
 
-    # SMB  192.168.1.10  445  DC01  [*] Windows 10.0 Build 17763 x64 (name:DC01) (domain:CORP) (signing:True) (SMBv1:False)
-    pattern = re.compile(
+    # SMB  10.0.0.1  445  DC01  [*] Windows ... (signing:True) (SMBv1:False)
+    info_re = re.compile(
         r"SMB\s+(\d+\.\d+\.\d+\.\d+)\s+\d+\s+(\S+)\s+\[\*\]\s+(.*?)"
-        r"\(signing:(\w+)\).*?\(SMBv1:(\w+)\)"
-    )
-
+        r"\(signing:(\w+)\).*?\(SMBv1:(\w+)\)")
+    ip_re = re.compile(r"SMB\s+(\d+\.\d+\.\d+\.\d+)\s+\d+\s")
+    seen = set()
     for line in out.splitlines():
-        m = pattern.search(line)
+        mi = ip_re.search(line)
+        if mi and mi.group(1) not in seen:
+            seen.add(mi.group(1))
+            reachable.append(mi.group(1))
+        m = info_re.search(line)
         if not m:
             continue
         ip, hostname, os_info, signing, smbv1 = m.groups()
-        os_info = os_info.strip()
-        host_rows.append(f"{ip:<18} {hostname:<20} {signing:<8} {smbv1:<8} {os_info}")
-
+        host_rows.append(f"{ip:<18} {hostname:<20} {signing:<8} {smbv1:<8} {os_info.strip()}")
         if signing.lower() == "false":
             unsigned_ips.append(ip)
         if smbv1.lower() == "true":
             smbv1_ips.append(ip)
 
-    # Merge with nxc-generated relay file in case it differs
     if relay_file.exists():
         existing = [l.strip() for l in relay_file.read_text().splitlines() if l.strip()]
         unsigned_ips = list(set(unsigned_ips + existing))
 
     write_file(out_dir / "smb_unsigned.txt", unsigned_ips, label="Signing disabled")
     write_file(out_dir / "smb_v1.txt", smbv1_ips, label="SMBv1 enabled")
+    header = f"{'IP':<18} {'Hostname':<20} {'Signing':<8} {'SMBv1':<8} OS\n" + "-" * 80
+    (out_dir / "smb_hosts_info.txt").write_text(header + "\n" + "\n".join(host_rows) + "\n")
+    log_ok(f"Joignables SMB: {len(reachable)} | signing off: {len(unsigned_ips)} | SMBv1: {len(smbv1_ips)}")
 
-    # Host info table
-    header = f"{'IP':<18} {'Hostname':<20} {'Signing':<8} {'SMBv1':<8} OS\n" + "-"*80
-    info_path = out_dir / "smb_hosts_info.txt"
-    info_path.write_text(header + "\n" + "\n".join(host_rows) + "\n")
-    log_ok(f"Host info: {len(host_rows)} hosts → smb_hosts_info.txt")
+    # --- 2) Sweep avec creds : qui s'authentifie ? ---
+    if creds_args:
+        log_info("nxc smb sweep auth (hôtes acceptant les creds) ...")
+        aout, _ = run_nxc(_nxc(hosts_file, "", creds=creds_args), timeout=scaled_timeout(n_hosts))
+        aout = strip_ansi(aout)
+        a_re = re.compile(r"SMB\s+(\d+\.\d+\.\d+\.\d+)\s")
+        seen_a = set()
+        for line in aout.splitlines():
+            if not nxc_login_ok(line):          # [+] = creds valides
+                continue
+            ma = a_re.search(line)
+            if not ma:
+                continue
+            ip = ma.group(1)
+            if ip not in seen_a:
+                seen_a.add(ip)
+                auth_hosts.append(ip)
+            if nxc_is_admin(line):              # (Pwn3d!)/(admin) = admin local
+                admin_hosts.append(ip)
+        write_file(out_dir / "smb_login_success.txt", auth_hosts,
+                   label="Hosts where creds authenticate")
+        if admin_hosts:
+            write_file(out_dir / "smb_admin.txt", admin_hosts,
+                       label="Hosts with admin (Pwn3d!/admin)")
+        if auth_hosts:
+            log_ok(f"Creds valides sur {len(set(auth_hosts))} hôte(s)"
+                   + (f", admin sur {len(set(admin_hosts))}" if admin_hosts else ""))
+        else:
+            log_warn("Les creds ne s'authentifient sur aucun hôte.")
+    else:
+        write_file(out_dir / "smb_login_success.txt", [])
 
-    return unsigned_ips, smbv1_ips, host_rows
+    return unsigned_ips, smbv1_ips, host_rows, sorted(set(reachable)), sorted(set(auth_hosts))
 
 
 # =============================================================================
 # STEP 2 — NULL SESSION SHARES
 # =============================================================================
-def step2_null_session(hosts_file, out_dir):
-    """Enumerate shares via null session."""
+def step2_null_session(hosts_file, out_dir, n_hosts):
+    """Enumerate shares via null session (no creds), on reachable hosts."""
     log_step("STEP 2 — Null Session Share Listing")
 
-    if not confirm_step("STEP 2 — Null Session Share Listing", f"nxc smb '{hosts_file}' --shares -u '' -p ''"):
+    if not confirm_step("STEP 2 — Null Session Share Listing", "nxc smb <reachable> --shares -u '' -p ''"):
         write_file(out_dir / "smb_shares_null.txt", [])
         return []
 
-    out, err, rc = run(f"nxc smb '{hosts_file}' --shares -u '' -p ''", timeout=300)
+    out, rc = run_nxc(_nxc(hosts_file, "--shares", creds="-u '' -p ''"),
+                      timeout=scaled_timeout(n_hosts))
+    out = strip_ansi(out)
 
     shares = []
-    # Parse share lines:
-    # SMB  192.168.1.10  445  DC01  [*] Enumerated shares
-    # SMB  192.168.1.10  445  DC01  Share           Permissions     Remark
-    # SMB  192.168.1.10  445  DC01  -----           -----------     ------
-    # SMB  192.168.1.10  445  DC01  ADMIN$                          Remote Admin
-    # SMB  192.168.1.10  445  DC01  IPC$            READ            Remote IPC
+    # READ,WRITE doit être testé avant READ seul (sinon un READ,WRITE est classé READ).
     share_line = re.compile(
-        r"SMB\s+(\d+\.\d+\.\d+\.\d+)\s+\d+\s+\S+\s+(\S+)\s+(READ|WRITE|READ,WRITE)"
+        r"SMB\s+(\d+\.\d+\.\d+\.\d+)\s+\d+\s+\S+\s+(\S+)\s+(READ(?:,WRITE)?|WRITE)"
     )
     for line in out.splitlines():
         m = share_line.search(line)
@@ -232,8 +325,8 @@ def step2_null_session(hosts_file, out_dir):
 # =============================================================================
 # STEP 3 — AUTHENTICATED SHARE ENUMERATION
 # =============================================================================
-def step3_auth_shares(hosts_file, out_dir, creds_args):
-    """Enumerate accessible shares with credentials.
+def step3_auth_shares(hosts_file, out_dir, creds_args, n_hosts):
+    """Enumerate accessible shares with credentials (on authenticated hosts only).
 
     Produit trois vues (les shares administratifs en `$` — ADMIN$, C$, IPC$… — sont
     exclus partout, ce ne sont pas des findings d'accès pertinents) :
@@ -245,13 +338,14 @@ def step3_auth_shares(hosts_file, out_dir, creds_args):
     """
     log_step("STEP 3 — Authenticated Share Enumeration")
 
-    if not confirm_step("STEP 3 — Authenticated Share Enumeration", f"nxc smb '{hosts_file}' {creds_args} --shares"):
+    if not confirm_step("STEP 3 — Authenticated Share Enumeration", "nxc smb <auth-hosts> <creds> --shares"):
         write_file(out_dir / "smb_shares_read.txt", [])
         write_file(out_dir / "smb_shares_write.txt", [])
         write_file(out_dir / "smb_shares_accessible.txt", [])
         return [], [], []
 
-    out, err, rc = run(f"nxc smb '{hosts_file}' {creds_args} --shares", timeout=300)
+    out, rc = run_nxc(_nxc(hosts_file, "--shares", creds=creds_args),
+                      timeout=scaled_timeout(n_hosts))
     out = strip_ansi(out)
 
     read_shares       = []
@@ -287,67 +381,11 @@ def step3_auth_shares(hosts_file, out_dir, creds_args):
 
 
 # =============================================================================
-# STEP 4 — SYSVOL / NETLOGON
+# STEP 4 — GPP CREDENTIALS (SYSVOL)
 # =============================================================================
-# Patterns passés à `--pattern` (nxc attend des motifs SÉPARÉS PAR ESPACES, pas une
-# liste à virgules). Ciblent scripts/GPP/logon susceptibles de fuiter des secrets.
-SYSVOL_PATTERNS = [".ps1", ".vbs", ".bat", ".cmd", ".xml", ".txt", ".ini", ".inf", ".config"]
-
-# Les lignes de hit `--spider` ressemblent à :
-#   SMB  10.0.0.1  445  DC01  //10.0.0.1/SYSVOL/corp.local/.../Groups.xml [lastm:'...' size:1234]
-# On récupère le chemin UNC (//host/share/...) jusqu'au marqueur [lastm/size].
-_SPIDER_PATH_RE = re.compile(r"(//.+?)\s*\[(?:lastm|size)", re.IGNORECASE)
-
-
-def _parse_spider_hits(output):
-    """Extrait les chemins de fichiers des lignes de sortie `--spider`."""
-    hits = []
-    for line in output.splitlines():
-        m = _SPIDER_PATH_RE.search(line)
-        if m:
-            hits.append(m.group(1).strip())
-            continue
-        # Fallback : toute ligne contenant un chemin UNC, hors ligne racine `//.../.`
-        idx = line.find("//")
-        if idx != -1:
-            frag = line[idx:].strip()
-            if frag and not frag.rstrip().endswith("/."):
-                hits.append(frag)
-    return hits
-
-
-def step4_sysvol(hosts_file, out_dir, creds_args):
-    """Spider SYSVOL and NETLOGON for interesting scripts/configs (built-in --spider)."""
-    log_step("STEP 4 — SYSVOL/NETLOGON Browsing")
-
-    sysvol_files = []
-    pattern_arg = " ".join(SYSVOL_PATTERNS)
-
-    detail = (f"nxc smb '{hosts_file}' {creds_args} --spider SYSVOL|NETLOGON "
-              f"--pattern {pattern_arg}")
-    if not confirm_step("STEP 4 — SYSVOL/NETLOGON Browsing", detail):
-        write_file(out_dir / "sysvol_files.txt", [])
-        return sysvol_files
-
-    for share in ("SYSVOL", "NETLOGON"):
-        log_info(f"Spidering {share} for scripts/configs ...")
-        out, err, rc = run(
-            f"nxc smb '{hosts_file}' {creds_args} --spider {share} "
-            f"--pattern {pattern_arg} --depth 15",
-            timeout=600,
-        )
-        sysvol_files.extend(_parse_spider_hits(out))
-
-    sysvol_files = list(dict.fromkeys(sysvol_files))
-    write_file(out_dir / "sysvol_files.txt", sysvol_files, sort=False,
-               label="SYSVOL/NETLOGON files")
-
-    return sysvol_files
-
-
-# =============================================================================
-# STEP 6 — GPP CREDENTIALS (SYSVOL)
-# =============================================================================
+# NB : le spidering SYSVOL/NETLOGON (--spider) et spider_plus (inventaire de tous les
+# shares) ont été RETIRÉS volontairement — trop de bruit. GPP ci-dessous extrait les
+# secrets à forte valeur de SYSVOL ; le reste de l'exploration se fait à la main.
 # Lignes à retenir dans la sortie des modules GPP (le reste = bannière/énum SYSVOL).
 _GPP_FINDING_RE = re.compile(
     r"(?i)(cpassword|password|username|credential|autologin|decrypt|found .*\.xml)"
@@ -360,7 +398,7 @@ _GPP_NEGATIVE_RE = re.compile(
 )
 
 
-def step_gpp(hosts_file, out_dir, creds_args):
+def step_gpp(hosts_file, out_dir, creds_args, n_hosts):
     """Extract GPP credentials from SYSVOL via nxc gpp_password / gpp_autologin.
 
     gpp_password déchiffre les cpassword des fichiers de préférences GPP
@@ -368,18 +406,19 @@ def step_gpp(hosts_file, out_dir, creds_args):
     Printers.xml) ; gpp_autologin extrait les identifiants d'autologon de
     registry.xml. Les deux lisent SYSVOL. Toute trouvaille = creds en clair → 🔴.
     """
-    log_step("STEP 6 — GPP credentials (SYSVOL)")
+    log_step("STEP 4 — GPP credentials (SYSVOL)")
 
     findings = []
-    if not confirm_step("STEP 6 — GPP credentials (SYSVOL)",
-                        f"nxc smb '{hosts_file}' {creds_args} -M gpp_password  +  -M gpp_autologin"):
+    if not confirm_step("STEP 4 — GPP credentials (SYSVOL)",
+                        "nxc smb <auth-hosts> <creds> -M gpp_password  +  -M gpp_autologin"):
         write_file(out_dir / "sysvol_gpp.txt", [])
         return findings
 
     raw_parts = []
     for module in ("gpp_password", "gpp_autologin"):
         log_info(f"Running {module} on SYSVOL ...")
-        out, err, rc = run(f"nxc smb '{hosts_file}' {creds_args} -M {module}", timeout=300)
+        out, rc = run_nxc(_nxc(hosts_file, f"-M {module}", creds=creds_args),
+                          timeout=scaled_timeout(n_hosts))
         out = strip_ansi(out)
         raw_parts.append(f"# === {module} ===\n{out}")
         for line in out.splitlines():
@@ -400,82 +439,10 @@ def step_gpp(hosts_file, out_dir, creds_args):
 
 
 # =============================================================================
-# STEP 5 — SPIDER PLUS (tous les partages lisibles)
-# =============================================================================
-# Emplacements où d'anciennes versions de nxc écrivent le JSON spider_plus, en
-# secours si `-o OUTPUT_FOLDER=` n'est pas honoré par la version installée.
-# Défaut nxc : NXC_PATH/nxc_spider_plus (NXC_PATH = ~/.nxc). Les autres couvrent
-# d'anciennes dispositions /tmp.
-_LEGACY_SPIDER_DIRS = [
-    Path.home() / ".nxc" / "nxc_spider_plus",
-    Path("/tmp/nxc_hosted/nxc_spider_plus"),
-    Path("/tmp/nxc_spider_plus"),
-]
-
-
-def step5_spider_summary(hosts_file, out_dir, creds_args):
-    """Run spider_plus on all readable shares and parse its per-host JSON.
-
-    spider_plus écrit un JSON par hôte (`<ip>.json`) dont les clés de 1er niveau
-    sont les PARTAGES, chaque partage mappant chemin -> métadonnées. On force
-    OUTPUT_FOLDER pour connaître l'emplacement au lieu de le deviner.
-    """
-    log_step("STEP 5 — Spider Plus (all readable shares)")
-
-    interesting = []
-    json_dir = out_dir / "spider_plus_json"
-
-    detail = (f"nxc smb '{hosts_file}' {creds_args} -M spider_plus "
-              f"-o OUTPUT_FOLDER={json_dir}")
-    if not confirm_step("STEP 5 — Spider Plus (all readable shares)", detail):
-        write_file(out_dir / "smb_spider.txt", [])
-        return interesting
-
-    json_dir.mkdir(parents=True, exist_ok=True)
-    log_info("Running spider_plus module (crawls all readable shares) ...")
-    run(
-        f"nxc smb '{hosts_file}' {creds_args} -M spider_plus "
-        f"-o OUTPUT_FOLDER={shlex.quote(str(json_dir))}",
-        timeout=900,
-    )
-
-    # JSON de notre dossier contrôlé d'abord ; sinon secours sur les emplacements legacy.
-    json_files = list(json_dir.rglob("*.json"))
-    if not json_files:
-        for d in _LEGACY_SPIDER_DIRS:
-            if d.exists():
-                json_files += list(d.rglob("*.json"))
-
-    for jf in json_files:
-        try:
-            data = json.loads(jf.read_text())
-        except (json.JSONDecodeError, OSError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        host = jf.stem  # spider_plus nomme chaque fichier <ip>.json
-        for share, files in data.items():
-            if not isinstance(files, dict):
-                continue
-            for path, meta in files.items():
-                size = ""
-                if isinstance(meta, dict):
-                    size = meta.get("size", meta.get("filesize", ""))
-                entry = f"{host}  \\\\{share}\\{path}"
-                if size != "":
-                    entry += f"  ({size})"
-                interesting.append(entry)
-
-    interesting = list(dict.fromkeys(interesting))
-    write_file(out_dir / "smb_spider.txt", interesting, sort=False, label="Spider plus files")
-    return interesting
-
-
-# =============================================================================
 # SUMMARY
 # =============================================================================
-def write_summary(out_dir, unsigned, smbv1, null_shares, read_shares, write_shares,
-                  accessible_shares, sysvol_files, spider_files, gpp_findings, has_creds):
+def write_summary(out_dir, unsigned, smbv1, reachable, auth_hosts, null_shares,
+                  read_shares, write_shares, accessible_shares, gpp_findings, has_creds):
     """Write a human-readable summary file and print it."""
     log_step("SUMMARY")
 
@@ -483,6 +450,7 @@ def write_summary(out_dir, unsigned, smbv1, null_shares, read_shares, write_shar
         f"SMB Enumeration Summary — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         RULE,
         "",
+        f"[RECON]    Reachable SMB hosts:                              {len(reachable)}",
         f"[SIGNING]  Hosts with SMB signing DISABLED (relay targets): {len(unsigned)}",
         f"[SMBv1]    Hosts with SMBv1 ENABLED:                         {len(smbv1)}",
         f"[NULL]     Shares accessible via null session:               {len(null_shares)}",
@@ -490,11 +458,10 @@ def write_summary(out_dir, unsigned, smbv1, null_shares, read_shares, write_shar
 
     if has_creds:
         lines += [
+            f"[AUTH]     Hosts where creds authenticate:                 {len(auth_hosts)}",
             f"[AUTH]     Accessible shares (R/W, non-admin):             {len(accessible_shares)}",
             f"[AUTH]     Readable shares (with creds):                   {len(read_shares)}",
             f"[CRITICAL] Writable shares (with creds):                   {len(write_shares)}",
-            f"[SYSVOL]   Interesting SYSVOL/NETLOGON files:              {len(sysvol_files)}",
-            f"[SPIDER]   Files found via spider_plus:                    {len(spider_files)}",
             f"[CRITICAL] GPP credential findings (SYSVOL):               {len(gpp_findings)}",
         ]
 
@@ -546,8 +513,8 @@ Examples:
     p.add_argument("-H", "--hash", help="NTLM hash LM:NT for pass-the-hash")
     p.add_argument("-d", "--domain", default="WORKGROUP",
                    help="Domain (default: WORKGROUP)")
-    p.add_argument("--threads", type=int, default=10,
-                   help="Number of parallel threads for nxc (default: 10)")
+    p.add_argument("--threads", type=int, default=100,
+                   help="nxc concurrency, passed as --threads (default: 100; raise for big scopes)")
     p.add_argument("-y", "--yes", action="store_true",
                    help="Non-interactive: accept all steps (for automation/UI)")
     return p.parse_args()
@@ -557,9 +524,11 @@ Examples:
 # MAIN
 # =============================================================================
 def main():
+    global _THREADS
     args = parse_args()
     if getattr(args, "yes", False):
         enable_auto_accept()
+    _THREADS = max(1, args.threads)
 
     # --- Output directory ---
     if args.output:
@@ -589,48 +558,61 @@ def main():
         log_warn("Skipping all nxc checks. Install nxc to proceed.")
         # Still create empty output files so callers don't break
         for fname in ["smb_unsigned.txt", "smb_v1.txt", "smb_hosts_info.txt",
-                      "smb_shares_null.txt", "smb_shares_read.txt",
-                      "smb_shares_write.txt", "sysvol_files.txt",
-                      "smb_spider.txt", "smb_summary.txt"]:
+                      "smb_login_success.txt", "smb_shares_null.txt",
+                      "smb_shares_read.txt", "smb_shares_write.txt",
+                      "smb_shares_accessible.txt", "sysvol_gpp.txt", "smb_summary.txt"]:
             (out_dir / fname).write_text("")
         sys.exit(1)
 
     has_creds = bool(args.username and (args.password is not None or args.hash))
     creds_args = build_creds_args(args) if has_creds else ""
+    n_all = len(hosts)
 
-    unsigned, smbv1, host_rows = step1_smb_info(hosts_tmp, out_dir)
-    null_shares = step2_null_session(hosts_tmp, out_dir)
+    # --- STEP 1: recon (info/signing + reachable + auth) ---
+    unsigned, smbv1, host_rows, reachable, auth_hosts = step1_recon(
+        hosts_tmp, out_dir, creds_args, n_all)
 
-    read_shares  = []
-    write_shares = []
-    accessible_shares = []
-    sysvol_files = []
-    spider_files = []
+    # --- STEP 2: null session (no creds) on reachable hosts only ---
+    reachable_tmp = hosts_to_tmpfile(reachable) if reachable else hosts_tmp
+    null_shares = step2_null_session(reachable_tmp, out_dir, len(reachable) or n_all)
+
+    read_shares, write_shares, accessible_shares = [], [], []
     gpp_findings = []
+    auth_tmp = None
 
-    if has_creds:
-        read_shares, write_shares, accessible_shares = step3_auth_shares(hosts_tmp, out_dir, creds_args)
-        sysvol_files = step4_sysvol(hosts_tmp, out_dir, creds_args)
-        spider_files = step5_spider_summary(hosts_tmp, out_dir, creds_args)
-        gpp_findings = step_gpp(hosts_tmp, out_dir, creds_args)
+    # --- STEP 3 & 4: authenticated, only against hosts where creds work ---
+    if has_creds and auth_hosts:
+        auth_tmp = hosts_to_tmpfile(auth_hosts)
+        n_auth = len(auth_hosts)
+        read_shares, write_shares, accessible_shares = step3_auth_shares(
+            auth_tmp, out_dir, creds_args, n_auth)
+        gpp_findings = step_gpp(auth_tmp, out_dir, creds_args, n_auth)
     else:
-        log_info("No credentials provided — skipping authenticated checks (steps 3-6)")
+        if has_creds and not auth_hosts:
+            log_warn("Creds did not authenticate anywhere — skipping share/GPP steps.")
+        else:
+            log_info("No credentials provided — skipping authenticated checks (steps 3-4)")
         for fname in ["smb_shares_read.txt", "smb_shares_write.txt",
-                      "smb_shares_accessible.txt", "sysvol_files.txt",
-                      "smb_spider.txt", "sysvol_gpp.txt"]:
+                      "smb_shares_accessible.txt", "sysvol_gpp.txt"]:
             (out_dir / fname).write_text("")
 
     # -------------------------------------------------------------------------
     # SUMMARY
     # -------------------------------------------------------------------------
-    write_summary(out_dir, unsigned, smbv1, null_shares, read_shares, write_shares,
-                  accessible_shares, sysvol_files, spider_files, gpp_findings, has_creds)
+    write_summary(out_dir, unsigned, smbv1, reachable, auth_hosts, null_shares,
+                  read_shares, write_shares, accessible_shares, gpp_findings, has_creds)
 
-    # Cleanup temp file
-    try:
-        os.unlink(hosts_tmp)
-    except OSError:
-        pass
+    # Cleanup temp host files
+    tmp_files = [hosts_tmp]
+    if reachable:
+        tmp_files.append(reachable_tmp)
+    if auth_tmp:
+        tmp_files.append(auth_tmp)
+    for tf in set(tmp_files):
+        try:
+            os.unlink(tf)
+        except OSError:
+            pass
 
     log_ok(f"Done. Results in: {out_dir.resolve()}")
 

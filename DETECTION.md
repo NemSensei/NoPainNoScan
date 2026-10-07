@@ -71,17 +71,22 @@ Centralisée dans [`npns_common.py`](npns_common.py) :
 > **Corrigé** : `403` ne déclenche plus (un portail d'auth global renvoie 401/403 partout ≠ ADCS) ; `/adcs/` (pas un chemin ADCS par défaut) retiré. 401 = enrôlement NTLM = signal ESC8 fort.
 
 ### SMB — [`check_smb.py`](check_smb.py)
+Flux : **1. recon** → **2. null session** → **3. shares** → **4. GPP**. Les steps 3 et 4
+ne ciblent que les hôtes où l'auth réussit (reco step 1) → bien plus rapide sur gros scope.
+
 | Finding | Critère | Fichier | Crit. |
 |---|---|---|---|
+| Hôtes joignables SMB | ligne `SMB <ip> <port>` au sweep | (dans `smb_hosts_info.txt`) | ℹ️ |
+| Auth réussie (creds valides) | `[+]` au sweep authentifié | `smb_login_success.txt` | ℹ️ |
+| Admin (creds) | `(Pwn3d!)`/`(admin)` au sweep | `smb_admin.txt` | ℹ️ |
 | SMB signing désactivé | `(signing:False)` | `smb_unsigned.txt` | 🔴 |
 | SMBv1 | `(SMBv1:True)` | `smb_v1.txt` | 🔴 |
-| Partage inscriptible | share listé `READ,WRITE`/`WRITE` (hors `$`) | `smb_shares_write.txt` | 🔴 |
+| Partage inscriptible | share `READ,WRITE`/`WRITE` (hors `$`) | `smb_shares_write.txt` | 🔴 |
 | Shares accessibles (R/W) | tout share non-`$` avec READ/WRITE (creds) | `smb_shares_accessible.txt` | ⚠️ |
 | Null session | partages via session nulle | `smb_shares_null.txt` | ⚠️ |
-| SYSVOL/Spider | fichiers intéressants | `sysvol_files.txt` | ⚠️ |
 | Creds GPP (SYSVOL) | `-M gpp_password`/`-M gpp_autologin` → ligne cred (hors négatives) | `sysvol_gpp.txt` (brut: `sysvol_gpp_raw.txt`) | 🔴 |
 
-> Pas de faux positif admin ici (ne s'appuie pas sur `(Pwn3d!)`). STEP 3 nettoie les codes ANSI (`strip_ansi`) avant parsing et **exclut les partages administratifs `$`** (ADMIN$, C$, IPC$…) de tous les fichiers shares. STEP 4/5 (SYSVOL/NETLOGON + spider_plus) corrigés et fonctionnels. **⚠ Reste** : regex null-session `READ,WRITE` de STEP 2 (sans creds) toujours mal classée.
+> Pas de faux positif admin (ne s'appuie pas sur `(Pwn3d!)` pour les shares). STEP 1-4 nettoient l'ANSI (`strip_ansi`) avant parsing et **excluent les partages `$`** des fichiers shares. Robustesse gros scope : `run_nxc()` redirige vers fichier, **tue le groupe de processus sur timeout et conserve la sortie partielle** (fini le « plus rien ne remonte »), timeouts scalés sur le nb d'hôtes, `--threads` transmis (défaut 100). **Spidering retiré volontairement** (`--spider` SYSVOL/NETLOGON + `-M spider_plus`) — trop bruyant ; GPP couvre les secrets SYSVOL, le reste se fait à la main. **⚠ Reste** : regex null-session fixée (plus de mauvais classement `READ,WRITE`).
 
 ### LDAP, Kerberos, SSH, DNS, SNMP, FTP
 Détection inchangée sur cette passe (**en attente** selon ta consigne), sauf le bug SSH ci-dessous. Points connus à fiabiliser : Kerberos (suffixe realm qui casse la userlist AS-REP + clock-skew), LDAP (`rc==0` log succès sur bind échoué ; `--password-not-required` mal étiqueté « no_preauth »), SNMP (version de brute non réutilisée → énum vide), DNS (crash IPv6 `cidr_from_ip`), FTP (listing non borné / filtre trop large).

@@ -106,6 +106,7 @@ def collect(base: Path) -> dict:
         "scanned": scanned("smb_hosts_info.txt", "smb_unsigned.txt"),
         "unsigned":    read_all(base, "smb_unsigned.txt"),
         "v1":          read_all(base, "smb_v1.txt"),
+        "login_success": read_all(base, "smb_login_success.txt"),
         "null_shares": read_all(base, "smb_shares_null.txt"),
         "accessible_shares": read_all(base, "smb_shares_accessible.txt"),
         "read_shares": read_all(base, "smb_shares_read.txt"),
@@ -411,6 +412,10 @@ def build_smb(d: dict) -> str:
     parts.append(subsec(f"SMBv1 enabled ({len(s['v1'])} hosts)",
                         ip_table(s["v1"]) if s["v1"] else '<p class="empty">No hosts with SMBv1 detected.</p>',
                         v1_lvl))
+
+    if s["login_success"]:
+        parts.append(subsec(f"Hosts where credentials authenticate ({len(s['login_success'])})",
+                            ip_table(s["login_success"]), "info"))
 
     if s["null_shares"]:
         parts.append(subsec(f"Null session shares ({len(s['null_shares'])} entries)",
