@@ -149,48 +149,50 @@ def check_anonymous_auth(ip: str) -> tuple:
 
 RAKP_USERS = ["ADMIN", "admin", "Administrator", "root", "USERID"]
 
-def capture_rakp_hash(ip: str, usernames: list) -> list:
+def capture_rakp_hash(ip: str, usernames: list) -> tuple:
     """
-    Attempt RAKP hash capture.
-    Returns list of (username, hash_line) tuples for cracking.
-    ipmitool with -vvv prints the RAKP exchange; we extract the HMAC/hash.
-    If ipmipwner is available, use it instead.
+    Attempt RAKP hash capture + user enumeration.
+
+    Returns (hashes, enum_users):
+      • hashes      : list[(user, hashcat_line)]  — VRAIS hashes crackables (-m 7300),
+                       uniquement via ipmipwner. Vide si ipmipwner absent.
+      • enum_users  : list[user]                  — comptes EXISTANTS déduits de la
+                       réponse RAKP 2 d'ipmitool. Ce n'est PAS un hash → ne doit pas
+                       aller dans ipmi_hashes.txt ni compter comme capture.
+
+    Pourquoi : `ipmitool -vvv` n'émet PAS de hash RAKP exploitable. L'ancien code
+    flaggait un "hash" dès que "rakp 2" apparaissait dans la sortie — or ipmitool
+    imprime "RAKP 2 message indicates an error : unauthorized name" (= l'utilisateur
+    N'EXISTE PAS), qui contient aussi "rakp 2" → faux positif critique systématique,
+    avec un pseudo-hash = hex arbitraire du debug. La vraie capture passe par
+    ipmipwner ou Metasploit ipmi_dumphashes.
     """
     hashes = []
 
-    # Prefer ipmipwner if available
+    # Chemin fiable : ipmipwner produit des hashes hashcat-ready ($rakp$...).
     if tool_exists("ipmipwner"):
         for user in usernames:
             cmd = f"ipmipwner --target {shlex.quote(ip)} --user {shlex.quote(user)} 2>&1"
             out, err, rc = run(cmd, timeout=30)
-            combined = (out + err).strip()
-            # ipmipwner outputs hashcat-ready hashes
-            for line in combined.splitlines():
-                if "$rakp$" in line or "RAKP" in line.upper():
+            for line in (out + err).splitlines():
+                if "$rakp$" in line:  # format hashcat réel uniquement
                     hashes.append((user, line.strip()))
-        return hashes
+        return hashes, []
 
-    # Fallback: use ipmitool -vvv and parse RAKP material from stderr
+    # Fallback ipmitool : ÉNUMÉRATION seulement (pas de hash).
+    log_info("ipmipwner absent — fallback ipmitool : énumération d'utilisateurs "
+             "uniquement (pas de capture de hash). Installer ipmipwner pour les hashes.")
+    enum_users = []
     for user in usernames:
         cmd = f"ipmitool -I lanplus -H {shlex.quote(ip)} -U {shlex.quote(user)} -P 'dummypassword' -vvv chassis status 2>&1"
         out, err, rc = run(cmd, timeout=20)
-        combined = out + err
-
-        # Look for RAKP 2 error — means server responded with HMAC material
-        # The hash is not directly in ipmitool output, but we can note the
-        # server acknowledged the user exists (RAKP 2 response without error).
-        # Real hash capture requires a raw socket implementation or Metasploit.
-        # We record what we can.
-        if "rakp 2" in combined.lower():
-            # Try to find hex data patterns that look like HMAC material
-            hex_lines = re.findall(r'[0-9a-fA-F]{32,}', combined)
-            hash_candidate = " ".join(hex_lines[:4]) if hex_lines else "(hash material present but not extracted)"
-            hashes.append((user, f"RAKP2 response for user '{user}' on {ip}: {hash_candidate}"))
-        elif "rakp 2 message indicates an error" not in combined.lower() and \
-             "authentication" in combined.lower():
-            hashes.append((user, f"Possible RAKP exchange for user '{user}' on {ip} (verify manually)"))
-
-    return hashes
+        combined = (out + err).lower()
+        # Compte EXISTANT = RAKP 2 présent SANS message d'erreur "unauthorized name".
+        if "rakp 2" in combined and "indicates an error" not in combined \
+                and "unauthorized name" not in combined:
+            enum_users.append(user)
+            log_info(f"  BMC {ip}: utilisateur valide (RAKP) → '{user}'")
+    return [], enum_users
 
 
 # ---------------------------------------------------------------------------
@@ -258,11 +260,12 @@ def run_checks(targets: list, output_dir: Path, usernames: list, password: str =
     f_cipher0 = output_dir / "ipmi_cipher0.txt"
     f_anon    = output_dir / "ipmi_anonymous.txt"
     f_hashes  = output_dir / "ipmi_hashes.txt"
+    f_users   = output_dir / "ipmi_users.txt"
     f_defcred = output_dir / "ipmi_default_creds.txt"
     f_summary = output_dir / "ipmi_summary.txt"
 
     # Initialise files
-    for f in [f_info, f_cipher0, f_anon, f_hashes, f_defcred, f_summary]:
+    for f in [f_info, f_cipher0, f_anon, f_hashes, f_users, f_defcred, f_summary]:
         f.write_text("")
 
     stats = {
@@ -338,14 +341,18 @@ def run_checks(targets: list, output_dir: Path, usernames: list, password: str =
     if confirm_step("STEP 4/5 — RAKP hash capture", f"ipmitool -I lanplus -vvv (or ipmipwner) chassis status  (x{len(present_hosts)} host(s) x {len(usernames)} user(s))"):
         for ip in present_hosts:
             log_info(f"Attempting RAKP hash capture on {ip} ...")
-            hashes = capture_rakp_hash(ip, usernames)
-            if hashes:
-                for user, hline in hashes:
-                    append_file(f_hashes, f"[CRITICAL] {ip} | user={user} | {hline}")
-                    stats["hashes_captured"] += 1
-                    log_ok(f"  {ip} — RAKP hash material for user={user}")
-            else:
-                log_info(f"  {ip} — no RAKP hash material captured")
+            hashes, enum_users = capture_rakp_hash(ip, usernames)
+            for user, hline in hashes:
+                append_file(f_hashes, f"[CRITICAL] {ip} | user={user} | {hline}")
+                stats["hashes_captured"] += 1
+                log_ok(f"  {ip} — RAKP hash captured for user={user}")
+            # Énumération (pas un hash) : fichier séparé, NON critique.
+            for user in enum_users:
+                append_file(f_users, f"{ip} | {user}")
+            if not hashes and not enum_users:
+                log_info(f"  {ip} — no RAKP hash / no user enumerated")
+            elif not hashes and enum_users:
+                log_info(f"  {ip} — {len(enum_users)} user(s) enumerated (no hash; install ipmipwner)")
 
     # ---- STEP 5 ----
     log_step("STEP 5/5 — Default credentials")

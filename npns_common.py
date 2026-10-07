@@ -73,6 +73,34 @@ def tool_exists(name):
 
 
 # =============================================================================
+# PARSING NXC — succès vs accès privilégié
+# =============================================================================
+# nxc/NetExec distingue deux niveaux dans sa sortie :
+#   • "[+] domain\\user:pass"            → authentification réussie (creds VALIDES)
+#   • "... (Pwn3d!)"  ou  "... (admin)"  → accès réellement PRIVILÉGIÉ (exec / admin)
+# Le marqueur privilégié a changé selon les versions ((Pwn3d!) historique, (admin)
+# sur les builds récents) : on matche LES DEUX pour survivre aux mises à jour nxc.
+# Ne JAMAIS traiter un simple "[+]" comme un accès exploitable : c'est la source des
+# faux positifs (RDP/WinRM/MSSQL où creds valides ≠ session/exec possible).
+NXC_ADMIN_MARKERS = ("(pwn3d!)", "(admin)")
+
+
+def nxc_is_admin(line):
+    """True si la ligne nxc indique un accès privilégié (Pwn3d!/admin).
+
+    Seul signal fiable de « je peux réellement agir ici » (ouvrir une session RDP,
+    exécuter via WinRM, lancer xp_cmdshell). Insensible à la casse."""
+    low = line.lower()
+    return any(mark in low for mark in NXC_ADMIN_MARKERS)
+
+
+def nxc_login_ok(line):
+    """True si la ligne nxc montre une auth réussie ([+]) — creds valides mais PAS
+    forcément privilégiées. Signal plus faible que nxc_is_admin()."""
+    return "[+]" in line
+
+
+# =============================================================================
 # CONFIRMATION D'ÉTAPE + PROGRESSION
 # =============================================================================
 _AUTO_ACCEPT = False

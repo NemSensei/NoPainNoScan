@@ -135,8 +135,9 @@ def step_audit(hosts, port, out_dir):
             )
             full_output = audit_out + audit_err
         else:
-            # nxc ssh gives basic info — limited but better than nothing
-            audit_out, audit_err, rc = run(f"nxc ssh {ip} -p {port}", timeout=30)
+            # nxc ssh gives basic info — limited but better than nothing.
+            # NB: en nxc `-p` = MOT DE PASSE ; le port se passe avec `--port`.
+            audit_out, audit_err, rc = run(f"nxc ssh {shlex.quote(ip)} --port {port}", timeout=30)
             full_output = audit_out + audit_err
 
         audit_file = out_dir / f"ssh_audit_{ip}.txt"

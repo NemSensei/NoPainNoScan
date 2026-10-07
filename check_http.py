@@ -115,13 +115,21 @@ def step1_title(ip, port, timeout):
 
 
 def step2_adcs(ip, port, scheme, timeout):
-    """Check ADCS paths on a given base URL. Returns list of findings."""
-    paths = ['/certsrv/', '/certenroll/', '/adcs/', '/CertSrv/Default.asp']
+    """Check ADCS web-enrollment paths. Returns list of findings.
+
+    ESC8 vise l'endpoint d'enrôlement web /certsrv/ (protégé NTLM → 401, ou 200).
+    On ne garde QUE les chemins ADCS réels, et on ignore 403 : un 401/403 nu sur
+    n'importe quelle appli derrière un portail d'auth n'est PAS de l'ADCS (ancien
+    faux positif). '/adcs/' n'est pas un chemin ADCS par défaut → retiré.
+    """
+    paths = ['/certsrv/', '/certsrv/certfnsh.asp', '/certsrv/Default.asp', '/certenroll/']
     findings = []
     for path in paths:
         url = f"{scheme}://{ip}:{port}{path}"
         code = check_url_exists(url, timeout)
-        if code in ('200', '401', '403'):
+        # 401 = enrôlement protégé NTLM (signal ESC8 fort) ; 200 = accessible.
+        # 403 trop ambigu pour un critique → on l'ignore ici.
+        if code in ('200', '401'):
             findings.append(f"{url} [{code}]")
     return findings
 

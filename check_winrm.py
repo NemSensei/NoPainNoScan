@@ -17,7 +17,7 @@ from pathlib import Path
 
 from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
                          tool_exists, confirm_step, set_total_steps, enable_auto_accept,
-                         emit_progress)
+                         emit_progress, nxc_is_admin, nxc_login_ok)
 
 
 set_total_steps(3)
@@ -175,24 +175,39 @@ def step2_auth(hosts_file, username, password, ntlm_hash, domain, out_dir, port)
     log_info(f"Running: {cmd}")
     out, err, _ = run(cmd, timeout=300)
 
-    accessible = []
+    # WinRM : (Pwn3d!)/(admin) = on peut réellement exécuter (membre d'Administrators
+    # ou de "Remote Management Users"). Un simple [+] = creds valides mais shell non
+    # garanti. On ne remonte en "accessible" (→ critique dans le rapport, et base de
+    # step3 exec) que les hôtes avec accès réel. Les [+]-seuls partent en info.
+    accessible = []       # accès exploitable (exec)
+    valid_only = []       # creds valides, exec non confirmée
     for line in out.splitlines():
-        if "(Pwn3d!)" in line or "STATUS_SUCCESS" in line.upper() or "[+]" in line:
+        if nxc_is_admin(line):
             accessible.append(line.strip())
+        elif nxc_login_ok(line):
+            valid_only.append(line.strip())
+
+    # Brut nxc à part (troubleshooting) ; winrm_accessible.txt ne contient QUE les hôtes
+    # réellement accessibles → le rapport compte des lignes qui ont un sens (sinon le
+    # dump complet faisait toujours remonter WinRM en critique).
+    (out_dir / "winrm_auth_raw.txt").write_text(out + "\n" + (err or ""))
 
     acc_path = out_dir / "winrm_accessible.txt"
-    with acc_path.open("w") as f:
-        f.write(f"# WinRM Accessible Hosts — {datetime.now()}\n\n")
-        f.write("## Full nxc output\n")
-        f.write(out + "\n")
-        if accessible:
-            f.write("\n## [CRITICAL] Successful authentications\n")
-            f.write("\n".join(sorted(set(accessible))) + "\n")
+    if accessible:
+        acc_path.write_text("\n".join(sorted(set(accessible))) + "\n")
+    else:
+        acc_path.write_text("# No WinRM shell access (no admin/Pwn3d! marker)\n")
+
+    valid_path = out_dir / "winrm_valid_creds.txt"
+    valid_path.write_text("\n".join(sorted(set(valid_only))) + ("\n" if valid_only else ""))
 
     if accessible:
-        log_ok(f"[CRITICAL] {len(accessible)} successful auth(s) found → {acc_path}")
+        log_ok(f"[CRITICAL] {len(accessible)} host(s) with WinRM shell access → {acc_path}")
     else:
-        log_warn(f"No successful authentications. Full output in {acc_path}")
+        log_warn(f"No WinRM shell access (no admin/Pwn3d! marker). Full output in {acc_path}")
+    if valid_only:
+        log_info(f"{len(valid_only)} host(s) with VALID creds but no shell "
+                 f"(not in Remote Management Users?) → {valid_path}")
 
     return accessible
 

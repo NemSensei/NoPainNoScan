@@ -14,7 +14,7 @@ from pathlib import Path
 
 from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
                          tool_exists, confirm_step, set_total_steps, enable_auto_accept,
-                         emit_progress)
+                         emit_progress, nxc_is_admin)
 
 
 set_total_steps(3)
@@ -180,12 +180,22 @@ def step_authenticated(hosts_file: str, out_dir: Path,
 
     log_info(f"Testing xp_cmdshell (whoami) as {user}")
     stdout, _, _ = run(f"nxc mssql {hf} {creds}{auth} -x 'whoami' 2>/dev/null", timeout=180)
-    for line in stdout.splitlines():
-        if "[+]" in line or "Pwn3d!" in line or "\\" in line:
+    # xp_cmdshell = RCE : ne remonter que si nxc confirme l'exécution via le marqueur
+    # admin/Pwn3d!. Un simple [+] = login SA valide mais xp_cmdshell peut être désactivé
+    # ou le compte non-sysadmin ; l'ancien "\\" ramassait aussi la ligne d'auth et tout
+    # DOMAIN\user → faux positif critique.
+    exec_hosts = [line.strip() for line in stdout.splitlines() if nxc_is_admin(line)]
+    if exec_hosts:
+        for line in exec_hosts:
             m = re.search(r'MSSQL\s+([\d.]+)', line)
             if m:
                 log_ok(f"[CRITICAL] xp_cmdshell works on {m.group(1)} as {user}")
-            cmdexec_lines.append(line.strip())
+        cmdexec_lines.extend(exec_hosts)
+        # Joindre la sortie réelle de la commande (lignes hors statut nxc) comme preuve.
+        cmdexec_lines.extend(
+            l.strip() for l in stdout.splitlines()
+            if l.strip() and not re.search(r'\[\+\]|\[-\]|\[\*\]', l)
+        )
 
     log_info(f"Checking linked servers as {user}")
     q3 = "SELECT name FROM sys.servers"

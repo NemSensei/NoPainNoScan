@@ -7,7 +7,7 @@ from pathlib import Path
 
 from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
                          tool_exists, confirm_step, set_total_steps, enable_auto_accept,
-                         emit_progress)
+                         emit_progress, nxc_is_admin, nxc_login_ok)
 
 
 set_total_steps(3)
@@ -74,7 +74,7 @@ OS_RE = re.compile(
     re.IGNORECASE,
 )
 
-AUTH_LINE_RE = re.compile(r"RDP\s+(?P<ip>\d+\.\d+\.\d+\.\d+).*\[\+\]", re.IGNORECASE)
+RDP_IP_RE = re.compile(r"RDP\s+(?P<ip>\d+\.\d+\.\d+\.\d+)", re.IGNORECASE)
 
 
 def parse_nxc_output(stdout):
@@ -100,13 +100,31 @@ def parse_nxc_output(stdout):
 
 
 def parse_auth_output(stdout):
-    """Return list of IPs where authentication succeeded ([+])."""
-    successes = []
+    """Parse nxc rdp authenticated output.
+
+    En RDP, un simple ``[+]`` signifie seulement que les creds sont VALIDES (NLA les
+    accepte) — l'ouverture de session peut quand même être refusée (droits "Remote
+    Desktop Users"). Seul le marqueur ``(Pwn3d!)``/``(admin)`` garantit qu'on peut
+    réellement se connecter. On sépare donc les deux pour ne pas remonter de faux
+    positif critique.
+
+    Returns:
+        (admin_ips, valid_only_ips): IPs avec accès réel vs IPs creds-valides-seules.
+    """
+    admin_ips, valid_ips = [], []
     for line in stdout.splitlines():
-        m = AUTH_LINE_RE.search(line)
-        if m:
-            successes.append(m.group("ip"))
-    return list(dict.fromkeys(successes))  # dedup, preserve order
+        m = RDP_IP_RE.search(line)
+        if not m:
+            continue
+        ip = m.group("ip")
+        if nxc_is_admin(line):
+            admin_ips.append(ip)
+        elif nxc_login_ok(line):
+            valid_ips.append(ip)
+    admin = list(dict.fromkeys(admin_ips))
+    # creds valides mais SANS accès admin (exclut ceux déjà classés admin)
+    valid_only = [ip for ip in dict.fromkeys(valid_ips) if ip not in admin]
+    return admin, valid_only
 
 
 # ---------------------------------------------------------------------------
@@ -184,19 +202,33 @@ def step2_auth_check(hosts_file, out_dir, username, password, ntlm_hash, domain)
     log_info(f"Running: {cmd}")
     stdout, stderr, rc = run(cmd, timeout=600)
 
-    successes = parse_auth_output(stdout)
+    # Save raw output for troubleshooting / manual review.
+    (out_dir / "rdp_auth_raw.txt").write_text(stdout + "\n" + stderr)
 
+    admin, valid_only = parse_auth_output(stdout)
+
+    # rdp_login_success.txt = accès RÉEL uniquement (marqueur admin/Pwn3d!).
+    # C'est ce fichier que le rapport remonte en 🔴 critique.
     success_file = out_dir / "rdp_login_success.txt"
-    success_file.write_text("\n".join(sorted(successes)) + ("\n" if successes else ""))
+    success_file.write_text("\n".join(sorted(admin)) + ("\n" if admin else ""))
 
-    if successes:
-        log_ok(f"Successful login on {len(successes)} host(s):")
-        for ip in successes:
+    # Fichier d'info : creds valides mais session non garantie (droits RDP manquants).
+    valid_file = out_dir / "rdp_valid_creds.txt"
+    valid_file.write_text("\n".join(sorted(valid_only)) + ("\n" if valid_only else ""))
+
+    if admin:
+        log_ok(f"[CRITICAL] Interactive RDP access (admin) on {len(admin)} host(s):")
+        for ip in admin:
             log_ok(f"  {ip}")
     else:
-        log_warn("No successful logins detected.")
+        log_warn("No interactive RDP access (no admin/Pwn3d! marker).")
+    if valid_only:
+        log_info(f"{len(valid_only)} host(s) with VALID creds but no confirmed session "
+                 f"(check RDP logon rights) → {valid_file}")
+        for ip in valid_only:
+            log_info(f"  {ip}")
 
-    return successes
+    return admin
 
 
 def step3_screenshot(hosts_file, out_dir, username, password, ntlm_hash, domain):
