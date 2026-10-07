@@ -53,6 +53,31 @@ def jload(path: Path | None):
         return None
 
 
+def read_all(base: Path, name: str) -> list[str]:
+    """Union (dédupliquée, ordre préservé) des lignes de TOUS les fichiers `name`
+    trouvés récursivement sous `base`. `name` peut être un motif glob
+    (ex. 'ldap_users_*.txt'). C'est ce qui rend le rapport cumulatif : relancer
+    des checks (nouveaux services, nouveaux scopes, dossiers distincts) enrichit
+    le rapport au lieu de ne refléter qu'un seul fichier."""
+    seen, out = set(), []
+    for p in sorted(base.rglob(name)):
+        for line in read_lines(p):
+            if line not in seen:
+                seen.add(line)
+                out.append(line)
+    return out
+
+
+def merge_ports_summary(base: Path) -> dict:
+    """Fusionne tous les ports_summary.json trouvés → {ip: set(ports)}."""
+    merged: dict = {}
+    for p in sorted(base.rglob("ports_summary.json")):
+        data = jload(p) or {}
+        for ip, ports in data.items():
+            merged.setdefault(ip, set()).update(ports)
+    return merged
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Data collection
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,12 +85,16 @@ def jload(path: Path | None):
 def collect(base: Path) -> dict:
     d: dict = {}
 
-    # Discovery
-    d["alive"] = read_lines(find_file(base, "hosts_alive.txt"))
+    def scanned(*names) -> bool:
+        """True si AU MOINS un fichier correspondant existe (où que ce soit sous base)."""
+        return any(find_files(base, n) for n in names)
+
+    # Discovery (agrégé sur tous les runs/dossiers)
+    d["alive"] = read_all(base, "hosts_alive.txt")
     svcs = ["dc", "smb", "ldap", "rdp", "winrm", "ssh", "http",
             "mssql", "dns", "kerberos", "ftp", "snmp", "ipmi"]
-    d["by_service"] = {s: read_lines(find_file(base, f"hosts_{s}.txt")) for s in svcs}
-    ps = jload(find_file(base, "ports_summary.json"))
+    d["by_service"] = {s: read_all(base, f"hosts_{s}.txt") for s in svcs}
+    ps = merge_ports_summary(base)
     if ps:
         cnt = Counter(p for ports in ps.values() for p in ports)
         d["top_ports"] = cnt.most_common(15)
@@ -74,115 +103,115 @@ def collect(base: Path) -> dict:
 
     # SMB
     d["smb"] = {
-        "scanned": bool(find_file(base, "smb_hosts_info.txt") or find_file(base, "smb_unsigned.txt")),
-        "unsigned":    read_lines(find_file(base, "smb_unsigned.txt")),
-        "v1":          read_lines(find_file(base, "smb_v1.txt")),
-        "null_shares": read_lines(find_file(base, "smb_shares_null.txt")),
-        "read_shares": read_lines(find_file(base, "smb_shares_read.txt")),
-        "write_shares":read_lines(find_file(base, "smb_shares_write.txt")),
-        "sysvol":      read_lines(find_file(base, "sysvol_files.txt")),
-        "spider":      read_lines(find_file(base, "smb_spider.txt")),
+        "scanned": scanned("smb_hosts_info.txt", "smb_unsigned.txt"),
+        "unsigned":    read_all(base, "smb_unsigned.txt"),
+        "v1":          read_all(base, "smb_v1.txt"),
+        "null_shares": read_all(base, "smb_shares_null.txt"),
+        "read_shares": read_all(base, "smb_shares_read.txt"),
+        "write_shares":read_all(base, "smb_shares_write.txt"),
+        "sysvol":      read_all(base, "sysvol_files.txt"),
+        "spider":      read_all(base, "smb_spider.txt"),
     }
 
-    # LDAP
-    user_files = find_files(base, "ldap_users_*.txt")
-    grp_files  = find_files(base, "ldap_groups_*.txt")
-    cmp_files  = find_files(base, "ldap_computers_*.txt")
+    # LDAP (union dédupliquée des users/groups/computers sur tous les runs)
+    users     = read_all(base, "ldap_users_*.txt")
+    groups    = read_all(base, "ldap_groups_*.txt")
+    computers = read_all(base, "ldap_computers_*.txt")
     d["ldap"] = {
-        "scanned":         bool(find_file(base, "ldap_nullbind.txt") or find_file(base, "ldap_domain_info.txt")),
-        "nullbind":        read_lines(find_file(base, "ldap_nullbind.txt")),
-        "no_preauth":      read_lines(find_file(base, "ldap_no_preauth.txt")),
-        "delegation":      read_lines(find_file(base, "ldap_delegation.txt")),
-        "users_count":     sum(len(read_lines(f)) for f in user_files),
-        "groups_count":    sum(len(read_lines(f)) for f in grp_files),
-        "computers_count": sum(len(read_lines(f)) for f in cmp_files),
-        "users_sample":    read_lines(user_files[0])[:30] if user_files else [],
+        "scanned":         scanned("ldap_nullbind.txt", "ldap_domain_info.txt"),
+        "nullbind":        read_all(base, "ldap_nullbind.txt"),
+        "no_preauth":      read_all(base, "ldap_no_preauth.txt"),
+        "delegation":      read_all(base, "ldap_delegation.txt"),
+        "users_count":     len(users),
+        "groups_count":    len(groups),
+        "computers_count": len(computers),
+        "users_sample":    users[:30],
     }
 
     # RDP
     d["rdp"] = {
-        "scanned":       bool(find_file(base, "rdp_results.txt") or find_file(base, "rdp_no_nla.txt")),
-        "no_nla":        read_lines(find_file(base, "rdp_no_nla.txt")),
-        "login_success": read_lines(find_file(base, "rdp_login_success.txt")),
-        "results":       read_lines(find_file(base, "rdp_results.txt")),
+        "scanned":       scanned("rdp_results.txt", "rdp_no_nla.txt"),
+        "no_nla":        read_all(base, "rdp_no_nla.txt"),
+        "login_success": read_all(base, "rdp_login_success.txt"),
+        "results":       read_all(base, "rdp_results.txt"),
     }
 
     # SSH
     d["ssh"] = {
-        "scanned":       bool(find_file(base, "ssh_banners.txt")),
-        "banners":       read_lines(find_file(base, "ssh_banners.txt")),
-        "weak_algos":    read_lines(find_file(base, "ssh_weak_algos.txt")),
-        "password_auth": read_lines(find_file(base, "ssh_password_auth.txt")),
-        "login_success": read_lines(find_file(base, "ssh_login_success.txt")),
+        "scanned":       scanned("ssh_banners.txt"),
+        "banners":       read_all(base, "ssh_banners.txt"),
+        "weak_algos":    read_all(base, "ssh_weak_algos.txt"),
+        "password_auth": read_all(base, "ssh_password_auth.txt"),
+        "login_success": read_all(base, "ssh_login_success.txt"),
     }
 
     # HTTP
     d["http"] = {
-        "scanned": bool(find_file(base, "http_titles.txt")),
-        "titles":  read_lines(find_file(base, "http_titles.txt")),
-        "adcs":    read_lines(find_file(base, "http_adcs.txt")),
-        "webdav":  read_lines(find_file(base, "http_webdav.txt")),
-        "owa":     read_lines(find_file(base, "http_owa.txt")),
-        "rdweb":   read_lines(find_file(base, "http_rdweb.txt")),
-        "adfs":    read_lines(find_file(base, "http_adfs.txt")),
-        "wsus":    read_lines(find_file(base, "http_wsus.txt")),
+        "scanned": scanned("http_titles.txt"),
+        "titles":  read_all(base, "http_titles.txt"),
+        "adcs":    read_all(base, "http_adcs.txt"),
+        "webdav":  read_all(base, "http_webdav.txt"),
+        "owa":     read_all(base, "http_owa.txt"),
+        "rdweb":   read_all(base, "http_rdweb.txt"),
+        "adfs":    read_all(base, "http_adfs.txt"),
+        "wsus":    read_all(base, "http_wsus.txt"),
     }
 
     # MSSQL
     d["mssql"] = {
-        "scanned":       bool(find_file(base, "mssql_hosts_info.txt") or find_file(base, "mssql_accessible.txt")),
-        "accessible":    read_lines(find_file(base, "mssql_accessible.txt")),
-        "default_creds": read_lines(find_file(base, "mssql_default_creds.txt")),
-        "cmdexec":       read_lines(find_file(base, "mssql_cmdexec.txt")),
-        "linked":        read_lines(find_file(base, "mssql_linked_servers.txt")),
+        "scanned":       scanned("mssql_hosts_info.txt", "mssql_accessible.txt"),
+        "accessible":    read_all(base, "mssql_accessible.txt"),
+        "default_creds": read_all(base, "mssql_default_creds.txt"),
+        "cmdexec":       read_all(base, "mssql_cmdexec.txt"),
+        "linked":        read_all(base, "mssql_linked_servers.txt"),
     }
 
     # DNS
     d["dns"] = {
-        "scanned": bool(find_file(base, "dns_soa.txt")),
-        "axfr":    read_lines(find_file(base, "dns_axfr_success.txt")),
-        "hosts":   read_lines(find_file(base, "dns_hosts.txt")),
-        "soa":     read_lines(find_file(base, "dns_soa.txt")),
+        "scanned": scanned("dns_soa.txt"),
+        "axfr":    read_all(base, "dns_axfr_success.txt"),
+        "hosts":   read_all(base, "dns_hosts.txt"),
+        "soa":     read_all(base, "dns_soa.txt"),
     }
 
     # FTP
     d["ftp"] = {
-        "scanned":       bool(find_file(base, "ftp_banners.txt") or find_file(base, "ftp_anonymous.txt")),
-        "banners":       read_lines(find_file(base, "ftp_banners.txt")),
-        "anonymous":     read_lines(find_file(base, "ftp_anonymous.txt")),
-        "writable":      read_lines(find_file(base, "ftp_writable.txt")),
-        "login_success": read_lines(find_file(base, "ftp_login_success.txt")),
+        "scanned":       scanned("ftp_banners.txt", "ftp_anonymous.txt"),
+        "banners":       read_all(base, "ftp_banners.txt"),
+        "anonymous":     read_all(base, "ftp_anonymous.txt"),
+        "writable":      read_all(base, "ftp_writable.txt"),
+        "login_success": read_all(base, "ftp_login_success.txt"),
     }
 
     # SNMP
     d["snmp"] = {
-        "scanned":     bool(find_file(base, "snmp_accessible.txt")),
-        "accessible":  read_lines(find_file(base, "snmp_accessible.txt")),
+        "scanned":     scanned("snmp_accessible.txt"),
+        "accessible":  read_all(base, "snmp_accessible.txt"),
         "data_files":  find_files(base, "snmp_data_*.txt"),
     }
 
     # IPMI
     d["ipmi"] = {
-        "scanned":       bool(find_file(base, "ipmi_hosts_info.txt") or find_file(base, "ipmi_cipher0.txt")),
-        "cipher0":       read_lines(find_file(base, "ipmi_cipher0.txt")),
-        "anonymous":     read_lines(find_file(base, "ipmi_anonymous.txt")),
-        "hashes":        read_lines(find_file(base, "ipmi_hashes.txt")),
-        "default_creds": read_lines(find_file(base, "ipmi_default_creds.txt")),
+        "scanned":       scanned("ipmi_hosts_info.txt", "ipmi_cipher0.txt"),
+        "cipher0":       read_all(base, "ipmi_cipher0.txt"),
+        "anonymous":     read_all(base, "ipmi_anonymous.txt"),
+        "hashes":        read_all(base, "ipmi_hashes.txt"),
+        "default_creds": read_all(base, "ipmi_default_creds.txt"),
     }
 
     # WinRM
     d["winrm"] = {
-        "scanned":     bool(find_file(base, "winrm_hosts_info.txt")),
-        "hosts_info":  read_lines(find_file(base, "winrm_hosts_info.txt")),
-        "accessible":  read_lines(find_file(base, "winrm_accessible.txt")),
+        "scanned":     scanned("winrm_hosts_info.txt"),
+        "hosts_info":  read_all(base, "winrm_hosts_info.txt"),
+        "accessible":  read_all(base, "winrm_accessible.txt"),
     }
 
     # Kerberos
     d["kerberos"] = {
-        "scanned":     bool(find_file(base, "kerberos_valid_users.txt") or find_file(base, "kerberos_asrep_hashes.txt")),
-        "valid_users": read_lines(find_file(base, "kerberos_valid_users.txt")),
-        "asrep":       read_lines(find_file(base, "kerberos_asrep_hashes.txt")),
-        "spn":         read_lines(find_file(base, "kerberos_spn_hashes.txt")),
+        "scanned":     scanned("kerberos_valid_users.txt", "kerberos_asrep_hashes.txt"),
+        "valid_users": read_all(base, "kerberos_valid_users.txt"),
+        "asrep":       read_all(base, "kerberos_asrep_hashes.txt"),
+        "spn":         read_all(base, "kerberos_spn_hashes.txt"),
     }
 
     return d
@@ -969,6 +998,10 @@ Examples:
         raise SystemExit(1)
 
     print(f"[*] Scanning output files in: {base.resolve()}")
+    srcs = list(base.rglob("*.txt")) + list(base.rglob("*.json"))
+    dirs = sorted({str(p.parent.relative_to(base)) or "." for p in srcs})
+    print(f"[*] Found {len(srcs)} output file(s) in {len(dirs)} dir(s): "
+          + ", ".join(dirs[:25]) + (" ..." if len(dirs) > 25 else ""))
     d = collect(base)
 
     scanned = sum(1 for k in ["smb","ldap","rdp","ssh","http","mssql","dns",

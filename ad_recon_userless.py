@@ -354,7 +354,7 @@ def _nmap_sweep(tokens):
     if not tokens:
         return set()
     out, _, _ = run(
-        f"nmap -sn -PS{DISCOVERY_TCP_PORTS} -n --max-retries 1 --min-rate 500 "
+        f"nmap -sn -PS{DISCOVERY_TCP_PORTS} -n --max-retries 3 --min-rate 500 "
         f"{' '.join(tokens)} -oG - 2>/dev/null",
         timeout=1200,
     )
