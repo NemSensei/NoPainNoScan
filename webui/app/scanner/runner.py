@@ -203,6 +203,9 @@ async def spawn(cmd: list[str], cwd: Optional[Path] = None) -> asyncio.subproces
         stderr=asyncio.subprocess.STDOUT,
         cwd=str(cwd) if cwd is not None else None,
         env=env,
+        # Own process group so cancel can SIGTERM the whole tree
+        # (the scripts spawn nxc/masscan/nmap children).
+        start_new_session=True,
     )
 
 

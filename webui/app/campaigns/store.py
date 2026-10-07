@@ -193,6 +193,26 @@ def update_run_status(run_id: int, status: str,
         conn.close()
 
 
+def fail_stale_running_runs() -> int:
+    """Mark every run still 'running'/'queued' in the DB as failed.
+
+    Called at startup: jobs live in memory only, so after a server restart
+    those rows would stay 'running' forever (no live process is attached
+    anymore, and cancel_job() refuses unknown run_ids).
+    """
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            "UPDATE runs SET status = 'failed', finished_at = ? "
+            "WHERE status IN ('queued', 'running')",
+            (_now(),),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
 def get_run(run_id: int) -> Optional[dict[str, Any]]:
     """Return one run as dict, or None."""
     conn = get_conn()

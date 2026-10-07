@@ -16,11 +16,38 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .config import HOST, PORT, STATIC_DIR, TEMPLATES_DIR
-from .campaigns.store import init_db
+from .config import DB_PATH, HOST, PORT, STATIC_DIR, TEMPLATES_DIR
+from .campaigns.store import fail_stale_running_runs, init_db
 from .scanner.registry import list_checks
 
 app = FastAPI(title="NoPainNoScan Web UI", version="0.1.0")
+
+
+# --------------------------------------------------------------------------- #
+# Host allowlist (anti DNS-rebinding)
+# --------------------------------------------------------------------------- #
+# The UI is documented as local & unauthenticated. Browsing a malicious page
+# while the UI runs is enough for DNS rebinding to become same-origin: the
+# page could then launch scans (POST /api/runs) and read the findings.
+# Rejecting every Host other than the loopback endpoints breaks that vector.
+_ALLOWED_HOSTS = {
+    f"127.0.0.1:{PORT}",
+    f"localhost:{PORT}",
+    f"[::1]:{PORT}",
+    "127.0.0.1",   # Host header without port (HTTP/1.0 style requests)
+    "localhost",
+}
+
+
+@app.middleware("http")
+async def _host_allowlist(request: Request, call_next):
+    host = request.headers.get("host", "")
+    if host and host not in _ALLOWED_HOSTS:
+        return JSONResponse(
+            {"detail": f"Refused Host header '{host}' — this UI is local-only"},
+            status_code=403,
+        )
+    return await call_next(request)
 
 # >>> agent2 routes
 from .scanner.routes import router as scanner_router  # noqa: E402
@@ -46,6 +73,11 @@ app.include_router(reports_router)
 def _startup() -> None:
     """Ensure the database schema exists before serving requests."""
     init_db()
+    # Jobs live in memory only: after a restart, rows still marked
+    # queued/running have no live process behind them anymore.
+    stale = fail_stale_running_runs()
+    if stale:
+        print(f"[webui] marked {stale} interrupted run(s) as failed")
 
 
 @app.get("/", response_class=HTMLResponse)
