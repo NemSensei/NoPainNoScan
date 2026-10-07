@@ -61,43 +61,8 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-# Progress reporting for the web UI (no-op fallback when run standalone).
-try:
-    from _npns_progress import emit_progress
-except Exception:
-    def emit_progress(*a, **k): pass
-
-
-# =============================================================================
-# COULEURS
-# =============================================================================
-class C:
-    HEADER = '\033[95m'
-    CYAN   = '\033[96m'
-    GREEN  = '\033[92m'
-    WARN   = '\033[93m'
-    FAIL   = '\033[91m'
-    DIM    = '\033[2m'
-    ENDC   = '\033[0m'
-    BOLD   = '\033[1m'
-
-# Colors only on an interactive terminal; disabled when piped (web UI) or NO_COLOR.
-if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
-    for _k in list(vars(C)):
-        if _k.isupper():
-            setattr(C, _k, "")
-
-RULE = "-" * 60
-
-
-# =============================================================================
-# LOGGING
-# =============================================================================
-def log_info(msg): print(f"{C.CYAN}[INFO]{C.ENDC} {msg}")
-def log_ok(msg):   print(f"{C.GREEN}[ OK ]{C.ENDC} {msg}")
-def log_warn(msg): print(f"{C.WARN}[WARN]{C.ENDC} {msg}")
-def log_err(msg):  print(f"{C.FAIL}[FAIL]{C.ENDC} {msg}")
-def log_step(msg): print(f"\n{C.BOLD}==> {msg}{C.ENDC}\n{C.DIM}{RULE}{C.ENDC}")
+from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
+                         tool_exists, emit_progress)
 
 
 # =============================================================================
@@ -112,10 +77,6 @@ def run(cmd, timeout=600):
         return "", "TIMEOUT", -1
     except Exception as e:
         return "", str(e), -1
-
-
-def tool_exists(name):
-    return shutil.which(name) is not None
 
 
 def check_root():

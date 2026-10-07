@@ -6,33 +6,13 @@ from datetime import datetime
 from pathlib import Path
 import ipaddress
 
-# Progress reporting for the web UI (no-op fallback when run standalone).
-try:
-    from _npns_progress import emit_progress
-except Exception:
-    def emit_progress(*a, **k): pass
 
-TOTAL_STEPS = 4
-_STEP_SEEN = 0
+from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
+                         tool_exists, confirm_step, set_total_steps, enable_auto_accept,
+                         sub_progress)
 
-class C:
-    HEADER = '\033[95m'; CYAN = '\033[96m'
-    GREEN = '\033[92m'; WARN = '\033[93m'; FAIL = '\033[91m'
-    ENDC = '\033[0m'; BOLD = '\033[1m'; DIM = '\033[2m'
 
-# Colors only on an interactive terminal; disabled when piped (web UI) or NO_COLOR.
-if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
-    for _k in list(vars(C)):
-        if _k.isupper():
-            setattr(C, _k, "")
-
-RULE = "-" * 60
-
-def log_info(msg): print(f"{C.CYAN}[INFO]{C.ENDC} {msg}")
-def log_ok(msg):   print(f"{C.GREEN}[ OK ]{C.ENDC} {msg}")
-def log_warn(msg): print(f"{C.WARN}[WARN]{C.ENDC} {msg}")
-def log_err(msg):  print(f"{C.FAIL}[FAIL]{C.ENDC} {msg}")
-def log_step(msg): print(f"\n{C.BOLD}==> {msg}{C.ENDC}\n{C.DIM}{RULE}{C.ENDC}")
+set_total_steps(4)
 
 def run(cmd, timeout=60):
     try:
@@ -41,34 +21,9 @@ def run(cmd, timeout=60):
     except subprocess.TimeoutExpired:
         return "", "TIMEOUT", 1
 
-def tool_exists(name):
-    out, _, rc = run(f"which {name}")
-    return rc == 0
 
 # ─── User confirmation ────────────────────────────────────────────────────────
 
-AUTO_ACCEPT = False
-
-def confirm_step(step_name, detail=None):
-    """Ask the user to validate a step before launching its commands."""
-    global AUTO_ACCEPT, _STEP_SEEN
-    proceed = AUTO_ACCEPT
-    if not proceed:
-        print(f"\n{C.WARN}[?]{C.ENDC} {C.BOLD}{step_name}{C.ENDC} is about to run.")
-        if detail:
-            print(f"    {C.CYAN}{detail}{C.ENDC}")
-        resp = input("    Proceed? [y/N/a=accept all remaining] ").strip().lower()
-        if resp in ("a", "all"):
-            AUTO_ACCEPT = True
-            proceed = True
-        elif resp in ("y", "yes"):
-            proceed = True
-    if proceed:
-        _STEP_SEEN += 1
-        emit_progress(_STEP_SEEN, TOTAL_STEPS, label=step_name)
-        return True
-    log_warn(f"Skipped by user: {step_name}")
-    return False
 
 # ─── Target resolution ────────────────────────────────────────────────────────
 
@@ -116,7 +71,7 @@ def step_banner(hosts, port, out_dir):
     banners = {}
     _n = len(hosts)
     for _i, ip in enumerate(hosts, 1):
-        emit_progress(_STEP_SEEN, TOTAL_STEPS, label="STEP 1 — Banner grab", host=_i, hosts=_n)
+        sub_progress(_i, _n, label="STEP 1 — Banner grab")
         banner = grab_banner(ip, port)
         if banner:
             log_ok(f"{ip}:{port} → {banner}")
@@ -213,7 +168,7 @@ def step_auth_methods(hosts, port, out_dir):
 
     _n = len(hosts)
     for _i, ip in enumerate(hosts, 1):
-        emit_progress(_STEP_SEEN, TOTAL_STEPS, label="STEP 3 — Authentication methods", host=_i, hosts=_n)
+        sub_progress(_i, _n, label="STEP 3 — Authentication methods")
         cmd = (
             f"ssh -o BatchMode=yes -o ConnectTimeout=5 "
             f"-o PreferredAuthentications=none "
@@ -347,7 +302,7 @@ def main():
                         help="Non-interactive: accept all steps (for automation/UI)")
     args = parser.parse_args()
     if args.yes:
-        globals()["AUTO_ACCEPT"] = True
+        enable_auto_accept()
 
     # Banner
     print(f"\n{C.BOLD}SSH — Enumeration & Cipher Audit{C.ENDC}")
