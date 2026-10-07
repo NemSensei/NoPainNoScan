@@ -58,6 +58,7 @@ import shutil
 import subprocess
 import sys
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -325,73 +326,109 @@ PORT_LABELS.update({p: f"{n} (UDP)" for p, n in EXOTIC_UDP_PORTS.items()})
 # =============================================================================
 # ETAPE 1 — DECOUVERTE DES HOSTS
 # =============================================================================
+# Découverte parallélisée par chunks de cibles (exhaustif mais rapide sur gros
+# scope). Chaque chunk produit 2 tâches indépendantes (fping ICMP + nmap TCP-SYN)
+# soumises à un pool unique : peu de cibles -> 1 chunk -> fping ‖ nmap ; beaucoup
+# de cibles -> tout se parallélise jusqu'à DISCOVERY_MAX_WORKERS.
+DISCOVERY_MAX_WORKERS = 8
+DISCOVERY_CHUNK_SIZE = 8
+
+
+def _chunks(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+
+def _fping_sweep(tokens):
+    """ICMP sweep fping sur un chunk de cibles (IP/CIDR). Retourne les IP vivantes."""
+    if not tokens:
+        return set()
+    out, _, _ = run(f"fping -a -q {' '.join(tokens)} 2>/dev/null", timeout=600)
+    return {line.strip() for line in out.splitlines() if line.strip()}
+
+
+def _nmap_sweep(tokens):
+    """TCP SYN ping nmap sur un chunk de cibles. Retourne les IP répondantes."""
+    if not tokens:
+        return set()
+    out, _, _ = run(
+        f"nmap -sn -PS{DISCOVERY_TCP_PORTS} -n --max-retries 1 --min-rate 500 "
+        f"{' '.join(tokens)} -oG - 2>/dev/null",
+        timeout=1200,
+    )
+    hosts = set()
+    for line in out.splitlines():
+        if "Status: Up" in line:
+            m = re.match(r'^Host:\s+(\S+)', line)
+            if m:
+                hosts.add(m.group(1))
+    return hosts
+
+
 def discover_hosts(targets):
     """
-    Découverte via ICMP (fping) + TCP SYN ping (nmap) sur `targets`.
-    Fonction pure : ne lit/écrit aucun fichier, le merge et l'écriture de
-    hosts_alive.txt sont gérés par main() (pour l'accumulation incrémentale).
+    Découverte via ICMP (fping) + TCP SYN ping (nmap) sur `targets`, parallélisée
+    par chunks de cibles. Fonction pure : n'écrit aucun fichier (main() gère le
+    merge/écriture de hosts_alive.txt pour l'accumulation incrémentale).
 
-    Args:
-        targets: list[str] — CIDRs/IPs/plages à découvrir (les NOUVEAUX en mode incrémental)
+    fping ne comprend pas les plages a.b.c.d-e : seuls les tokens IP/CIDR lui sont
+    passés ; nmap reçoit toutes les cibles (il gère les plages).
+
     Returns:
         set[str]: IPs vivantes trouvées sur ce run
     """
     log_step("ETAPE 1 — Découverte des hôtes")
-    hosts = set()
-
     if not targets:
         log_info("Aucun nouveau subnet à découvrir — étape sautée")
-        return hosts
+        return set()
 
-    # --- fping: ICMP echo (une exécution par cible) ---
-    if tool_exists("fping"):
-        for target in targets:
-            log_info(f"fping ICMP sweep → {target}...")
-            out, _, _ = run(f"fping -a -g -q {target} 2>/dev/null", timeout=120)
-            icmp_hosts = {line.strip() for line in out.splitlines() if line.strip()}
-            if icmp_hosts:
-                log_ok(f"fping [{target}]: {len(icmp_hosts)} hosts ICMP alive")
-                hosts.update(icmp_hosts)
-            else:
-                log_warn(f"fping [{target}]: 0 host ICMP (ICMP filtré ou réseau vide)")
-    else:
+    have_fping = tool_exists("fping")
+    have_nmap = tool_exists("nmap")
+    if not have_fping:
         log_warn("fping non installé — skipping ICMP (apt install fping)")
-
-    # --- nmap: TCP SYN ping sur ports AD/internes courants ---
-    # Détecte les hosts qui bloquent ICMP (hôtes routés, VLANs distants,
-    # machines Windows avec pare-feu bloquant le ping).
-    if tool_exists("nmap"):
-        for target in targets:
-            log_info(f"nmap TCP SYN ping [{DISCOVERY_TCP_PORTS}] → {target}...")
-            out, _, _ = run(
-                f"nmap -sn -PS{DISCOVERY_TCP_PORTS} -n "
-                f"--max-retries 1 --min-rate 500 "
-                f"{target} -oG - 2>/dev/null",
-                timeout=300
-            )
-            tcp_hosts = set()
-            for line in out.splitlines():
-                if "Status: Up" in line:
-                    m = re.match(r'^Host:\s+(\S+)', line)
-                    if m:
-                        tcp_hosts.add(m.group(1))
-            new_hosts = tcp_hosts - hosts
-            if tcp_hosts:
-                log_ok(
-                    f"nmap TCP ping [{target}]: {len(tcp_hosts)} hosts répondent"
-                    + (f" ({len(new_hosts)} nouveaux vs ICMP)" if new_hosts else "")
-                )
-                hosts.update(tcp_hosts)
-            else:
-                log_warn(f"nmap TCP ping [{target}]: 0 host détecté via ports TCP")
-    else:
+    if not have_nmap:
         log_warn("nmap non installé — TCP port ping désactivé (apt install nmap)")
+    if not (have_fping or have_nmap):
+        return set()
 
+    fping_tokens = [t for t in targets if not _RANGE_RE.match(t)]  # fping: pas de plages
+    nmap_tokens = list(targets)
+
+    tasks = []  # (méthode, callable, chunk)
+    if have_fping:
+        tasks += [("fping", _fping_sweep, ch) for ch in _chunks(fping_tokens, DISCOVERY_CHUNK_SIZE)]
+    if have_nmap:
+        tasks += [("nmap", _nmap_sweep, ch) for ch in _chunks(nmap_tokens, DISCOVERY_CHUNK_SIZE)]
+
+    n_chunks = max(1, (len(targets) + DISCOVERY_CHUNK_SIZE - 1) // DISCOVERY_CHUNK_SIZE)
+    log_info(f"Découverte parallèle : {len(targets)} cible(s), {n_chunks} chunk(s), "
+             f"{len(tasks)} tâche(s), {DISCOVERY_MAX_WORKERS} workers max...")
+
+    icmp_hosts, tcp_hosts = set(), set()
+    with ThreadPoolExecutor(max_workers=DISCOVERY_MAX_WORKERS) as ex:
+        futs = {ex.submit(fn, ch): method for method, fn, ch in tasks}
+        for fut in as_completed(futs):
+            method = futs[fut]
+            try:
+                res = fut.result()
+            except Exception as e:  # noqa: BLE001
+                log_warn(f"découverte {method}: tâche échouée ({e})")
+                continue
+            if method == "fping":
+                icmp_hosts |= res
+            else:
+                tcp_hosts |= res
+
+    hosts = icmp_hosts | tcp_hosts
+    if have_fping:
+        log_ok(f"fping (ICMP)   : {len(icmp_hosts)} hôte(s)")
+    if have_nmap:
+        log_ok(f"nmap (TCP-SYN) : {len(tcp_hosts)} hôte(s) (+{len(tcp_hosts - icmp_hosts)} hors ICMP)")
     if not hosts:
         log_warn("Aucun host découvert sur les cibles de ce run")
     else:
         log_ok(f"{len(hosts)} hôte(s) vivant(s) découvert(s) sur ce run")
-    return set(hosts)
+    return hosts
 
 
 # =============================================================================
@@ -578,7 +615,7 @@ def masscan_scan(base_path, hosts_to_scan, tcp_ports, udp_ports, rate=5000,
     log_info(f"masscan {label}: {len(hosts_to_scan)} hosts × {len(tcp_ports)} TCP + "
              f"{len(udp_ports)} UDP @ {rate} pps (retries=2)...")
     _, err, code = run(
-        f"masscan -iL {scan_list} -p{ports_arg} --rate={rate} --retries=2 -oJ {output_file}",
+        f"masscan -iL {scan_list} -p{ports_arg} --rate={rate} --retries=2 --wait=3 -oJ {output_file}",
         timeout=900
     )
 
