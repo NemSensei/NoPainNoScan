@@ -272,81 +272,130 @@ def step3_auth_shares(hosts_file, out_dir, creds_args):
 # =============================================================================
 # STEP 4 — SYSVOL / NETLOGON
 # =============================================================================
+# Patterns passés à `--pattern` (nxc attend des motifs SÉPARÉS PAR ESPACES, pas une
+# liste à virgules). Ciblent scripts/GPP/logon susceptibles de fuiter des secrets.
+SYSVOL_PATTERNS = [".ps1", ".vbs", ".bat", ".cmd", ".xml", ".txt", ".ini", ".inf", ".config"]
+
+# Les lignes de hit `--spider` ressemblent à :
+#   SMB  10.0.0.1  445  DC01  //10.0.0.1/SYSVOL/corp.local/.../Groups.xml [lastm:'...' size:1234]
+# On récupère le chemin UNC (//host/share/...) jusqu'au marqueur [lastm/size].
+_SPIDER_PATH_RE = re.compile(r"(//.+?)\s*\[(?:lastm|size)", re.IGNORECASE)
+
+
+def _parse_spider_hits(output):
+    """Extrait les chemins de fichiers des lignes de sortie `--spider`."""
+    hits = []
+    for line in output.splitlines():
+        m = _SPIDER_PATH_RE.search(line)
+        if m:
+            hits.append(m.group(1).strip())
+            continue
+        # Fallback : toute ligne contenant un chemin UNC, hors ligne racine `//.../.`
+        idx = line.find("//")
+        if idx != -1:
+            frag = line[idx:].strip()
+            if frag and not frag.rstrip().endswith("/."):
+                hits.append(frag)
+    return hits
+
+
 def step4_sysvol(hosts_file, out_dir, creds_args):
-    """Browse SYSVOL and look for interesting scripts."""
+    """Spider SYSVOL and NETLOGON for interesting scripts/configs (built-in --spider)."""
     log_step("STEP 4 — SYSVOL/NETLOGON Browsing")
 
     sysvol_files = []
+    pattern_arg = " ".join(SYSVOL_PATTERNS)
 
-    if not confirm_step("STEP 4 — SYSVOL/NETLOGON Browsing", f"nxc smb '{hosts_file}' {creds_args} -M spider_plus  +  --spider SYSVOL --pattern '.ps1,.vbs,.bat,.xml,.txt'"):
+    detail = (f"nxc smb '{hosts_file}' {creds_args} --spider SYSVOL|NETLOGON "
+              f"--pattern {pattern_arg}")
+    if not confirm_step("STEP 4 — SYSVOL/NETLOGON Browsing", detail):
         write_file(out_dir / "sysvol_files.txt", [])
         return sysvol_files
 
-    # Run spider_plus module on all hosts
-    log_info("Running spider_plus module ...")
-    out, err, rc = run(
-        f"nxc smb '{hosts_file}' {creds_args} -M spider_plus",
-        timeout=600
-    )
+    for share in ("SYSVOL", "NETLOGON"):
+        log_info(f"Spidering {share} for scripts/configs ...")
+        out, err, rc = run(
+            f"nxc smb '{hosts_file}' {creds_args} --spider {share} "
+            f"--pattern {pattern_arg} --depth 15",
+            timeout=600,
+        )
+        sysvol_files.extend(_parse_spider_hits(out))
 
-    # Collect lines mentioning SYSVOL or NETLOGON files
-    for line in out.splitlines():
-        if re.search(r'(SYSVOL|NETLOGON)', line, re.IGNORECASE):
-            sysvol_files.append(line.strip())
-
-    # Spider SYSVOL specifically for interesting extensions on all hosts
-    log_info("Spidering SYSVOL for scripts/configs ...")
-    out2, err2, rc2 = run(
-        f"nxc smb '{hosts_file}' {creds_args} --spider SYSVOL "
-        f"--pattern '.ps1,.vbs,.bat,.xml,.txt'",
-        timeout=600
-    )
-
-    interesting_exts = re.compile(r'\.(ps1|vbs|bat|xml|txt)$', re.IGNORECASE)
-    for line in out2.splitlines():
-        if interesting_exts.search(line):
-            sysvol_files.append(line.strip())
-
-    # Dedup
     sysvol_files = list(dict.fromkeys(sysvol_files))
-    write_file(out_dir / "sysvol_files.txt", sysvol_files, sort=False, label="SYSVOL files")
+    write_file(out_dir / "sysvol_files.txt", sysvol_files, sort=False,
+               label="SYSVOL/NETLOGON files")
 
     return sysvol_files
 
 
 # =============================================================================
-# STEP 5 — SPIDER PLUS SUMMARY
+# STEP 5 — SPIDER PLUS (tous les partages lisibles)
 # =============================================================================
-def step5_spider_summary(out_dir):
-    """Parse spider_plus JSON output for interesting files."""
-    log_step("STEP 5 — Spider Plus Summary")
+# Emplacements où d'anciennes versions de nxc écrivent le JSON spider_plus, en
+# secours si `-o OUTPUT_FOLDER=` n'est pas honoré par la version installée.
+# Défaut nxc : NXC_PATH/nxc_spider_plus (NXC_PATH = ~/.nxc). Les autres couvrent
+# d'anciennes dispositions /tmp.
+_LEGACY_SPIDER_DIRS = [
+    Path.home() / ".nxc" / "nxc_spider_plus",
+    Path("/tmp/nxc_hosted/nxc_spider_plus"),
+    Path("/tmp/nxc_spider_plus"),
+]
+
+
+def step5_spider_summary(hosts_file, out_dir, creds_args):
+    """Run spider_plus on all readable shares and parse its per-host JSON.
+
+    spider_plus écrit un JSON par hôte (`<ip>.json`) dont les clés de 1er niveau
+    sont les PARTAGES, chaque partage mappant chemin -> métadonnées. On force
+    OUTPUT_FOLDER pour connaître l'emplacement au lieu de le deviner.
+    """
+    log_step("STEP 5 — Spider Plus (all readable shares)")
 
     interesting = []
+    json_dir = out_dir / "spider_plus_json"
 
-    # nxc spider_plus writes JSON to /tmp/nxc_spider_plus or ~/.nxc/logs
-    spider_dirs = [
-        Path("/tmp/nxc_spider_plus"),
-        Path.home() / ".nxc" / "logs",
-        Path.home() / ".nxc" / "modules",
-    ]
+    detail = (f"nxc smb '{hosts_file}' {creds_args} -M spider_plus "
+              f"-o OUTPUT_FOLDER={json_dir}")
+    if not confirm_step("STEP 5 — Spider Plus (all readable shares)", detail):
+        write_file(out_dir / "smb_spider.txt", [])
+        return interesting
 
-    json_files = []
-    for d in spider_dirs:
-        if d.exists():
-            json_files += list(d.glob("*spider_plus*"))
-            json_files += list(d.glob("*SPIDER*"))
+    json_dir.mkdir(parents=True, exist_ok=True)
+    log_info("Running spider_plus module (crawls all readable shares) ...")
+    run(
+        f"nxc smb '{hosts_file}' {creds_args} -M spider_plus "
+        f"-o OUTPUT_FOLDER={shlex.quote(str(json_dir))}",
+        timeout=900,
+    )
+
+    # JSON de notre dossier contrôlé d'abord ; sinon secours sur les emplacements legacy.
+    json_files = list(json_dir.rglob("*.json"))
+    if not json_files:
+        for d in _LEGACY_SPIDER_DIRS:
+            if d.exists():
+                json_files += list(d.rglob("*.json"))
 
     for jf in json_files:
         try:
             data = json.loads(jf.read_text())
-            for host, shares in data.items():
-                for share, files in shares.items():
-                    for fname, meta in (files.items() if isinstance(files, dict) else []):
-                        size = meta.get("size", 0) if isinstance(meta, dict) else 0
-                        interesting.append(f"{host}  \\\\{share}\\{fname}  ({size} bytes)")
-        except Exception:
+        except (json.JSONDecodeError, OSError):
             continue
+        if not isinstance(data, dict):
+            continue
+        host = jf.stem  # spider_plus nomme chaque fichier <ip>.json
+        for share, files in data.items():
+            if not isinstance(files, dict):
+                continue
+            for path, meta in files.items():
+                size = ""
+                if isinstance(meta, dict):
+                    size = meta.get("size", meta.get("filesize", ""))
+                entry = f"{host}  \\\\{share}\\{path}"
+                if size != "":
+                    entry += f"  ({size})"
+                interesting.append(entry)
 
+    interesting = list(dict.fromkeys(interesting))
     write_file(out_dir / "smb_spider.txt", interesting, sort=False, label="Spider plus files")
     return interesting
 
@@ -483,7 +532,7 @@ def main():
     if has_creds:
         read_shares, write_shares = step3_auth_shares(hosts_tmp, out_dir, creds_args)
         sysvol_files = step4_sysvol(hosts_tmp, out_dir, creds_args)
-        spider_files = step5_spider_summary(out_dir)
+        spider_files = step5_spider_summary(hosts_tmp, out_dir, creds_args)
     else:
         log_info("No credentials provided — skipping authenticated checks (steps 3-5)")
         for fname in ["smb_shares_read.txt", "smb_shares_write.txt",
