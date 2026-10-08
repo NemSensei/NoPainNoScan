@@ -386,16 +386,19 @@ def step3_auth_shares(hosts_file, out_dir, creds_args, n_hosts):
 # NB : le spidering SYSVOL/NETLOGON (--spider) et spider_plus (inventaire de tous les
 # shares) ont été RETIRÉS volontairement — trop de bruit. GPP ci-dessous extrait les
 # secrets à forte valeur de SYSVOL ; le reste de l'exploration se fait à la main.
-# Lignes à retenir dans la sortie des modules GPP : uniquement les marqueurs
-# forts d'un vrai secret (cpassword déchiffré, autologon). Les mots génériques
-# ("password", "username", "credential") ont été retirés : avec des creds
-# fournies, la sortie contient aussi les lignes d'auth nxc
-# (ex. "[+] CORP\svc:xxx STATUS_PASSWORD_MUST_CHANGE") qui déclenchaient un
-# faux CRITICAL « GPP credentials » sans aucun GPP réel.
-_GPP_FINDING_RE = re.compile(r"(?i)(cpassword|\bGPP\b|autologin)")
-# …sauf les lignes négatives ("No autologin found", "No GPP files found", etc.)
-# et les lignes de statut d'authentification nxc (STATUS_*).
-# Phrases explicites (pas de mots isolés : un '0' d'octet d'IP matcherait sinon).
+# Lignes à retenir dans la sortie des modules GPP : les marqueurs de PAYOFF d'un
+# vrai secret — cpassword déchiffré, autologon, "Found credentials in …", et les
+# lignes de résultat "Usernames:" / "Passwords:". On cible ces motifs précis (avec
+# ':' ou "in ") plutôt que les mots génériques "password/username/credential" seuls :
+#   • la version précédente trop large comptait les lignes d'auth nxc
+#     (ex. "[+] CORP\svc:xxx STATUS_PASSWORD_MUST_CHANGE") comme un faux GPP ;
+#   • la version trop étroite (cpassword|GPP|autologin) jetait au contraire les
+#     vraies lignes "Found credentials…/Usernames:/Passwords:" → faux négatif.
+# Ce motif précis ne matche jamais un "user:pass" d'auth, et garde tous les payoffs.
+_GPP_FINDING_RE = re.compile(
+    r"(?i)(cpassword|autologin|credentials?\s+in\b|usernames?\s*:|passwords?\s*:)"
+)
+# Ceinture-bretelles : on exclut quand même les lignes négatives et de statut nxc.
 _GPP_NEGATIVE_RE = re.compile(
     r"(?i)(no (gpp|autologin|credential|password|result|xml|file)"
     r"|not found|nothing found|could ?n'?t|could not|failed to"
