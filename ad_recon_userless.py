@@ -89,14 +89,34 @@ def check_root():
 _RANGE_RE = re.compile(r'^(\d{1,3}\.){3}\d{1,3}-\d{1,3}(\.\d{1,3}){0,3}$')
 
 
-def is_valid_target(token):
-    """True si token est une IP, un CIDR, ou une plage nmap/masscan (a.b.c.d-e[.f.g.h])."""
+def normalize_target(token):
+    """Normalise une cible valide, ou retourne None si invalide.
+
+    - IPv4 seule / CIDR → normalisés via ip_network (gère la notation
+      netmask "10.0.0.0/255.255.255.0" que fping ne comprend pas).
+    - IPv6 → rejetée : fping ne le supporte pas et masscan non plus ;
+      nmap exigerait -6 (une cible v6 dans un chunk fait échouer le nmap
+      ENTIERS du chunk — 0 hôte pour les 8 cibles, silencieusement).
+    - Plage a.b.c.d-e[.f[.g[.h]]] → validée octet par octet (une plage
+      "10.0.0.300-400" fait échouer le parsing nmap de tout le chunk).
+    """
+    token = token.strip()
+    if _RANGE_RE.match(token):
+        octets = [int(x) for x in token.replace("-", ".").split(".")]
+        if any(o > 255 for o in octets):
+            return None
+        # borne de fin >= borne de début (dernier octet de la borne basse
+        # vs premier octet libre de la borne haute : 10.0.0.1-50 → 50 >= 1)
+        if octets[4] < octets[3]:
+            return None
+        return token
     try:
-        ipaddress.ip_network(token, strict=False)  # couvre IP seule et CIDR
-        return True
+        net = ipaddress.ip_network(token, strict=False)
     except ValueError:
-        pass
-    return bool(_RANGE_RE.match(token))
+        return None
+    if net.version == 6:
+        return None
+    return net.with_prefixlen
 
 
 def parse_targets(target_arg):
@@ -112,12 +132,13 @@ def parse_targets(target_arg):
             tok = line.split("#")[0].strip()
             if not tok:
                 continue
-            if not is_valid_target(tok):
+            normalized = normalize_target(tok)
+            if normalized is None:
                 invalid.append(tok)
                 continue
             if tok not in seen:
                 seen.add(tok)
-                targets.append(tok)
+                targets.append(normalized)
         for tok in invalid:
             log_warn(f"Ligne invalide ignorée dans {target_arg}: {tok!r}")
         if not targets:
@@ -127,10 +148,11 @@ def parse_targets(target_arg):
                + (f" ({len(invalid)} ignorée(s))" if invalid else ""))
         return targets
     # Argument direct (IP / CIDR / plage)
-    if not is_valid_target(target_arg):
-        log_err(f"Cible invalide: {target_arg!r} (attendu IP, CIDR ou plage a.b.c.d-e)")
+    normalized = normalize_target(target_arg)
+    if normalized is None:
+        log_err(f"Cible invalide: {target_arg!r} (attendu IP/CIDR IPv4, ou plage a.b.c.d-e)")
         sys.exit(1)
-    return [target_arg]
+    return [normalized]
 
 
 def setup_output_multi(base_dir, target_arg, targets):

@@ -39,17 +39,23 @@ def parse_targets(target_arg):
             if ip_part:
                 hosts.append(ip_part)
     else:
+        # "ip:port" donné directement : garder l'IP (les ports viennent de
+        # --ports, comme pour les lignes de fichier — sinon les URLs seraient
+        # construites "host:port:port" et tout échouerait silencieusement).
+        ip_part = target_arg
+        if ip_part.count(':') == 1:
+            ip_part = ip_part.split(':')[0]
         try:
-            network = ipaddress.ip_network(target_arg, strict=False)
+            network = ipaddress.ip_network(ip_part, strict=False)
             hosts = [str(ip) for ip in network.hosts()] if network.num_addresses > 1 else [str(network.network_address)]
         except ValueError:
-            hosts = [target_arg]
+            hosts = [ip_part]
     return list(dict.fromkeys(hosts))  # deduplicate, preserve order
 
 
 def curl_fetch(url, timeout):
     """Single curl call: return (status_code, headers_dict, body)."""
-    cmd = f"curl -sk -m {timeout} --max-redirs 3 -D - {url}"
+    cmd = f"curl -skL -m {timeout} --max-redirs 3 -D - {shlex.quote(url)}"
     out, _, _ = run(cmd, timeout=timeout + 5)
     status = ""
     headers = {}

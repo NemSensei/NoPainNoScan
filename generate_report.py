@@ -89,9 +89,15 @@ def merge_ports_summary(base: Path) -> dict:
     """Fusionne tous les ports_summary.json trouvés → {ip: set(ports)}."""
     merged: dict = {}
     for p in sorted(base.rglob("ports_summary.json")):
-        data = jload(p) or {}
+        data = jload(p)
+        if not isinstance(data, dict):
+            continue
         for ip, ports in data.items():
-            merged.setdefault(ip, set()).update(ports)
+            if not isinstance(ports, (list, set)):
+                continue  # un JSON valide mais pas {ip: [ports]} ne doit pas
+                          # injecter de pseudo-ports (caractères d'une string, ...)
+            merged.setdefault(ip, set()).update(
+                int(x) for x in ports if isinstance(x, int))
     return merged
 
 
