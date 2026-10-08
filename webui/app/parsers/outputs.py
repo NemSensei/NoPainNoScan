@@ -145,10 +145,26 @@ _FINDING_SPECS: dict[str, list[tuple[str, str, str, str]]] = {
     "ldap": [
         ("ldap_nullbind.txt",    "Anonymous LDAP bind",         "high",
          "Directory readable without credentials (null bind)"),
-        ("ldap_no_preauth.txt",  "AS-REP roastable account",    "high",
-         "Kerberos pre-auth disabled - offline crackable (hashcat -m 18200)"),
+        ("ldap_signing.txt",     "LDAP signing/CB not enforced", "high",
+         "LDAP signing/channel binding not enforced - NTLM relay to LDAP (RBCD / ADCS ESC8)"),
         ("ldap_delegation.txt",  "Unconstrained delegation",    "critical",
          "Delegation abuse can lead to domain compromise"),
+        ("ldap_laps.txt",        "LAPS password readable",      "critical",
+         "Local admin password readable via LAPS by this account"),
+        ("ldap_gmsa.txt",        "gMSA secret readable",        "critical",
+         "gMSA managed password/NT hash readable by this account"),
+        ("ldap_asrep_hashes.txt","AS-REP roastable hash",       "high",
+         "AS-REP hash captured - offline crackable (hashcat -m 18200)"),
+        ("ldap_kerberoast_hashes.txt", "Kerberoastable hash",   "high",
+         "TGS-REP/SPN hash captured - offline crackable (hashcat -m 13100)"),
+        # ldap_no_preauth.txt = PASSWD_NOTREQD (password optional), NOT Kerberos
+        # pre-auth disabled (that is AS-REP roasting, above / check_kerberos).
+        ("ldap_no_preauth.txt",  "PASSWD_NOTREQD account",      "medium",
+         "Password optional on account - empty-password / spray candidate"),
+        ("ldap_descriptions.txt","User description to review",  "medium",
+         "User description field - often contains cleartext passwords"),
+        ("ldap_adcs.txt",        "AD CS present",               "medium",
+         "AD CS enumerated via LDAP - check templates with Certipy (ESC1-ESC8)"),
     ],
     "rdp": [
         ("rdp_login_success.txt","Successful RDP login",        "critical",
@@ -303,8 +319,12 @@ def _service_inventory(base: Path, check_id: str) -> dict[str, Any]:
         }
 
     elif check_id == "ldap":
-        users = sum(len(_read_lines(f)) for f in _find_files(base, "ldap_users*.txt"))
-        groups = sum(len(_read_lines(f)) for f in _find_files(base, "ldap_groups*.txt"))
+        # Exclure les dumps bruts `*.raw.txt` (sortie nxc/ldapsearch non parsée) :
+        # ils matchent le glob mais regonfleraient le compteur.
+        users = sum(len(_read_lines(f)) for f in _find_files(base, "ldap_users*.txt")
+                    if not f.name.endswith(".raw.txt"))
+        groups = sum(len(_read_lines(f)) for f in _find_files(base, "ldap_groups*.txt")
+                     if not f.name.endswith(".raw.txt"))
         inv = {"users_count": users, "groups_count": groups}
 
     elif check_id == "ssh":

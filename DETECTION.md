@@ -88,8 +88,31 @@ ne ciblent que les hôtes où l'auth réussit (reco step 1) → bien plus rapide
 
 > Pas de faux positif admin (ne s'appuie pas sur `(Pwn3d!)` pour les shares). STEP 1-4 nettoient l'ANSI (`strip_ansi`) avant parsing et **excluent les partages `$`** des fichiers shares. Robustesse gros scope : `run_nxc()` redirige vers fichier, **tue le groupe de processus sur timeout et conserve la sortie partielle** (fini le « plus rien ne remonte »), timeouts scalés sur le nb d'hôtes, `--threads` transmis (défaut 100). **Spidering retiré volontairement** (`--spider` SYSVOL/NETLOGON + `-M spider_plus`) — trop bruyant ; GPP couvre les secrets SYSVOL, le reste se fait à la main. **⚠ Reste** : regex null-session fixée (plus de mauvais classement `READ,WRITE`).
 
-### LDAP, Kerberos, SSH, DNS, SNMP, FTP
-Détection inchangée sur cette passe (**en attente** selon ta consigne), sauf le bug SSH ci-dessous. Points connus à fiabiliser : Kerberos (suffixe realm qui casse la userlist AS-REP + clock-skew), LDAP (`rc==0` log succès sur bind échoué ; `--password-not-required` mal étiqueté « no_preauth »), SNMP (version de brute non réutilisée → énum vide), DNS (crash IPv6 `cidr_from_ip`), FTP (listing non borné / filtre trop large).
+### LDAP — [`check_ldap.py`](check_ldap.py)
+Flux : **1. rootDSE** (identifie les vrais DC) → **2. signing/channel binding** → **3. null bind + dump anonyme** → **4. énum authentifiée (nxc)** → **5. BloodHound**. Les étapes 4-5 ciblent les **DC** (hôtes répondant au rootDSE, repli sur toutes les cibles), pas tout le scope.
+
+| Finding | Critère | Fichier | Crit. |
+|---|---|---|---|
+| Null/anonymous bind | ldapsearch `-D '' -w ''` renvoie des `dn:` | `ldap_nullbind.txt` | 🔴 |
+| Signing/channel binding non imposé | `-M ldap-checker` → ligne « signing not enforced/required » ou « channel binding … never/not/disabled » | `ldap_signing.txt` (brut: `ldap_signing_raw.txt`) | 🔴 |
+| Délégation non contrainte | `--trusted-for-delegation` → comptes | `ldap_delegation.txt` | 🔴 |
+| LAPS lisible | `--laps` → ligne de données | `ldap_laps.txt` | 🔴 |
+| gMSA lisible | `--gmsa` → ligne de données | `ldap_gmsa.txt` | 🔴 |
+| AS-REP roastable | `--asreproast <file>` écrit ≥1 hash | `ldap_asrep_hashes.txt` | 🔴 (m18200) |
+| Kerberoastable | `--kerberoasting <file>` écrit ≥1 hash | `ldap_kerberoast_hashes.txt` | 🔴 (m13100) |
+| PASSWD_NOTREQD | `--password-not-required` → comptes | `ldap_no_preauth.txt` | ⚠️ |
+| Descriptions utilisateurs | `-M get-desc-users` → lignes (creds en clair fréquents) | `ldap_descriptions.txt` | ⚠️ |
+| ADCS | `-M adcs` → CA/templates (→ Certipy) | `ldap_adcs.txt` | ⚠️ |
+| adminCount=1 | `--admin-count` → comptes | `ldap_admin_count.txt` | ℹ️ |
+| MachineAccountQuota | `-M maq` | `ldap_maq.txt` | ℹ️ |
+| Password policy | `--pass-pol` | `ldap_pass_policy.txt` | ℹ️ |
+| Users / Groups / Computers | `--users`/`--groups` (+ dump anonyme) | `ldap_users*.txt`, `ldap_groups*.txt`, `ldap_computers_*.txt` | ℹ️ |
+
+> **Corrigé (faux positifs)** : la sortie nxc n'est plus écrite BRUTE dans les fichiers lus par le rapport. Avant, chaque ligne bannière `[*]`, auth `[+] dom\user:pass` et en-tête `-Username-` était comptée → `delegation`/`no_preauth` remontaient en finding **à chaque run** même à 0 compte réel, et `users_count` était gonflé (idem le dump null-bind brut `dn:/sAMAccountName:`). On parse désormais en **une entité par ligne** (`nxc_data_lines`), on détecte l'échec d'auth (plus de « succès » sur `rc==0` d'un bind raté : on exige un `[+]`), et les bruts sont gardés en `*.raw.txt` / `*_raw.txt` (hors glob du rapport). `--password-not-required` reste nommé `ldap_no_preauth.txt` pour compat rapport mais est bien étiqueté **PASSWD_NOTREQD** (≠ sans préauth Kerberos — ça c'est l'AS-REP roast).
+> **Opérationnel** : `run_nxc` tue le groupe de processus sur timeout et conserve la sortie partielle ; `strip_ansi` avant parsing ; `--threads` ; secrets **redacted** dans les logs/UI (`-p '***'`). Roasting AS-REP/Kerberoast présent **aussi** dans [`check_kerberos.py`](check_kerberos.py) (overlap voulu : check_ldap autonome).
+
+### Kerberos, SSH, DNS, SNMP, FTP
+Détection inchangée sur cette passe (**en attente** selon ta consigne), sauf le bug SSH ci-dessous. Points connus à fiabiliser : Kerberos (suffixe realm qui casse la userlist AS-REP + clock-skew), SNMP (version de brute non réutilisée → énum vide), DNS (crash IPv6 `cidr_from_ip`), FTP (listing non borné / filtre trop large).
 
 ---
 

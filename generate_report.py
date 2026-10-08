@@ -143,10 +143,21 @@ def collect(base: Path) -> dict:
     computers = read_any(base, "ldap_computers_*.txt", "ldap_computers.txt")
     d["ldap"] = {
         "scanned":         scanned("ldap_nullbind.txt", "ldap_domain_info.txt",
-                                   "ldap_summary.txt", "ldap_users_*.txt"),
+                                   "ldap_summary.txt", "ldap_users_*.txt",
+                                   "ldap_signing.txt"),
         "nullbind":        read_all(base, "ldap_nullbind.txt"),
+        "signing":         read_all(base, "ldap_signing.txt"),
         "no_preauth":      read_all(base, "ldap_no_preauth.txt"),
         "delegation":      read_all(base, "ldap_delegation.txt"),
+        "admin_count":     read_all(base, "ldap_admin_count.txt"),
+        "descriptions":    read_all(base, "ldap_descriptions.txt"),
+        "laps":            read_all(base, "ldap_laps.txt"),
+        "gmsa":            read_all(base, "ldap_gmsa.txt"),
+        "adcs":            read_all(base, "ldap_adcs.txt"),
+        "pass_pol":        read_all(base, "ldap_pass_policy.txt"),
+        "maq":             read_all(base, "ldap_maq.txt"),
+        "asrep":           read_all(base, "ldap_asrep_hashes.txt"),
+        "kerberoast":      read_all(base, "ldap_kerberoast_hashes.txt"),
         "users_count":     len(users),
         "groups_count":    len(groups),
         "computers_count": len(computers),
@@ -255,10 +266,18 @@ def get_criticals(d: dict) -> list[tuple[str, str, str]]:
 
     ldap = d["ldap"]
     if ldap["nullbind"]:   c.append(("LDAP",     f"{len(ldap['nullbind'])} hosts allow anonymous LDAP bind", "critical"))
+    # signing/channel binding non imposé = relais NTLM vers LDAP (RBCD, ADCS ESC8).
+    if ldap["signing"]:    c.append(("LDAP",     f"{len(ldap['signing'])} DC(s) with LDAP signing/channel binding not enforced (NTLM relay → RBCD/ESC8)", "critical"))
+    if ldap["delegation"]: c.append(("LDAP",     f"{len(ldap['delegation'])} accounts with unconstrained delegation", "critical"))
+    if ldap["laps"]:       c.append(("LDAP",     f"{len(ldap['laps'])} LAPS password(s) readable by this account", "critical"))
+    if ldap["gmsa"]:       c.append(("LDAP",     f"{len(ldap['gmsa'])} gMSA secret(s) readable by this account", "critical"))
+    if ldap["asrep"]:      c.append(("LDAP",     f"{len(ldap['asrep'])} AS-REP roastable account(s) (hashcat -m 18200)", "critical"))
+    if ldap["kerberoast"]: c.append(("LDAP",     f"{len(ldap['kerberoast'])} Kerberoastable account(s) (hashcat -m 13100)", "critical"))
     # ldap_no_preauth.txt = comptes PASSWD_NOTREQD (mot de passe facultatif),
     # PAS des comptes sans préauth Kerberos (ceux-là viennent de check_kerberos).
     if ldap["no_preauth"]: c.append(("LDAP",     f"{len(ldap['no_preauth'])} accounts with PASSWD_NOTREQD (password optional — empty-password candidates)", "warning"))
-    if ldap["delegation"]: c.append(("LDAP",     f"{len(ldap['delegation'])} accounts with unconstrained delegation", "critical"))
+    if ldap["descriptions"]: c.append(("LDAP",   f"{len(ldap['descriptions'])} user description(s) to review (often contain cleartext passwords)", "warning"))
+    if ldap["adcs"]:       c.append(("LDAP",     f"{len(ldap['adcs'])} ADCS entry(ies) found (enumerate templates with Certipy)", "warning"))
 
     rdp = d["rdp"]
     if rdp["no_nla"]:         c.append(("RDP",   f"{len(rdp['no_nla'])} hosts without NLA", "warning"))
@@ -481,7 +500,8 @@ def build_ldap(d: dict) -> str:
     parts = []
 
     nb_lvl  = "critical" if s["nullbind"]   else "ok"
-    pra_lvl = "critical" if s["no_preauth"] else "ok"
+    sig_lvl = "critical" if s["signing"]    else "ok"
+    pra_lvl = "warning"  if s["no_preauth"] else "ok"
     del_lvl = "critical" if s["delegation"] else "ok"
 
     # Stats
@@ -497,15 +517,49 @@ def build_ldap(d: dict) -> str:
                         else '<p class="empty">No anonymous bind allowed.</p>',
                         nb_lvl))
 
-    parts.append(subsec(f"Accounts without Kerberos pre-auth ({len(s['no_preauth'])})",
-                        text_table(s["no_preauth"], "Account") if s["no_preauth"]
-                        else '<p class="empty">No accounts without pre-auth found.</p>',
-                        pra_lvl))
+    parts.append(subsec("LDAP signing & channel binding",
+                        text_table(s["signing"], "Finding") if s["signing"]
+                        else '<p class="empty">Signing/channel binding enforced (or inconclusive).</p>',
+                        sig_lvl))
 
     parts.append(subsec(f"Unconstrained delegation ({len(s['delegation'])} accounts)",
                         text_table(s["delegation"], "Account") if s["delegation"]
                         else '<p class="empty">No delegation accounts found.</p>',
                         del_lvl))
+
+    if s["laps"]:
+        parts.append(subsec(f"LAPS passwords readable ({len(s['laps'])})",
+                            text_table(s["laps"], "LAPS"), "critical"))
+    if s["gmsa"]:
+        parts.append(subsec(f"gMSA secrets readable ({len(s['gmsa'])})",
+                            text_table(s["gmsa"], "gMSA"), "critical"))
+    if s["asrep"]:
+        parts.append(subsec(f"AS-REP roastable accounts ({len(s['asrep'])}) — hashcat -m 18200",
+                            text_table(s["asrep"], "Hash"), "critical"))
+    if s["kerberoast"]:
+        parts.append(subsec(f"Kerberoastable accounts ({len(s['kerberoast'])}) — hashcat -m 13100",
+                            text_table(s["kerberoast"], "Hash"), "critical"))
+
+    parts.append(subsec(f"Accounts with PASSWD_NOTREQD ({len(s['no_preauth'])})",
+                        text_table(s["no_preauth"], "Account") if s["no_preauth"]
+                        else '<p class="empty">No PASSWD_NOTREQD accounts found.</p>',
+                        pra_lvl))
+
+    if s["descriptions"]:
+        parts.append(subsec(f"User descriptions to review ({len(s['descriptions'])})",
+                            text_table(s["descriptions"], "Description"), "warning"))
+    if s["adcs"]:
+        parts.append(subsec(f"ADCS entries ({len(s['adcs'])})",
+                            text_table(s["adcs"], "ADCS"), "warning"))
+    if s["admin_count"]:
+        parts.append(subsec(f"adminCount=1 accounts ({len(s['admin_count'])})",
+                            text_table(s["admin_count"], "Account"), "info"))
+    if s["maq"]:
+        parts.append(subsec("MachineAccountQuota",
+                            text_table(s["maq"], "Policy"), "info"))
+    if s["pass_pol"]:
+        parts.append(subsec("Password policy",
+                            text_table(s["pass_pol"], "Policy"), "info"))
 
     if s["users_sample"]:
         parts.append(subsec(f"User sample (first {len(s['users_sample'])})",
