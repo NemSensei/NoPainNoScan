@@ -214,6 +214,34 @@ def parse_ldapsearch_attr(out: str, attr: str) -> list[str]:
             for m in re.finditer(rf'^{attr}:\s*(.+)$', out, re.M | re.I)]
 
 
+# gMSA : nxc liste TOUS les gMSA, y compris ceux qu'on ne peut pas lire
+# ("NTLM: <no read permissions>"). Ce n'est un finding que si le secret est
+# RÉELLEMENT lisible (hash NTLM présent) → sinon faux positif.
+_NO_READ   = re.compile(r'no read permission', re.I)
+_NTLM_HASH = re.compile(r'NTLM:\s*([0-9a-fA-F]{32}(?::[0-9a-fA-F]{32})?)', re.I)
+# Compte extrait d'un hash Kerberoast hashcat : $krb5tgs$<etype>$*USER$REALM$...
+_KRB_USER  = re.compile(r'\$krb5tgs\$\d+\$\*([^*$]+)\$', re.I)
+
+
+def parse_gmsa(out: str) -> list[str]:
+    """gMSA dont le secret est réellement lisible (hash NTLM présent).
+
+    Écarte les lignes « <no read permissions> » : on ne lit pas le mot de passe,
+    donc pas de finding (c'était la source du faux positif)."""
+    res = []
+    for line in nxc_data_lines(out):
+        if _NO_READ.search(line):
+            continue
+        if _NTLM_HASH.search(line):
+            res.append(line)
+    return res
+
+
+def parse_laps(out: str) -> list[str]:
+    """Entrées LAPS lisibles (on écarte les « no read permissions »)."""
+    return [l for l in nxc_data_lines(out) if not _NO_READ.search(l)]
+
+
 # ---------------------------------------------------------------------------
 # STEP 1 — rootDSE
 # ---------------------------------------------------------------------------
@@ -406,6 +434,34 @@ def step_nullbind(host_map: dict[str, str], outdir: Path) -> list[str]:
 # STEP 4 — Énumération authentifiée (nxc ldap)
 # ---------------------------------------------------------------------------
 
+def _kerberoast_group_lookup(targets: str, creds_real: str, creds_disp: str,
+                             tmo: int, hash_path: Path, outdir: Path):
+    """Résout les groupes de chaque compte kerberoastable (analyse de droits admin).
+
+    On extrait le sAMAccountName de chaque hash `$krb5tgs$`, puis on interroge
+    `nxc -M groupmembership -o USER=<compte>` (récursif, supporte PtH). Produit
+    `ldap_kerberoast_groups.txt` : « compte : grp1, grp2, … » — lu par le rapport
+    pour repérer d'un coup d'œil les comptes dans des groupes privilégiés."""
+    users = list(dict.fromkeys(
+        m.group(1).strip()
+        for m in _KRB_USER.finditer(hash_path.read_text(errors="replace"))
+        if m.group(1).strip()))
+    if not users:
+        return
+    mapping, raw = [], []
+    for u in users:
+        log_info(f"nxc ldap {targets} {creds_disp} -M groupmembership -o USER={u}")
+        out, _ = run_nxc(f"nxc ldap {targets} {creds_real} "
+                         f"-M groupmembership -o USER={shlex.quote(u)}", timeout=tmo)
+        raw.append(f"# === {u} ===\n{strip_ansi(out)}")
+        groups = nxc_data_lines(out)
+        mapping.append(f"{u}: " + (", ".join(groups) if groups
+                                   else "(groupes non résolus — voir .raw.txt)"))
+    write_file(outdir / "ldap_kerberoast_groups.raw.txt", "\n".join(raw) + "\n")
+    write_lines(outdir / "ldap_kerberoast_groups.txt", mapping, sort=True)
+    log_ok("Groupes des comptes kerberoastables → ldap_kerberoast_groups.txt")
+
+
 def step_auth_enum(dc_targets: list[str], creds_real, creds_disp, outdir: Path) -> dict:
     """Toutes les vérifs LDAP authentifiées, en une étape (sorties PARSÉES)."""
     log_step("STEP 4 — Authenticated enumeration (nxc ldap)")
@@ -450,8 +506,8 @@ def step_auth_enum(dc_targets: list[str], creds_real, creds_disp, outdir: Path) 
         ("Password policy",          "--pass-pol",               nxc_data_lines, "ldap_pass_policy.txt"),
         ("MachineAccountQuota",      "-M maq",                   nxc_data_lines, "ldap_maq.txt"),
         ("User descriptions",        "-M get-desc-users",        nxc_data_lines, "ldap_descriptions.txt"),
-        ("LAPS (readable)",          "--laps",                   nxc_data_lines, "ldap_laps.txt"),
-        ("gMSA (readable)",          "--gmsa",                   nxc_data_lines, "ldap_gmsa.txt"),
+        ("LAPS (readable)",          "--laps",                   parse_laps,     "ldap_laps.txt"),
+        ("gMSA (readable)",          "--gmsa",                   parse_gmsa,     "ldap_gmsa.txt"),
         ("ADCS (CA/templates)",      "-M adcs",                  nxc_data_lines, "ldap_adcs.txt"),
     ]
     for label, flag, parser, fname in checks:
@@ -479,6 +535,9 @@ def step_auth_enum(dc_targets: list[str], creds_real, creds_disp, outdir: Path) 
             n = len([l for l in hash_path.read_text().splitlines() if l.strip()])
             results[fname] = n
             log_warn(f"[CRITICAL] {label}: {n} hash(es) → {fname}  [hashcat -m {mode}]")
+            if flag == "--kerberoasting":
+                _kerberoast_group_lookup(targets, creds_real, creds_disp, tmo,
+                                         hash_path, outdir)
         else:
             write_file(hash_path, "")
             results[fname] = 0

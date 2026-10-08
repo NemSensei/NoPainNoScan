@@ -158,6 +158,7 @@ def collect(base: Path) -> dict:
         "maq":             read_all(base, "ldap_maq.txt"),
         "asrep":           read_all(base, "ldap_asrep_hashes.txt"),
         "kerberoast":      read_all(base, "ldap_kerberoast_hashes.txt"),
+        "kerberoast_groups": read_all(base, "ldap_kerberoast_groups.txt"),
         "users_count":     len(users),
         "groups_count":    len(groups),
         "computers_count": len(computers),
@@ -537,8 +538,13 @@ def build_ldap(d: dict) -> str:
         parts.append(subsec(f"AS-REP roastable accounts ({len(s['asrep'])}) — hashcat -m 18200",
                             text_table(s["asrep"], "Hash"), "critical"))
     if s["kerberoast"]:
+        # On privilégie l'affichage « compte : groupes » (analyse de droits admin)
+        # quand il est disponible ; sinon on retombe sur la liste des hashes.
+        kerb_body = (text_table(s["kerberoast_groups"], "Account : groups")
+                     if s["kerberoast_groups"]
+                     else text_table(s["kerberoast"], "Hash"))
         parts.append(subsec(f"Kerberoastable accounts ({len(s['kerberoast'])}) — hashcat -m 13100",
-                            text_table(s["kerberoast"], "Hash"), "critical"))
+                            kerb_body, "critical"))
 
     parts.append(subsec(f"Accounts with PASSWD_NOTREQD ({len(s['no_preauth'])})",
                         text_table(s["no_preauth"], "Account") if s["no_preauth"]

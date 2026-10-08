@@ -96,10 +96,10 @@ Flux : **1. rootDSE** (identifie les vrais DC) → **2. signing/channel binding*
 | Null/anonymous bind | ldapsearch `-D '' -w ''` renvoie des `dn:` | `ldap_nullbind.txt` | 🔴 |
 | Signing/channel binding non imposé | bannière `[*]` d'un `nxc ldap` : `(signing:None/off/false/…)` ou `(channel binding:Never)` — le module `ldap-checker` n'existe plus, c'est affiché à chaque connexion | `ldap_signing.txt` (brut: `ldap_signing_raw.txt`) | 🔴 |
 | Délégation non contrainte | `--trusted-for-delegation` → comptes | `ldap_delegation.txt` | 🔴 |
-| LAPS lisible | `--laps` → ligne de données | `ldap_laps.txt` | 🔴 |
-| gMSA lisible | `--gmsa` → ligne de données | `ldap_gmsa.txt` | 🔴 |
+| LAPS lisible | `--laps` → ligne de données (les « no read permissions » **exclus**) | `ldap_laps.txt` | 🔴 |
+| gMSA lisible | `--gmsa` → ligne avec **hash NTLM réellement lisible** (les « `NTLM: <no read permissions>` » **exclus** — c'était un faux positif) | `ldap_gmsa.txt` | 🔴 |
 | AS-REP roastable | `--asreproast <file>` écrit ≥1 hash | `ldap_asrep_hashes.txt` | 🔴 (m18200) |
-| Kerberoastable | `--kerberoasting <file>` écrit ≥1 hash | `ldap_kerberoast_hashes.txt` | 🔴 (m13100) |
+| Kerberoastable | `--kerberoasting <file>` écrit ≥1 hash ; groupes de chaque compte résolus via `-M groupmembership` (analyse de droits admin) | `ldap_kerberoast_hashes.txt`, `ldap_kerberoast_groups.txt` | 🔴 (m13100) |
 | PASSWD_NOTREQD | `--password-not-required` → comptes | `ldap_no_preauth.txt` | ⚠️ |
 | Descriptions utilisateurs | `-M get-desc-users` → lignes (creds en clair fréquents) | `ldap_descriptions.txt` | ⚠️ |
 | ADCS | `-M adcs` → CA/templates (→ Certipy) | `ldap_adcs.txt` | ⚠️ |
