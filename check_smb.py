@@ -386,15 +386,20 @@ def step3_auth_shares(hosts_file, out_dir, creds_args, n_hosts):
 # NB : le spidering SYSVOL/NETLOGON (--spider) et spider_plus (inventaire de tous les
 # shares) ont été RETIRÉS volontairement — trop de bruit. GPP ci-dessous extrait les
 # secrets à forte valeur de SYSVOL ; le reste de l'exploration se fait à la main.
-# Lignes à retenir dans la sortie des modules GPP (le reste = bannière/énum SYSVOL).
-_GPP_FINDING_RE = re.compile(
-    r"(?i)(cpassword|password|username|credential|autologin|decrypt|found .*\.xml)"
-)
-# …sauf les lignes négatives ("No autologin found", "No GPP files found", etc.).
+# Lignes à retenir dans la sortie des modules GPP : uniquement les marqueurs
+# forts d'un vrai secret (cpassword déchiffré, autologon). Les mots génériques
+# ("password", "username", "credential") ont été retirés : avec des creds
+# fournies, la sortie contient aussi les lignes d'auth nxc
+# (ex. "[+] CORP\svc:xxx STATUS_PASSWORD_MUST_CHANGE") qui déclenchaient un
+# faux CRITICAL « GPP credentials » sans aucun GPP réel.
+_GPP_FINDING_RE = re.compile(r"(?i)(cpassword|\bGPP\b|autologin)")
+# …sauf les lignes négatives ("No autologin found", "No GPP files found", etc.)
+# et les lignes de statut d'authentification nxc (STATUS_*).
 # Phrases explicites (pas de mots isolés : un '0' d'octet d'IP matcherait sinon).
 _GPP_NEGATIVE_RE = re.compile(
     r"(?i)(no (gpp|autologin|credential|password|result|xml|file)"
-    r"|not found|nothing found|could ?n'?t|could not|failed to)"
+    r"|not found|nothing found|could ?n'?t|could not|failed to"
+    r"|STATUS_[A-Z_]+)"
 )
 
 
