@@ -67,7 +67,7 @@ python3 generate_report.py -d /tmp/pentest -n "Client" -o /tmp/pentest/report.ht
 |---|---|---|
 | `ad_recon_userless.py` | — | Découverte réseau (fping + nmap), port scan masscan, tri par service |
 | `check_smb.py` | 139/445 | Signing, SMBv1, null session, partages (R/W), SYSVOL/NETLOGON |
-| `check_ldap.py` | 389/636/3268 | Null bind + dump anonyme, LDAP signing/channel binding (relais NTLM), pass-pol, MachineAccountQuota, délégation, adminCount, LAPS/gMSA lisibles, ADCS, descriptions, AS-REP/Kerberoast, BloodHound (`--bloodhound`, 1 DC) |
+| `check_ldap.py` | 389/636/3268 | Null bind + dump anonyme, LDAP signing/channel binding (relais NTLM), pass-pol, MachineAccountQuota, délégation, adminCount, LAPS/gMSA lisibles, ADCS, descriptions, AS-REP/Kerberoast, BloodHound (`--bloodhound [DC_IP]`, 1 DC) |
 | `check_rdp.py` | 3389 | NLA, OS, test de login, screenshot |
 | `check_ssh.py` | 22 | Bannière, algos faibles, méthodes d'auth, test creds |
 | `check_http.py` | 80/443/8080/8443/8000 | ADCS, WebDAV, OWA/RDWeb/ADFS/WSUS, whatweb |

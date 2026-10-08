@@ -585,9 +585,12 @@ def parse_args():
     p.add_argument("-d", "--domain", default=None, help="Domaine FQDN")
     p.add_argument("--threads", type=int, default=50,
                    help="Concurrence nxc (--threads, défaut 50)")
-    p.add_argument("--bloodhound", action="store_true",
+    p.add_argument("--bloodhound", nargs="?", const=True, default=False,
+                   metavar="DC_IP",
                    help="Lance la collecte BloodHound (bloodhound-python -c All) "
-                        "sur UN seul DC. Désactivé par défaut.")
+                        "sur UN seul DC. Sans valeur : 1er DC du rootDSE. "
+                        "Avec une IP (--bloodhound 10.0.0.5) : ce DC précis. "
+                        "Désactivé par défaut.")
     p.add_argument("-y", "--yes", action="store_true",
                    help="Non-interactif : accepte toutes les étapes (automatisation/UI)")
     return p.parse_args()
@@ -668,9 +671,11 @@ def main():
             log_warn("--bloodhound demandé mais bloodhound-python non installé — ignoré.")
         else:
             # bloodhound-python collecte TOUT le domaine via un seul DC (-ns) :
-            # inutile (et absurde) de le relancer par hôte. On prend le 1er DC.
+            # inutile (et absurde) de le relancer par hôte. IP fournie à
+            # --bloodhound si donnée, sinon le 1er DC du rootDSE.
+            dc_ip = args.bloodhound if isinstance(args.bloodhound, str) else dc_targets[0]
             step_bloodhound(args.username, args.password, args.hash, domain,
-                            outdir, dc_targets[0])
+                            outdir, dc_ip)
     elif has_creds and domain and tool_exists("bloodhound-python"):
         log_info("BloodHound non lancé (ajoute --bloodhound pour la collecte).")
 
