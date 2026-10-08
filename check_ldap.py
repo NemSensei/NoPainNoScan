@@ -5,8 +5,8 @@
 systématiquement en interne :
 
   STEP 1  rootDSE / domaine (sans creds) — identifie les vrais DC.
-  STEP 2  LDAP signing + channel binding (nxc -M ldap-checker) — exposition
-          relais NTLM → LDAP (RBCD, ADCS ESC8). Finding fort, souvent sans creds.
+  STEP 2  LDAP signing + channel binding (lu dans la bannière `nxc ldap`) —
+          exposition relais NTLM → LDAP (RBCD, ADCS ESC8). Souvent sans creds.
   STEP 3  Bind anonyme / null bind + dump anonyme (ldapsearch).
   STEP 4  Énumération authentifiée (nxc ldap) : users, groups, password policy,
           MachineAccountQuota, PASSWD_NOTREQD, délégation non contrainte,
@@ -262,16 +262,37 @@ def step_rootdse(hosts: list[str], outdir: Path) -> dict[str, str]:
 # STEP 2 — LDAP signing & channel binding (relais NTLM / ESC8)
 # ---------------------------------------------------------------------------
 
-_SIGN_BAD = re.compile(r'(?i)signing.*(not|isn.?t|no).*(enforc|requir)|signing not (required|enforced)')
-_CB_BAD   = re.compile(r'(?i)channel ?binding.*(never|not|disabled|no\b)')
+# NetExec n'a plus le module `ldap-checker` : le statut signing / channel binding
+# est désormais imprimé DIRECTEMENT dans la bannière de connexion `[*]` à chaque
+# `nxc ldap`, p.ex. :
+#   LDAP  10.0.0.1  389  DC01  [*] Windows ... (signing:None) (channel binding:Never)
+# On parse donc la bannière au lieu d'appeler un module.
+_BANNER_RE  = re.compile(r'(?:LDAP|LDAPS)\s+(\S+)\s+\d+\s+\S+\s+\[\*\](.*)')
+_SIGNING_TOK = re.compile(r'\(\s*(?:ldap[\s_]*)?signing\s*:\s*([^)]+)\)', re.I)
+_CB_TOK      = re.compile(r'\(\s*channel[\s_]*binding\s*:\s*([^)]+)\)', re.I)
+
+
+def _signing_bad(val: str) -> bool:
+    """signing non imposé (relayable vers LDAP 389)."""
+    v = val.strip().lower()
+    return v in ("none", "off", "false", "no", "0", "disabled") or "not" in v
+
+
+def _cb_bad(val: str) -> bool:
+    """channel binding non imposé (relayable vers LDAPS 636).
+
+    Conservateur : seul « Never » est un vrai signal de vuln. « No TLS cert »
+    signifie qu'il n'y a pas de LDAPS à tester, pas une faiblesse en soi."""
+    return "never" in val.strip().lower()
 
 
 def step_ldap_signing(dc_targets: list[str], creds_real, creds_disp, outdir: Path):
-    """nxc -M ldap-checker : signing/channel binding non imposés → relais possible.
+    """Signing / channel binding non imposés → relais NTLM possible.
 
-    Marche souvent sans creds ; on passe les creds si on les a (plus fiable).
-    Finding 🔴 : un DC qui n'impose ni signing ni channel binding est relayable
-    vers LDAP (ajout d'ordinateur + RBCD, ou enrôlement de certificat ESC8)."""
+    Lu dans la bannière `[*]` d'un simple `nxc ldap` (marche même sans creds : la
+    bannière est imprimée à la connexion, avant l'auth). Finding 🔴 : un DC qui
+    n'impose pas le signing est relayable vers LDAP (ajout d'ordinateur + RBCD) ;
+    channel binding « Never » l'est vers LDAPS (enrôlement de certificat ESC8)."""
     log_step("STEP 2 — LDAP signing & channel binding (NTLM relay / ESC8)")
     findings_file = outdir / "ldap_signing.txt"
 
@@ -280,28 +301,39 @@ def step_ldap_signing(dc_targets: list[str], creds_real, creds_disp, outdir: Pat
         write_file(findings_file, "")
         return []
     if not confirm_step("STEP 2 — LDAP signing & channel binding",
-                        "nxc ldap <dc> -M ldap-checker"):
+                        "nxc ldap <dc>  (bannière : signing / channel binding)"):
         write_file(findings_file, "")
         return []
 
     targets = " ".join(shlex.quote(h) for h in dc_targets)
-    creds = f" {creds_real}" if creds_real else ""
-    disp  = f" {creds_disp}" if creds_disp else ""
-    log_info(f"nxc ldap {targets}{disp} -M ldap-checker")
-    out, _ = run_nxc(f"nxc ldap {targets}{creds} -M ldap-checker",
-                     timeout=scaled_timeout(len(dc_targets)))
+    # Creds si dispo (plus fiable), sinon bind anonyme : la bannière sort quand même.
+    creds = creds_real if creds_real else "-u '' -p ''"
+    disp  = creds_disp if creds_disp else "-u '' -p ''"
+    log_info(f"nxc ldap {targets} {disp}")
+    out, _ = run_nxc(f"nxc ldap {targets} {creds}", timeout=scaled_timeout(len(dc_targets)))
     write_file(outdir / "ldap_signing_raw.txt", strip_ansi(out))
 
-    findings = []
-    for payload in nxc_payloads(out):
-        if _SIGN_BAD.search(payload) or _CB_BAD.search(payload):
-            findings.append(payload.lstrip('[*+!-] ').strip())
-    findings = write_lines(findings_file, findings)
+    findings, seen = [], set()
+    for line in strip_ansi(out).splitlines():
+        m = _BANNER_RE.search(line.strip())
+        if not m:
+            continue
+        ip, msg = m.group(1), m.group(2)
+        ms, mc = _SIGNING_TOK.search(msg), _CB_TOK.search(msg)
+        if not (ms or mc) or ip in seen:
+            continue
+        seen.add(ip)
+        sv = ms.group(1).strip() if ms else "?"
+        cv = mc.group(1).strip() if mc else "?"
+        if (ms and _signing_bad(sv)) or (mc and _cb_bad(cv)):
+            findings.append(f"{ip}  signing:{sv}  channel binding:{cv}")
+
+    findings = write_lines(findings_file, findings, sort=True)
     if findings:
-        log_warn(f"[CRITICAL] signing/channel binding non imposé sur un ou plusieurs DC "
+        log_warn(f"[CRITICAL] signing/channel binding non imposé sur {len(findings)} DC "
                  f"→ {findings_file}")
     else:
-        log_ok("Signing/channel binding imposés (ou non concluant — voir ldap_signing_raw.txt).")
+        log_ok("Signing/channel binding imposés (ou bannière non parsée — voir ldap_signing_raw.txt).")
     return findings
 
 
@@ -460,7 +492,8 @@ def step_auth_enum(dc_targets: list[str], creds_real, creds_disp, outdir: Path) 
 # ---------------------------------------------------------------------------
 
 def step_bloodhound(user, password, nt_hash, domain, outdir: Path, dc_ip: str):
-    log_step("STEP 5 — BloodHound collection")
+    log_step("STEP 5 — BloodHound collection (1 DC)")
+    log_info(f"Collecte via un seul DC : {dc_ip} (couvre tout le domaine {domain})")
     if not confirm_step("STEP 5 — BloodHound collection",
                         f"bloodhound-python -u {user} -d {domain} -ns {dc_ip} -c All --zip"):
         return
@@ -540,6 +573,7 @@ def parse_args():
   %(prog)s -t hosts_ldap.txt
   %(prog)s -t 192.168.1.10 -u admin -p 'Password1' -d corp.local
   %(prog)s -t 10.0.0.0/24 -u svc -H aad3b435b51404eeaad3b435b51404ee:abc123 -d lab.local
+  %(prog)s -t hosts_ldap.txt -u svc -p 'Pass' -d corp.local --bloodhound
 """)
     p.add_argument("-t", "--target", required=True,
                    help="Cible : fichier de hosts, IP, ou CIDR")
@@ -551,6 +585,9 @@ def parse_args():
     p.add_argument("-d", "--domain", default=None, help="Domaine FQDN")
     p.add_argument("--threads", type=int, default=50,
                    help="Concurrence nxc (--threads, défaut 50)")
+    p.add_argument("--bloodhound", action="store_true",
+                   help="Lance la collecte BloodHound (bloodhound-python -c All) "
+                        "sur UN seul DC. Désactivé par défaut.")
     p.add_argument("-y", "--yes", action="store_true",
                    help="Non-interactif : accepte toutes les étapes (automatisation/UI)")
     return p.parse_args()
@@ -621,13 +658,21 @@ def main():
     else:
         log_info("Pas de creds — étapes authentifiées (4-5) ignorées.")
 
-    # ---- STEP 5 : BloodHound ----
-    if has_creds and domain:
-        if not tool_exists("bloodhound-python"):
-            log_info("bloodhound-python non installé — collecte BloodHound ignorée.")
+    # ---- STEP 5 : BloodHound (opt-in via --bloodhound, sur UN seul DC) ----
+    if args.bloodhound:
+        if not has_creds:
+            log_warn("--bloodhound demandé mais aucun identifiant fourni — ignoré.")
+        elif not domain:
+            log_warn("--bloodhound demandé mais domaine inconnu (ni -d ni rootDSE) — ignoré.")
+        elif not tool_exists("bloodhound-python"):
+            log_warn("--bloodhound demandé mais bloodhound-python non installé — ignoré.")
         else:
+            # bloodhound-python collecte TOUT le domaine via un seul DC (-ns) :
+            # inutile (et absurde) de le relancer par hôte. On prend le 1er DC.
             step_bloodhound(args.username, args.password, args.hash, domain,
                             outdir, dc_targets[0])
+    elif has_creds and domain and tool_exists("bloodhound-python"):
+        log_info("BloodHound non lancé (ajoute --bloodhound pour la collecte).")
 
     write_summary(outdir, hosts, dc_targets, vulnerable_nb, signing, auth, has_creds)
 

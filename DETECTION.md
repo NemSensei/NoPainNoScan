@@ -89,12 +89,12 @@ ne ciblent que les hôtes où l'auth réussit (reco step 1) → bien plus rapide
 > Pas de faux positif admin (ne s'appuie pas sur `(Pwn3d!)` pour les shares). STEP 1-4 nettoient l'ANSI (`strip_ansi`) avant parsing et **excluent les partages `$`** des fichiers shares. Robustesse gros scope : `run_nxc()` redirige vers fichier, **tue le groupe de processus sur timeout et conserve la sortie partielle** (fini le « plus rien ne remonte »), timeouts scalés sur le nb d'hôtes, `--threads` transmis (défaut 100). **Spidering retiré volontairement** (`--spider` SYSVOL/NETLOGON + `-M spider_plus`) — trop bruyant ; GPP couvre les secrets SYSVOL, le reste se fait à la main. **⚠ Reste** : regex null-session fixée (plus de mauvais classement `READ,WRITE`).
 
 ### LDAP — [`check_ldap.py`](check_ldap.py)
-Flux : **1. rootDSE** (identifie les vrais DC) → **2. signing/channel binding** → **3. null bind + dump anonyme** → **4. énum authentifiée (nxc)** → **5. BloodHound**. Les étapes 4-5 ciblent les **DC** (hôtes répondant au rootDSE, repli sur toutes les cibles), pas tout le scope.
+Flux : **1. rootDSE** (identifie les vrais DC) → **2. signing/channel binding** → **3. null bind + dump anonyme** → **4. énum authentifiée (nxc)** → **5. BloodHound (opt-in `--bloodhound`, sur 1 DC)**. L'étape 4 cible les **DC** (hôtes répondant au rootDSE, repli sur toutes les cibles), pas tout le scope ; l'étape 5 ne tourne que si `--bloodhound` est passé et sur **un seul DC** (bloodhound-python `-ns <DC>` collecte tout le domaine).
 
 | Finding | Critère | Fichier | Crit. |
 |---|---|---|---|
 | Null/anonymous bind | ldapsearch `-D '' -w ''` renvoie des `dn:` | `ldap_nullbind.txt` | 🔴 |
-| Signing/channel binding non imposé | `-M ldap-checker` → ligne « signing not enforced/required » ou « channel binding … never/not/disabled » | `ldap_signing.txt` (brut: `ldap_signing_raw.txt`) | 🔴 |
+| Signing/channel binding non imposé | bannière `[*]` d'un `nxc ldap` : `(signing:None/off/false/…)` ou `(channel binding:Never)` — le module `ldap-checker` n'existe plus, c'est affiché à chaque connexion | `ldap_signing.txt` (brut: `ldap_signing_raw.txt`) | 🔴 |
 | Délégation non contrainte | `--trusted-for-delegation` → comptes | `ldap_delegation.txt` | 🔴 |
 | LAPS lisible | `--laps` → ligne de données | `ldap_laps.txt` | 🔴 |
 | gMSA lisible | `--gmsa` → ligne de données | `ldap_gmsa.txt` | 🔴 |
