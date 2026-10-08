@@ -7,7 +7,8 @@ from pathlib import Path
 
 from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
                          tool_exists, confirm_step, set_total_steps, enable_auto_accept,
-                         emit_progress, nxc_is_admin, nxc_login_ok)
+                         emit_progress, nxc_is_admin, nxc_login_ok, strip_ansi,
+                         timed_out)
 
 
 set_total_steps(3)
@@ -61,42 +62,53 @@ def write_hosts_file(targets, out_dir):
 
 # Example nxc rdp output line:
 # RDP         10.10.10.1      3389   DC01   [*] Windows 10 or Windows Server 2016 Build 14393 (name:DC01) (domain:lab.local) (nla:True)
-NXC_LINE_RE = re.compile(
-    r"RDP\s+(?P<ip>\d+\.\d+\.\d+\.\d+)\s+\d+\s+(?P<hostname>\S+)\s+.*?"
-    r"\(name:(?P<name>[^)]*)\).*?"
-    r"\(domain:(?P<domain>[^)]*)\).*?"
-    r"\(nla:(?P<nla>\w+)\)",
-    re.IGNORECASE,
-)
-
-OS_RE = re.compile(
-    r"RDP\s+\S+\s+\d+\s+\S+\s+\[\*\]\s+(?P<os>[^\(]+?)\s+(?:Build\s+\d+\s+)?\(",
-    re.IGNORECASE,
-)
-
-RDP_IP_RE = re.compile(r"RDP\s+(?P<ip>\d+\.\d+\.\d+\.\d+)", re.IGNORECASE)
+# Les champs sont parsés INDÉPENDAMMENT puis fusionnés par IP : l'ancienne
+# regex unique exigeait (name:…), (domain:…) et (nla:…) sur la MÊME ligne —
+# une seule variante manquante (nxc ancien, champ absent, retour à la ligne)
+# faisait perdre l'hôte entier.
+FIELD_RES = {
+    "ip":       re.compile(r"RDP\s+(?P<ip>\d+\.\d+\.\d+\.\d+)", re.IGNORECASE),
+    "port_host": re.compile(r"RDP\s+\d+\.\d+\.\d+\.\d+\s+\d+\s+(?P<hostname>\S+)", re.IGNORECASE),
+    "name":     re.compile(r"\(name:(?P<name>[^)]*)\)", re.IGNORECASE),
+    "domain":   re.compile(r"\(domain:(?P<domain>[^)]*)\)", re.IGNORECASE),
+    "nla":      re.compile(r"\(nla:(?P<nla>\w+)\)", re.IGNORECASE),
+    "os":       re.compile(r"\[\*\]\s+(?P<os>[^(]+?)\s+(?:Build\s+\d+\s+)?\(", re.IGNORECASE),
+}
 
 
 def parse_nxc_output(stdout):
     """Parse nxc rdp unauthenticated output.
 
+    Chaque champ est recherché séparément et fusionné par IP : une ligne
+    partielle complète ce qu'on sait déjà de l'hôte au lieu d'être jetée.
+
     Returns list of dicts: {ip, hostname, os, nla_enabled}
     """
-    results = []
-    for line in stdout.splitlines():
-        m = NXC_LINE_RE.search(line)
-        if not m:
+    by_ip = {}
+    for line in strip_ansi(stdout).splitlines():
+        ip_m = FIELD_RES["ip"].search(line)
+        if not ip_m:
             continue
-        os_m = OS_RE.search(line)
-        os_str = os_m.group("os").strip() if os_m else "Unknown"
-        nla_enabled = m.group("nla").lower() == "true"
-        results.append({
-            "ip": m.group("ip"),
-            "hostname": m.group("hostname"),
-            "os": os_str,
-            "nla_enabled": nla_enabled,
+        ip = ip_m.group("ip")
+        rec = by_ip.setdefault(ip, {
+            "ip": ip, "hostname": "", "os": "Unknown", "nla_enabled": False,
         })
-    return results
+        h_m = FIELD_RES["port_host"].search(line)
+        if h_m:
+            rec["hostname"] = h_m.group("hostname")
+        n_m = FIELD_RES["name"].search(line)
+        if n_m:
+            rec["hostname"] = n_m.group("name").strip() or rec["hostname"]
+        d_m = FIELD_RES["domain"].search(line)
+        if d_m:
+            rec["domain"] = d_m.group("domain").strip()
+        nla_m = FIELD_RES["nla"].search(line)
+        if nla_m:
+            rec["nla_enabled"] = nla_m.group("nla").lower() == "true"
+        os_m = FIELD_RES["os"].search(line)
+        if os_m:
+            rec["os"] = os_m.group("os").strip()
+    return list(by_ip.values())
 
 
 def parse_auth_output(stdout):
@@ -155,7 +167,9 @@ def step1_nla_check(hosts_file, out_dir):
     log_info(f"Running: {cmd}")
     stdout, stderr, rc = run(cmd, timeout=600)
 
-    if rc != 0 and not stdout:
+    if timed_out(stderr):
+        log_warn("nxc timed out — RDP results INCOMPLETE (hosts may be missing)")
+    elif rc != 0 and not stdout:
         log_warn(f"nxc returned code {rc}. stderr: {stderr[:200]}")
 
     # Save raw output

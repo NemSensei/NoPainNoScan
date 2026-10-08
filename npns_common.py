@@ -110,6 +110,18 @@ def nxc_login_ok(line):
     return "[+]" in line
 
 
+def timed_out(stderr):
+    """True si run() a expiré (marqueur "TIMEOUT" en stderr).
+
+    Les wrappers run() de chaque script retournent ("", "TIMEOUT", 1) sur
+    subprocess.TimeoutExpired. Sans ce test, un timeout est indistinguable
+    d'une sortie vide → faux négatif silencieux ("aucun résultat") alors que
+    la commande n'a jamais fini. À tester à chaque appel dont on interprète
+    la sortie.
+    """
+    return bool(stderr) and "TIMEOUT" in stderr
+
+
 # =============================================================================
 # CONFIRMATION D'ÉTAPE + PROGRESSION
 # =============================================================================

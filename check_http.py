@@ -10,7 +10,7 @@ import ipaddress
 
 from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
                          tool_exists, confirm_step, set_total_steps, enable_auto_accept,
-                         emit_progress)
+                         emit_progress, timed_out)
 
 
 set_total_steps(2)
@@ -79,18 +79,26 @@ def curl_fetch(url, timeout):
 
 def check_url_exists(url, timeout):
     """Check if a URL returns 200 or 401."""
-    cmd = f"curl -sk -o /dev/null -w '%{{http_code}}' -m {timeout} {url}"
-    out, _, _ = run(cmd, timeout=timeout + 5)
+    cmd = f"curl -sk -o /dev/null -w '%{{http_code}}' -m {timeout} {shlex.quote(url)}"
+    out, err, _ = run(cmd, timeout=timeout + 5)
+    if timed_out(err):
+        log_warn(f"curl timed out on {url} — check ignoré (avant : compté comme « absent »)")
     code = out.strip().strip("'")
     return code
 
 
 def check_webdav(url, timeout):
     """Check if WebDAV is enabled on a URL."""
-    cmd = f"curl -sk -X OPTIONS {url} -D - -m {timeout}"
+    cmd = f"curl -sk -X OPTIONS {shlex.quote(url)} -D - -m {timeout}"
     out, _, _ = run(cmd, timeout=timeout + 5)
-    dav_headers = re.search(r'DAV:', out, re.IGNORECASE)
-    allow_match = re.search(r'Allow:\s*(.+)', out, re.IGNORECASE)
+    # Le marqueur DAV: ne vaut que dans les HEADERS : le corps d'une page
+    # quelconque peut contenir la chaîne "DAV:" (avant : faux positif dès
+    # qu'un contenu non vide suivait la réponse OPTIONS).
+    header_section = out.partition("\r\n\r\n")[0]
+    if not header_section:
+        header_section = out.partition("\n\n")[0]
+    dav_headers = re.search(r'^DAV\s*:', header_section, re.IGNORECASE | re.MULTILINE)
+    allow_match = re.search(r'^Allow:\s*(.+)', header_section, re.IGNORECASE | re.MULTILINE)
     allow_val = allow_match.group(1).strip() if allow_match else ""
     webdav_methods = any(m in allow_val.upper() for m in ['PROPFIND', 'COPY', 'MOVE'])
     if dav_headers or webdav_methods:
@@ -120,6 +128,21 @@ def step1_title(ip, port, timeout):
     return results
 
 
+_ADCS_BODY_MARKERS = (
+    "certsrv", "certenroll",
+    "active directory certificate services",
+    "certificate services", "certification authority",
+)
+
+
+def _fetch_body(url, timeout):
+    """Retourne les 50 premiers Ko du corps de la réponse (sans suivre les
+    redirections : on veut ce que CETTE URL renvoie)."""
+    cmd = f"curl -sk -m {timeout} --max-redirs 0 {shlex.quote(url)} | head -c 51200"
+    out, _, _ = run(cmd, timeout=timeout + 5)
+    return out
+
+
 def step2_adcs(ip, port, scheme, timeout):
     """Check ADCS web-enrollment paths. Returns list of findings.
 
@@ -127,16 +150,28 @@ def step2_adcs(ip, port, scheme, timeout):
     On ne garde QUE les chemins ADCS réels, et on ignore 403 : un 401/403 nu sur
     n'importe quelle appli derrière un portail d'auth n'est PAS de l'ADCS (ancien
     faux positif). '/adcs/' n'est pas un chemin ADCS par défaut → retiré.
+
+    Un 200 nu n'est PAS un signal : n'importe quelle app qui répond 200 sur
+    toutes ses routes (SPA, catch-all) faisait remonter un « ADCS CRITICAL »
+    sur un simple blog. Un 200 doit en plus contenir un marqueur ADCS dans
+    le corps ; le 401 reste accepté seul (protégé NTLM = signal ESC8 fort).
     """
     paths = ['/certsrv/', '/certsrv/certfnsh.asp', '/certsrv/Default.asp', '/certenroll/']
     findings = []
     for path in paths:
         url = f"{scheme}://{ip}:{port}{path}"
         code = check_url_exists(url, timeout)
-        # 401 = enrôlement protégé NTLM (signal ESC8 fort) ; 200 = accessible.
+        # 401 = enrôlement protégé NTLM (signal ESC8 fort).
         # 403 trop ambigu pour un critique → on l'ignore ici.
-        if code in ('200', '401'):
-            findings.append(f"{url} [{code}]")
+        if code not in ('200', '401'):
+            continue
+        if code == '200':
+            body = _fetch_body(url, timeout).lower()
+            if not any(marker in body for marker in _ADCS_BODY_MARKERS):
+                log_info(f"  {url} [200] sans marqueur ADCS dans le corps — ignoré "
+                         f"(catch-all 200, pas un enrôlement de certificats)")
+                continue
+        findings.append(f"{url} [{code}]")
     return findings
 
 

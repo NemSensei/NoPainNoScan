@@ -139,7 +139,13 @@ def _merge_text(dest: Path, src_text: str) -> None:
 
 
 def _merge_json(dest: Path, src_text: str) -> bool:
-    """Deep-merge a ``{host: [ports]}``-style JSON file. True on success."""
+    """Deep-merge a ``{host: [ports]}``-style JSON file. True on success.
+
+    Deux formes gérées par hôte : ``[ports]`` (ancien format) et
+    ``{"tcp": [...], "udp": [...]}`` (nouveau format, protocole préservé) —
+    les dicts sont fusionnés récursivement, sinon la valeur d'un run
+    écraserait celle des runs précédents (perte silencieuse de ports).
+    """
     try:
         a = json.loads(dest.read_text(encoding="utf-8", errors="replace"))
         b = json.loads(src_text)
@@ -147,13 +153,18 @@ def _merge_json(dest: Path, src_text: str) -> bool:
         return False
     if not isinstance(a, dict) or not isinstance(b, dict):
         return False
-    for key, val in b.items():
-        if key in a and isinstance(a[key], list) and isinstance(val, list):
-            # union preserving order: existing first, then new
-            seen = set(a[key])
-            a[key] = a[key] + [x for x in val if x not in seen]
-        else:
-            a[key] = val
+
+    def _union(dst: Any, src: Any) -> Any:
+        if isinstance(dst, dict) and isinstance(src, dict):
+            for k, v in src.items():
+                dst[k] = _union(dst[k], v) if k in dst else v
+            return dst
+        if isinstance(dst, list) and isinstance(src, list):
+            seen = set(dst)
+            return dst + [x for x in src if x not in seen]
+        return src
+
+    _union(a, b)
     dest.write_text(json.dumps(a), encoding="utf-8")
     return True
 

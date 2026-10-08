@@ -54,6 +54,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -63,7 +64,7 @@ from datetime import datetime
 from pathlib import Path
 
 from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
-                         tool_exists, emit_progress)
+                         tool_exists, emit_progress, timed_out)
 
 
 # =============================================================================
@@ -250,20 +251,35 @@ def save_state(base_path, state):
 
 
 def load_prior_ports(base_path):
-    """Charge ports_summary.json accumulé → {ip: set(int)} ({} si absent/illisible)."""
+    """Charge ports_summary.json accumulé → {ip: set((port, proto))} ({} si absent/illisible).
+
+    Supporte les deux formats : l'ancien {ip: [161, 445]} (protocole perdu,
+    tout considéré TCP) et le nouveau {ip: {"tcp": [...], "udp": [...]}}.
+    """
     p = Path(base_path) / "ports_summary.json"
     if not p.exists():
         return {}
     try:
         data = json.loads(p.read_text())
-        return {ip: set(int(x) for x in ports) for ip, ports in data.items()}
-    except (json.JSONDecodeError, OSError, ValueError):
+        out = {}
+        for ip, ports in data.items():
+            entries = set()
+            if isinstance(ports, dict):
+                entries |= {(int(x), "tcp") for x in ports.get("tcp", [])}
+                entries |= {(int(x), "udp") for x in ports.get("udp", [])}
+            else:
+                # ancien format : ints sans protocole
+                entries |= {(int(x), "tcp") for x in ports}
+            if entries:
+                out[ip] = entries
+        return out
+    except (json.JSONDecodeError, OSError, ValueError, TypeError):
         log_warn("ports_summary.json illisible — ports précédents ignorés")
         return {}
 
 
 def merge_ports(a, b):
-    """Union des ports par IP de deux dicts {ip: set(int)}."""
+    """Union des ports par IP de deux dicts {ip: set((port, proto))}."""
     out = {ip: set(ports) for ip, ports in a.items()}
     for ip, ports in b.items():
         out.setdefault(ip, set()).update(ports)
@@ -380,29 +396,37 @@ def _chunks(lst, size):
 def _fping_sweep(token):
     """ICMP sweep fping sur UNE cible. `-g` est requis pour expandre un CIDR
     (sans lui, fping prend l'argument pour un nom d'hôte). Un IP seule passe sans -g.
-    Retourne les IP vivantes."""
-    cmd = (f"fping -a -g -q {token} 2>/dev/null" if "/" in token
-           else f"fping -a -q {token} 2>/dev/null")
-    out, _, _ = run(cmd, timeout=600)
-    return {line.strip() for line in out.splitlines() if line.strip()}
+    Retourne (IP vivantes, cible couverte) — couverte=False si timeout (on ne
+    peut pas distinguer « aucun hôte » de « scan jamais terminé »)."""
+    cmd = (f"fping -a -g -q {shlex.quote(token)} 2>/dev/null" if "/" in token
+           else f"fping -a -q {shlex.quote(token)} 2>/dev/null")
+    out, err, _ = run(cmd, timeout=600)
+    if timed_out(err):
+        return set(), False
+    return {line.strip() for line in out.splitlines() if line.strip()}, True
 
 
 def _nmap_sweep(tokens):
-    """TCP SYN ping nmap sur un chunk de cibles. Retourne les IP répondantes."""
+    """TCP SYN ping nmap sur un chunk de cibles.
+    Retourne (IP répondantes, chunk couvert) — couvert=False si timeout : un
+    nmap qui explose perd TOUT le chunk (8 cibles), il faut le retenter."""
     if not tokens:
-        return set()
-    out, _, _ = run(
+        return set(), False
+    out, err, _ = run(
         f"nmap -sn -PS{DISCOVERY_TCP_PORTS} -n --max-retries 3 --min-rate 500 "
-        f"{' '.join(tokens)} -oG - 2>/dev/null",
+        f"{' '.join(shlex.quote(t) for t in tokens)} -oG - 2>/dev/null",
         timeout=1200,
     )
+    if timed_out(err):
+        log_warn(f"  nmap timeout sur le chunk ({len(tokens)} cible(s)) — à retenter")
+        return set(), False
     hosts = set()
     for line in out.splitlines():
         if "Status: Up" in line:
             m = re.match(r'^Host:\s+(\S+)', line)
             if m:
                 hosts.add(m.group(1))
-    return hosts
+    return hosts, True
 
 
 def discover_hosts(targets):
@@ -415,12 +439,16 @@ def discover_hosts(targets):
     passés ; nmap reçoit toutes les cibles (il gère les plages).
 
     Returns:
-        set[str]: IPs vivantes trouvées sur ce run
+        (set[str], set[str]): (IPs vivantes trouvées sur ce run,
+                               cibles effectivement couvertes — une cible dont
+                               TOUTES les tâches ont échoué/timeout est exclue
+                               pour être retentée au prochain run au lieu d'être
+                               marquée « scannée » à tort)
     """
     log_step("ETAPE 1 — Découverte des hôtes")
     if not targets:
         log_info("Aucun nouveau subnet à découvrir — étape sautée")
-        return set()
+        return set(), set()
 
     have_fping = tool_exists("fping")
     have_nmap = tool_exists("nmap")
@@ -429,18 +457,18 @@ def discover_hosts(targets):
     if not have_nmap:
         log_warn("nmap non installé — TCP port ping désactivé (apt install nmap)")
     if not (have_fping or have_nmap):
-        return set()
+        return set(), set()
 
     fping_tokens = [t for t in targets if not _RANGE_RE.match(t)]  # fping: pas de plages
     nmap_tokens = list(targets)
 
     # fping : une tâche par cible (le -g ne prend qu'un CIDR à la fois).
     # nmap  : une tâche par chunk (il gère plusieurs cibles d'un coup).
-    tasks = []  # (méthode, callable, arg, label)
+    tasks = []  # (méthode, callable, arg, label, cibles couvertes)
     if have_fping:
-        tasks += [("fping", _fping_sweep, t, t) for t in fping_tokens]
+        tasks += [("fping", _fping_sweep, t, t, {t}) for t in fping_tokens]
     if have_nmap:
-        tasks += [("nmap", _nmap_sweep, ch, f"{len(ch)} cible(s)")
+        tasks += [("nmap", _nmap_sweep, ch, f"{len(ch)} cible(s)", set(ch))
                   for ch in _chunks(nmap_tokens, DISCOVERY_CHUNK_SIZE)]
 
     total = len(tasks)
@@ -448,22 +476,27 @@ def discover_hosts(targets):
              f"{DISCOVERY_MAX_WORKERS} workers max...")
 
     icmp_hosts, tcp_hosts = set(), set()
+    covered = set()
     done = 0
     with ThreadPoolExecutor(max_workers=DISCOVERY_MAX_WORKERS) as ex:
-        futs = {ex.submit(fn, arg): (method, label) for method, fn, arg, label in tasks}
+        futs = {ex.submit(fn, arg): (method, label, covers)
+                for method, fn, arg, label, covers in tasks}
         for fut in as_completed(futs):
-            method, label = futs[fut]
+            method, label, covers = futs[fut]
             done += 1
             try:
-                res = fut.result()
+                hosts, ok = fut.result()
             except Exception as e:  # noqa: BLE001
                 log_warn(f"  [{done}/{total}] {method} {label}: échec ({e})")
                 continue
+            if not ok:
+                continue
+            covered |= covers
             if method == "fping":
-                icmp_hosts |= res
+                icmp_hosts |= hosts
             else:
-                tcp_hosts |= res
-            log_info(f"  [{done}/{total}] {method:<5} {label} → {len(res)} hôte(s)")
+                tcp_hosts |= hosts
+            log_info(f"  [{done}/{total}] {method:<5} {label} → {len(hosts)} hôte(s)")
 
     hosts = icmp_hosts | tcp_hosts
     if have_fping:
@@ -474,7 +507,7 @@ def discover_hosts(targets):
         log_warn("Aucun host découvert sur les cibles de ce run")
     else:
         log_ok(f"{len(hosts)} hôte(s) vivant(s) découvert(s) sur ce run")
-    return hosts
+    return hosts, covered
 
 
 # =============================================================================
@@ -484,9 +517,11 @@ def parse_masscan_json(filepath):
     """
     Parse le JSON masscan en gérant les formats invalides (trailing commas, etc.).
     Consolide les entrées par IP (masscan crée 1 entrée par port ouvert).
+    Le protocole est conservé : sans lui, un 161/udp (SNMP) et un 161/tcp
+    ouvert sont indistinguables → faux positif SNMP / mauvais check lancé.
 
     Returns:
-        dict[str, set[int]]: {ip: {port1, port2, ...}}
+        dict[str, set[tuple[int, str]]]: {ip: {(port, "tcp"|"udp"), ...}}
     """
     content = Path(filepath).read_text().strip()
     if not content or content == '[]':
@@ -523,30 +558,38 @@ def parse_masscan_json(filepath):
         for port_entry in entry.get("ports", []):
             port = port_entry.get("port")
             if port is not None:
-                host_ports[ip].add(int(port))
+                proto = port_entry.get("proto", "tcp").lower()
+                if proto not in ("tcp", "udp"):
+                    proto = "tcp"
+                host_ports[ip].add((int(port), proto))
 
     return host_ports
 
 
 def _rewrite_output_files(base_path, host_ports):
     """
-    Écrit/réécrit tous les fichiers de sortie catégorisés depuis un dict {ip: set(ports)}.
-    Appelé par masscan_scan et après nmap_verify pour rester cohérent.
+    Écrit/réécrit tous les fichiers de sortie catégorisés depuis un dict
+    {ip: set((port, proto))}. Appelé par masscan_scan et après nmap_verify
+    pour rester cohérent.
     """
     categories = {cat: set() for cat in list(PORT_CATEGORIES.keys()) + ["dc"]}
     udp_cat    = {cat: set() for cat in UDP_PORTS}
 
     for ip, open_ports in host_ports.items():
-        for port in open_ports:
+        tcp_ports  = {p for p, proto in open_ports if proto == "tcp"}
+        udp_ports_ = {p for p, proto in open_ports if proto == "udp"}
+        for port in tcp_ports:
             cat = PORT_TO_CAT.get(port)
             if cat:
                 categories[cat].add(ip)
-        has_kerberos = bool(open_ports & {88, 464})
-        has_ldap     = bool(open_ports & {389, 3268})
+        has_kerberos = bool(tcp_ports & {88, 464})
+        has_ldap     = bool(tcp_ports & {389, 3268})
         if has_kerberos and has_ldap:
             categories["dc"].add(ip)
+        # SNMP/IPMI ne vivent qu'en UDP : un 161/tcp ouvert ne doit pas
+        # ajouter l'hôte dans hosts_snmp.txt (ancien faux positif).
         for svc, port in UDP_PORTS.items():
-            if port in open_ports:
+            if port in udp_ports_:
                 udp_cat[svc].add(ip)
 
     categories["http"] = categories["http"] | categories.get("https", set())
@@ -571,21 +614,29 @@ def _rewrite_output_files(base_path, host_ports):
     write_list(base_path / "hosts_snmp.txt", list(udp_cat["snmp"]))
     write_list(base_path / "hosts_ipmi.txt", list(udp_cat["ipmi"]))
 
-    port_to_ips: dict[int, list[str]] = {}
+    port_to_ips: dict[tuple[int, str], list[str]] = {}
     for ip, open_ports in host_ports.items():
         for port in open_ports:
             port_to_ips.setdefault(port, []).append(ip)
-    for port, ips in port_to_ips.items():
-        write_list(base_path / f"port_{port}.txt", ips)
+    for (port, proto), ips in port_to_ips.items():
+        # tcp → port_445.txt (compat) ; udp → port_161_udp.txt
+        suffix = "" if proto == "tcp" else "_udp"
+        write_list(base_path / f"port_{port}{suffix}.txt", ips)
 
     detail_dir = base_path / "hosts_detail"
     detail_dir.mkdir(exist_ok=True)
     for ip, open_ports in host_ports.items():
         (detail_dir / f"host_{ip}.txt").write_text(
-            "\n".join(str(p) for p in sorted(open_ports)) + "\n"
+            "\n".join(f"{p}/{proto}" for p, proto in sorted(open_ports)) + "\n"
         )
 
-    ports_summary = {ip: sorted(ports) for ip, ports in host_ports.items()}
+    # Format nouveau : le protocole est préservé ({ip: {"tcp": [...], "udp": [...]}}).
+    ports_summary = {}
+    for ip, ports in host_ports.items():
+        ports_summary[ip] = {
+            "tcp": sorted(p for p, proto in ports if proto == "tcp"),
+            "udp": sorted(p for p, proto in ports if proto == "udp"),
+        }
     atomic_write_text(
         base_path / "ports_summary.json",
         json.dumps(ports_summary, indent=2, sort_keys=True)
@@ -595,9 +646,14 @@ def _rewrite_output_files(base_path, host_ports):
     exotic_ports = set(EXOTIC_TCP_PORTS) | set(EXOTIC_UDP_PORTS)
     exotic_hosts, exotic_lines = set(), []
     for ip, open_ports in host_ports.items():
-        for port in sorted(open_ports & exotic_ports):
+        for port, proto in sorted(open_ports):
+            if port not in exotic_ports:
+                continue
             exotic_hosts.add(ip)
-            exotic_lines.append(f"{ip}\t{port}\t{PORT_LABELS.get(port, '?')}")
+            label = PORT_LABELS.get(port, "?")
+            if proto == "udp":
+                label = f"{label} (UDP)"
+            exotic_lines.append(f"{ip}\t{port}/{proto}\t{label}")
     if exotic_lines:
         write_list(base_path / "hosts_exotic.txt", list(exotic_hosts))
         (base_path / "exotic_services.txt").write_text("\n".join(sorted(exotic_lines)) + "\n")
@@ -631,7 +687,8 @@ def masscan_scan(base_path, hosts_to_scan, tcp_ports, udp_ports, rate=5000,
         udp_ports: iterable[int] — ports UDP à scanner
         raw_name:  nom du fichier -oJ (distinct par passe pour ne pas s'écraser)
     Returns:
-        (dict[str, set[int]], bool): ({ip: {ports}}, scan_terminé_proprement)
+        (dict[str, set[tuple[int, str]]], bool): ({ip: {(port, proto)}},
+        scan_terminé_proprement)
         completed=False si masscan absent, aucun hôte, échec ou timeout
         (les hôtes ne sont alors PAS marqués scannés → re-scan au prochain run).
     """
@@ -725,7 +782,7 @@ def nmap_verify(base_path, hosts_to_verify, host_ports_in):
         return host_ports_in
 
     # ── Parse XML nmap ────────────────────────────────────────────────────────
-    nmap_ports: dict[str, set[int]] = {}
+    nmap_ports: dict[str, set[tuple[int, str]]] = {}
     import xml.etree.ElementTree as ET
     try:
         tree = ET.parse(nmap_output)
@@ -741,7 +798,8 @@ def nmap_verify(base_path, hosts_to_verify, host_ports_in):
             for port_el in host_el.findall(".//port"):
                 state_el = port_el.find("state")
                 if state_el is not None and state_el.get("state") == "open":
-                    ports_found.add(int(port_el.get("portid")))
+                    # scan -sS : que du TCP
+                    ports_found.add((int(port_el.get("portid")), "tcp"))
             if ports_found:
                 nmap_ports[ip] = ports_found
     except ET.ParseError as e:
@@ -761,7 +819,8 @@ def nmap_verify(base_path, hosts_to_verify, host_ports_in):
         new_here = ports - merged[ip]
         if new_here:
             new_ports_total += len(new_here)
-            log_ok(f"nmap ports supplémentaires sur {ip}: {sorted(new_here)}")
+            log_ok(f"nmap ports supplémentaires sur {ip}: "
+                   f"{sorted(p for p, _ in new_here)}")
         merged[ip].update(ports)
 
     log_ok(f"nmap verify: {new_hosts_total} hosts supplémentaires, {new_ports_total} ports supplémentaires")
@@ -784,7 +843,9 @@ def write_summary(base_path, target, hosts_list, host_ports, rate):
         if ips:
             categories[cat] = ips
 
-    port_counts = Counter(p for ports in (host_ports or {}).values() for p in ports)
+    port_counts = Counter(f"{p}/{proto}"
+                          for ports in (host_ports or {}).values()
+                          for p, proto in ports)
     top_ports = port_counts.most_common(15)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -918,12 +979,21 @@ Fichier de cibles (targets.txt):
     try:
         # ── ETAPE 1 — découverte (nouveaux subnets) + merge ──────────────────
         emit_progress(1, total_steps, label="ÉTAPE 1 — Découverte des hôtes")
-        discovered   = discover_hosts(new_targets)
+        discovered, covered_targets = discover_hosts(new_targets)
         merged_alive = prior_alive | discovered
         write_list(base_path / "hosts_alive.txt", list(merged_alive))
         if discovered:
             log_ok(f"{len(merged_alive)} hôtes vivants cumulés "
                    f"(+{len(discovered - prior_alive)} nouveaux)")
+        # Une cible dont la découverte a échoué/timeout n'est PAS marquée
+        # « scannée » : elle sera retentée au prochain run au lieu d'être
+        # silencieusement perdue (avant : un chunk nmap qui explosait
+        # marquait ses 8 cibles comme scannées avec 0 hôte).
+        failed_targets = sorted(set(new_targets) - covered_targets)
+        if failed_targets:
+            log_warn(f"{len(failed_targets)} cible(s) non couverte(s) par la "
+                     f"découverte — à retenter au prochain run : "
+                     f"{', '.join(failed_targets)}")
         if not merged_alive:
             log_err("Aucun host vivant (ni nouveau ni accumulé) — rien à scanner")
             sys.exit(1)
@@ -966,7 +1036,8 @@ Fichier de cibles (targets.txt):
 
         # ── Persistance de l'état ────────────────────────────────────────────
         state["rate"]                 = args.rate
-        state["targets_scanned"]      = sorted(prior_targets | set(new_targets))
+        # Seules les cibles réellement couvertes sont validées (cf. ETAPE 1).
+        state["targets_scanned"]      = sorted(prior_targets | (set(new_targets) & covered_targets))
         state["hosts_scanned"]        = sorted(scanned_now)
         state["hosts_exotic_scanned"] = sorted(exotic_now)
         state["last_phase"]           = "done"

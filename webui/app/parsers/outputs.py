@@ -308,8 +308,16 @@ def _service_inventory(base: Path, check_id: str) -> dict[str, Any]:
         ports = _jload(_find_file(base, "ports_summary.json"))
         top_ports: list[list[Any]] = []
         if isinstance(ports, dict):
-            cnt = Counter(p for plist in ports.values()
-                          if isinstance(plist, list) for p in plist)
+            # Deux formats : {ip: [ports]} (ancien) et
+            # {ip: {"tcp": [...], "udp": [...]}} (nouveau, protocole préservé).
+            flat: list[int] = []
+            for plist in ports.values():
+                if isinstance(plist, dict):
+                    flat.extend(p for k in ("tcp", "udp")
+                                for p in plist.get(k, []) if isinstance(p, int))
+                elif isinstance(plist, list):
+                    flat.extend(p for p in plist if isinstance(p, int))
+            cnt = Counter(flat)
             top_ports = [[port, n] for port, n in cnt.most_common(15)]
         inv = {
             "hosts_alive": alive,

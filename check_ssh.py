@@ -102,15 +102,24 @@ WEAK_ALGOS = {
 }
 
 def _parse_ssh_audit(output):
-    """Return list of weakness descriptions found in ssh-audit output."""
-    issues = []
+    """Parse ssh-audit output.
+
+    Retourne (weak, hardening) :
+      - weak      : les lignes (fail) = algorithme réellement cassé, et les
+                    lignes citant un algo de WEAK_ALGOS ;
+      - hardening : les lignes (warn) = recommandation de durcissement, PAS un
+                    algo cassé. Les compter comme "weak" inondait le rapport
+                    de faux positifs (ssh-audit émet des (warn) sur quasi tout
+                    serveur : en-têtes inutiles, algos faibles *optionnels*, ...).
+    """
+    weak, hardening = [], []
     for line in output.splitlines():
         lower = line.lower()
-        if "(fail)" in lower or "(warn)" in lower:
-            issues.append(line.strip())
-        elif any(algo in lower for algo in WEAK_ALGOS):
-            issues.append(line.strip())
-    return list(dict.fromkeys(issues))
+        if "(fail)" in lower or any(algo in lower for algo in WEAK_ALGOS):
+            weak.append(line.strip())
+        elif "(warn)" in lower:
+            hardening.append(line.strip())
+    return list(dict.fromkeys(weak)), list(dict.fromkeys(hardening))
 
 def step_audit(hosts, port, out_dir):
     log_step("STEP 2 — Algorithm audit (ssh-audit / nxc fallback)")
@@ -128,6 +137,7 @@ def step_audit(hosts, port, out_dir):
             return {}
 
     weak_hosts = {}
+    hardening_hosts = {}
 
     for ip in hosts:
         if has_ssh_audit:
@@ -144,12 +154,15 @@ def step_audit(hosts, port, out_dir):
         audit_file = out_dir / f"ssh_audit_{ip}.txt"
         audit_file.write_text(full_output)
 
-        issues = _parse_ssh_audit(full_output)
+        issues, hardening = _parse_ssh_audit(full_output)
         if issues:
             log_warn(f"{ip} — {len(issues)} weak algorithm(s) detected")
             weak_hosts[ip] = issues
         else:
             log_ok(f"{ip} — no obvious weak algorithms detected")
+        if hardening:
+            log_info(f"{ip} — {len(hardening)} hardening suggestion(s) (non-fatal)")
+            hardening_hosts[ip] = hardening
 
     weak_file = out_dir / "ssh_weak_algos.txt"
     weak_file.write_text("".join(
@@ -157,6 +170,13 @@ def step_audit(hosts, port, out_dir):
         for ip in sorted(weak_hosts)
     ))
     log_info(f"Weak-algo report → {weak_file}")
+
+    hardening_file = out_dir / "ssh_hardening.txt"
+    hardening_file.write_text("".join(
+        f"\n[{ip}]\n" + "".join(f"  {suggestion}\n" for suggestion in hardening_hosts[ip])
+        for ip in sorted(hardening_hosts)
+    ))
+    log_info(f"Hardening suggestions → {hardening_file}")
     return weak_hosts
 
 # ─── Step 3 – Auth methods ────────────────────────────────────────────────────
