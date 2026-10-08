@@ -7,6 +7,7 @@ from pathlib import Path
 import ipaddress
 
 from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
+                         nxc_login_ok, strip_ansi,
                          tool_exists, confirm_step, set_total_steps, enable_auto_accept)
 
 
@@ -242,9 +243,10 @@ def run_nxc_ftp(hosts_file, user, password, output_dir, label=''):
     out, err, rc = run(cmd, timeout=120)
 
     results = []
-    for line in out.splitlines():
-        # nxc marks success with [+] or "FTP" followed by success indicators
-        if '[+]' in line or 'Success' in line:
+    for line in strip_ansi(out).splitlines():
+        # Helper commun (cf. DETECTION.md) : un [+] = login valide. Évite de
+        # qualifier de succès des lignes de statut nxc sans marqueur [+].
+        if nxc_login_ok(line):
             results.append(line.strip())
 
     # Save nxc raw output

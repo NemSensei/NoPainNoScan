@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -34,6 +36,32 @@ from .registry import get_check
 
 # Terminal statuses (no further transitions expected).
 _TERMINAL = {"done", "failed", "cancelled"}
+
+# Secrets must never leave the process: not in the API responses (reachable by
+# any same-origin page) and not persisted in the SQLite DB (world-readable
+# backups, shared workstations...). The CLI run itself keeps the real values.
+_SECRET_PARAM_DESTS = {"password", "hash"}
+_REDACTED = "*****"
+
+
+def _redact_params(params: dict[str, Any]) -> dict[str, Any]:
+    """Copy of params with secret values replaced by a placeholder."""
+    return {k: (_REDACTED if k in _SECRET_PARAM_DESTS else v) for k, v in params.items()}
+
+
+def _redact_command(cmd: list[str]) -> list[str]:
+    """Copy of the argv with the value of every credential flag masked."""
+    out: list[str] = []
+    redact_next = False
+    for part in cmd:
+        if redact_next:
+            out.append(_REDACTED)
+            redact_next = False
+            continue
+        out.append(part)
+        if part in ("-p", "--password", "-H", "--hash"):
+            redact_next = True
+    return out
 
 # How many log lines to retain per job for late-subscriber replay.
 _LOG_BUFFER_MAX = 5000
@@ -102,7 +130,7 @@ class Job:
             "exit_code": self.exit_code,
             "error": self.error,
             "run_dir": self.run_dir,
-            "command": self.command,
+            "command": _redact_command(self.command),
             "log_lines": len(self.logs),
             "progress": self.progress,
         }
@@ -268,7 +296,7 @@ async def start_job(campaign_id: int, check_id: str, target: str,
         campaign_id=campaign_id,
         check_id=check_id,
         target=target,
-        params_json=json.dumps(params),
+        params_json=json.dumps(_redact_params(params)),
         output_dir=str(run_dir),
         status="queued",
     )
@@ -314,9 +342,15 @@ async def cancel_job(run_id: int) -> bool:
         return False
     if job.process is not None and job.process.returncode is None:
         try:
-            job.process.terminate()
-        except ProcessLookupError:  # pragma: no cover - already gone
-            pass
+            # The scripts spawn their own children (nxc, masscan, nmap, ...):
+            # SIGTERM to the whole process group, not just the direct child,
+            # otherwise the scanners keep running after a "successful" cancel.
+            os.killpg(os.getpgid(job.process.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):  # already gone / fallback
+            try:
+                job.process.terminate()
+            except ProcessLookupError:  # pragma: no cover - already gone
+                pass
     if job.task is not None:
         job.task.cancel()
     return True

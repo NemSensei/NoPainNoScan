@@ -43,8 +43,9 @@ def parse_targets(target_arg: str) -> list[str]:
 
     # Single IP or CIDR — expand with nmap if available
     if '/' in target_arg and tool_exists('nmap'):
-        out, _, _ = run(f"nmap -n -sL {target_arg} | awk '/Nmap scan report/{{print $NF}}'")
-        ips = [l.strip() for l in out.splitlines() if l.strip()]
+        # $NF est entre parenthèses quand nmap résout un hostname : on les retire.
+        out, _, _ = run(f"nmap -n -sL {shlex.quote(target_arg)} | awk '/Nmap scan report/{{print $NF}}'")
+        ips = [l.strip().strip('()') for l in out.splitlines() if l.strip()]
         return ips if ips else [target_arg]
 
     return [target_arg]
@@ -184,7 +185,7 @@ def build_cred_part(user: str, password: str | None, nt_hash: str | None) -> str
 def step_auth_enum(hosts: list[str], user: str, password: str | None,
                    nt_hash: str | None, domain: str, outdir: Path):
     log_step("STEP 4 — Authenticated enumeration (nxc ldap)")
-    targets = " ".join(hosts)
+    targets = " ".join(shlex.quote(h) for h in hosts)
     cred = build_cred_part(user, password, nt_hash)
 
     if not confirm_step("STEP 4 — Authenticated enumeration", f"nxc ldap {targets} -u {user} ... --users/--groups/--password-not-required/--trusted-for-delegation/--admin-count"):
@@ -193,7 +194,9 @@ def step_auth_enum(hosts: list[str], user: str, password: str | None,
     checks = [
         ("--users",                  "ldap_users.txt",       "Users"),
         ("--groups",                 "ldap_groups.txt",      "Groups"),
-        ("--password-not-required",  "ldap_no_preauth.txt",  "Accounts without preauth (AS-REP roast)"),
+        # NB : PASSWD_NOTREQD ≠ "sans préauth Kerberos" (c'est --asreproast) —
+        # ne pas diriger l'analyste vers un AS-REP roast impossible ici.
+        ("--password-not-required",  "ldap_no_preauth.txt",  "Accounts with PASSWD_NOTREQD (password optional)"),
         ("--trusted-for-delegation", "ldap_delegation.txt",  "Accounts trusted for delegation"),
         ("--admin-count",            "ldap_admin_count.txt", "Accounts with adminCount=1"),
     ]
@@ -213,26 +216,30 @@ def step_auth_enum(hosts: list[str], user: str, password: str | None,
 # ---------------------------------------------------------------------------
 
 def step_bloodhound(hosts: list[str], user: str, password: str | None,
-                    nt_hash: str | None, domain: str, outdir: Path):
+                    nt_hash: str | None, domain: str, outdir: Path,
+                    host_map: dict[str, str] | None = None):
     log_step("STEP 5 — BloodHound collection")
     if not confirm_step("STEP 5 — BloodHound collection", f"bloodhound-python -u {user} -d {domain} -ns {hosts[0]} -c All --zip"):
         return
     bh_dir = outdir / "bloodhound"
     bh_dir.mkdir(parents=True, exist_ok=True)
 
-    dc_ip = hosts[0]
+    # host_map (STEP 1) identifie les vrais DC : préférer le premier à hosts[0],
+    # qui n'est que la première cible brute du fichier.
+    dc_ip = next(iter(host_map), hosts[0]) if host_map else hosts[0]
     cred = f"--hashes {shlex.quote(nt_hash)}" if nt_hash else f"-p {shlex.quote(password or '')}"
 
     cmd = (
         f"cd {shlex.quote(str(bh_dir))} && bloodhound-python "
-        f"-u {shlex.quote(user)} {cred} -d {shlex.quote(domain)} -ns {dc_ip} -c All --zip 2>/dev/null"
+        f"-u {shlex.quote(user)} {cred} -d {shlex.quote(domain)} -ns {shlex.quote(dc_ip)} -c All --zip"
     )
     log_info(f"Running bloodhound-python against {dc_ip} ...")
-    out, _, rc = run(cmd, timeout=300)
+    out, err, rc = run(cmd, timeout=300)
     if rc == 0:
         log_ok(f"BloodHound data collected → {bh_dir}/")
     else:
-        log_warn(f"bloodhound-python exited with code {rc}. Check {bh_dir}/.")
+        # stderr = seul diagnostic utile (creds, DC injoignable, ...) : l'afficher.
+        log_warn(f"bloodhound-python exited with code {rc}: {(err or out).strip()[:300]}")
     # Save any stdout for reference
     if out.strip():
         write_file(bh_dir / "bloodhound_run.log", out)
@@ -327,7 +334,9 @@ def main():
         log_err("ldapsearch not found. Install ldap-utils (apt install ldap-utils).")
         sys.exit(1)
 
-    has_creds = bool(args.username and (args.password or args.hash))
+    # '' est un mot de passe valide en AD (comptes PASSWD_NOTREQD) : le tester
+    # avec un simple `or` faisait sauter les étapes 4-5 pour -u svc -p '' .
+    has_creds = bool(args.username and (args.password is not None or args.hash))
 
     # ---- STEP 1: rootDSE ----
     host_map = step_rootdse(hosts, outdir)
@@ -366,7 +375,7 @@ def main():
         elif not domain:
             log_warn("Domain unknown — skipping BloodHound collection.")
         else:
-            step_bloodhound(hosts, args.username, args.password, args.hash, domain, outdir)
+            step_bloodhound(hosts, args.username, args.password, args.hash, domain, outdir, host_map)
 
     # ---- Summary ----
     write_summary(outdir, hosts, vulnerable_nb, has_creds)

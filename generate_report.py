@@ -255,7 +255,9 @@ def get_criticals(d: dict) -> list[tuple[str, str, str]]:
 
     ldap = d["ldap"]
     if ldap["nullbind"]:   c.append(("LDAP",     f"{len(ldap['nullbind'])} hosts allow anonymous LDAP bind", "critical"))
-    if ldap["no_preauth"]: c.append(("LDAP",     f"{len(ldap['no_preauth'])} accounts without Kerberos pre-auth (AS-REP roastable)", "critical"))
+    # ldap_no_preauth.txt = comptes PASSWD_NOTREQD (mot de passe facultatif),
+    # PAS des comptes sans préauth Kerberos (ceux-là viennent de check_kerberos).
+    if ldap["no_preauth"]: c.append(("LDAP",     f"{len(ldap['no_preauth'])} accounts with PASSWD_NOTREQD (password optional — empty-password candidates)", "warning"))
     if ldap["delegation"]: c.append(("LDAP",     f"{len(ldap['delegation'])} accounts with unconstrained delegation", "critical"))
 
     rdp = d["rdp"]
