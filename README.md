@@ -66,7 +66,7 @@ python3 generate_report.py -d /tmp/pentest -n "Client" -o /tmp/pentest/report.ht
 | Script | Port(s) | Vérifie |
 |---|---|---|
 | `ad_recon_userless.py` | — | Découverte réseau (fping + nmap), port scan masscan, tri par service |
-| `check_smb.py` | 139/445 | Signing, SMBv1, null session, partages (R/W), SYSVOL/NETLOGON |
+| `check_smb.py` | 139/445 | Recon (hôtes joignables + hôtes où les creds passent/admin), signing, SMBv1, null session, partages R/W accessibles (hors `$`), GPP SYSVOL (`gpp_password`/`gpp_autologin`) |
 | `check_ldap.py` | 389/636/3268 | Null bind + dump anonyme, LDAP signing/channel binding (relais NTLM), pass-pol, MachineAccountQuota, délégation, adminCount, LAPS/gMSA lisibles, ADCS, descriptions, AS-REP/Kerberoast, BloodHound (`--bloodhound [DC_IP]`, 1 DC) |
 | `check_rdp.py` | 3389 | NLA, OS, test de login, screenshot |
 | `check_ssh.py` | 22 | Bannière, algos faibles, méthodes d'auth, test creds |
@@ -104,7 +104,7 @@ sudo python3 ad_recon_userless.py -t 10.10.0.0/24 -o /tmp/pentest [--verify]
 sudo python3 ad_recon_userless.py -t targets.txt  -o /tmp/pentest [--fresh]
 ```
 
-Étapes : **fping** (ICMP) ‖ **nmap** (TCP SYN ping, détecte les hosts filtrant l'ICMP) — lancés **en parallèle par chunks de cibles** pour tenir un gros scope — → **masscan** (ports AD/services + UDP SNMP/IPMI, `--wait` court) → **nmap `--verify`** (optionnel, double-check TCP). Produit `hosts_alive.txt`, un `hosts_<service>.txt` par service, `port_<n>.txt`, `ports_summary.json`, `summary.txt`.
+Étapes : **fping** (ICMP) ‖ **nmap** (TCP SYN ping, détecte les hosts filtrant l'ICMP) — lancés **en parallèle par chunks de cibles** pour tenir un gros scope — → **masscan** (ports AD/services + UDP SNMP/IPMI, `--wait` court) → **nmap `--verify`** (optionnel, double-check TCP). Le protocole (TCP/UDP) est conservé, donc un `161/tcp` ne remonte pas comme SNMP. Produit `hosts_alive.txt`, un `hosts_<service>.txt` par service, `port_<n>.txt` (+ `port_<n>_udp.txt` pour l'UDP), `ports_summary.json` (`{ip: {"tcp": [...], "udp": [...]}}`), `summary.txt`.
 
 **Relançable / incrémental** (pensé pour des subnets découverts progressivement) :
 
@@ -113,7 +113,7 @@ sudo python3 ad_recon_userless.py -t targets.txt  -o /tmp/pentest [--fresh]
 - L'état est persisté dans `state.json` ; une interruption (Ctrl-C) ou un masscan tronqué **reprend proprement** au run suivant.
 - `--fresh` ignore l'état et rescanne tout.
 - `--exotic` ajoute une passe d'enrichissement sur les hôtes vivants : services à forte valeur hors AD (bases de données, web sur ports exotiques, VNC, NFS, conteneurs/k8s, mail, imprimantes, NetBIOS/mDNS UDP, quelques ports OT/ICS) → `hosts_exotic.txt` + `exotic_services.txt` (IP, port, service).
-- Le `targets.txt` accepte IP / CIDR / plage `a.b.c.d-e` ; les lignes invalides sont ignorées avec un avertissement.
+- Le `targets.txt` accepte IP / CIDR / plage `a.b.c.d-e` **IPv4** (notation netmask normalisée) ; l'IPv6 et les lignes invalides (octets > 255, plages inversées) sont ignorés avec un avertissement.
 
 | Flag | Rôle |
 |---|---|
@@ -156,7 +156,7 @@ NoPainNoScan/
 ├── ad_recon_userless.py   # Phase 0 — découverte + port scan
 ├── check_*.py             # 12 checks par service
 ├── generate_report.py     # Rapport HTML
-├── npns_common.py         # Plomberie partagée (couleurs, logs, étapes)
+├── npns_common.py         # Plomberie partagée (couleurs, logs, étapes, helpers nxc)
 ├── _npns_progress.py      # Émission de progression (barre UI web)
 └── webui/                 # Interface web (FastAPI, optionnelle)
 ```
