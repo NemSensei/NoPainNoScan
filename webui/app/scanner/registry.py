@@ -287,6 +287,8 @@ REGISTRY: dict[str, CheckDefinition] = {
                           default="anonymous", help="Username for credential test"),
             CheckArgument(name="--password", short="-p", dest="password", type="str",
                           default="anonymous@", help="Password for credential test"),
+            CheckArgument(name="--port", dest="port", type="int", default=21,
+                          help="FTP port (default 21)"),
         ],
     ),
 

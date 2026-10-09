@@ -63,18 +63,21 @@ def parse_targets(target_arg):
 
 
 def cidr_from_ip(ip):
-    """Derive /24 network from a single IP string."""
-    parts = ip.split('.')
-    return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+    """Derive the containing /24 (IPv4) or /64 (IPv6) from an IP string."""
+    net = ipaddress.ip_network(f"{ip}/24" if ":" not in ip else f"{ip}/64",
+                               strict=False)
+    return str(net)
 
 
 # ---------------------------------------------------------------------------
 # STEP 1 — SOA detection
 # ---------------------------------------------------------------------------
 
+# NB : pas de TLD seuls ("net", "org") — ils généraient des AXFR contre la
+# racine DNS publique via le résolveur, pur bruit.
 COMMON_DOMAINS = [
     "corp", "local", "lan", "internal", "intranet", "domain",
-    "ad", "home", "office", "net", "org",
+    "ad", "home", "office", "corp.local", "internal.local",
 ]
 
 _SOA_RE = re.compile(r'\bSOA\b', re.IGNORECASE)
@@ -103,7 +106,7 @@ def detect_domain_from_soa(output):
     return None
 
 
-def step_soa(servers, guessed_domains, outdir):
+def step_soa(servers, guessed_domains, outdir, args_port=53):
     """Query SOA records to auto-detect the AD domain."""
     log_step("STEP 1 — SOA / Domain Detection")
     if not confirm_step("STEP 1 — SOA / Domain Detection", f"dig SOA <domain> @<ip>  (x{len(servers)} server(s))"):
@@ -117,7 +120,7 @@ def step_soa(servers, guessed_domains, outdir):
 
         # Try well-known domain guesses first
         for dom in guessed_domains:
-            out, _, rc = run(f"dig SOA {shlex.quote(dom)} @{shlex.quote(ip)} +time=5 +tries=1", timeout=10)
+            out, _, rc = run(f"dig SOA {shlex.quote(dom)} @{shlex.quote(ip)} -p {args_port} +time=5 +tries=1", timeout=10)
             if out and _SOA_RE.search(out):
                 d = detect_domain_from_soa(out)
                 if d:
@@ -126,17 +129,17 @@ def step_soa(servers, guessed_domains, outdir):
                 soa_lines.append(f"# {ip} — SOA {dom}\n{out}")
 
         # Generic root query
-        out, _, rc = run(f"dig +short -t SOA . @{shlex.quote(ip)} +time=5 +tries=1", timeout=10)
+        out, _, rc = run(f"dig +short -t SOA . @{shlex.quote(ip)} -p {args_port} +time=5 +tries=1", timeout=10)
         if out.strip():
             soa_lines.append(f"# {ip} — SOA .\n{out}")
 
         # NS root query
-        out, _, _ = run(f"dig @{shlex.quote(ip)} -t NS . +time=5 +tries=1", timeout=10)
+        out, _, _ = run(f"dig @{shlex.quote(ip)} -t NS . -p {args_port} +time=5 +tries=1", timeout=10)
         if out.strip():
             soa_lines.append(f"# {ip} — NS .\n{out}")
 
         # _msdcs hint
-        out, _, _ = run(f"dig @{shlex.quote(ip)} -t ANY _msdcs +time=5 +tries=1", timeout=10)
+        out, _, _ = run(f"dig @{shlex.quote(ip)} -t ANY _msdcs -p {args_port} +time=5 +tries=1", timeout=10)
         if out.strip() and 'ANSWER' in out:
             soa_lines.append(f"# {ip} — _msdcs\n{out}")
             d = detect_domain_from_soa(out)
@@ -159,7 +162,7 @@ def step_soa(servers, guessed_domains, outdir):
 # STEP 2 — AXFR zone transfer
 # ---------------------------------------------------------------------------
 
-def step_axfr(servers, domains, outdir):
+def step_axfr(servers, domains, outdir, args_port=53):
     """Attempt DNS zone transfer for each server/domain pair."""
     log_step("STEP 2 — Zone Transfer (AXFR)")
     if not confirm_step("STEP 2 — Zone Transfer (AXFR)", f"dig axfr <domain> @<ip>  (x{len(servers)} server(s) x {len(domains)} domain(s))"):
@@ -172,10 +175,13 @@ def step_axfr(servers, domains, outdir):
 
     for ip in servers:
         for domain in domains:
+            # One log line per (ip, domain) — the trailing-dot variant is an
+            # implementation detail, doubling these logs was just noise.
+            log_info(f"AXFR {domain} @{ip}")
+            transferred = False
             for dom_variant in [domain, domain + '.']:
-                log_info(f"AXFR {dom_variant} @{ip}")
-                out, err, rc = run(f"dig axfr {shlex.quote(dom_variant)} @{shlex.quote(ip)} +time=10 +tries=1", timeout=30)
-                if out and ('Transfer failed' not in out) and ('AXFR' in out or '; <<>> DiG' in out):
+                out, err, rc = run(f"dig axfr {shlex.quote(dom_variant)} @{shlex.quote(ip)} -p {args_port} +time=10 +tries=1", timeout=30)
+                if out and ('Transfer failed' not in out):
                     # Check there are actual records (not just SOA / error)
                     record_lines = [l for l in out.splitlines()
                                     if l.strip() and not l.startswith(';') and '\tIN\t' in l]
@@ -185,9 +191,10 @@ def step_axfr(servers, domains, outdir):
                         fname.write_text(out)
                         log_ok(f"  [CRITICAL] AXFR SUCCESS: {ip} → {domain} ({len(record_lines)} records)")
                         success_lines.append(f"[CRITICAL] {ip} — {domain} — {len(record_lines)} records — {fname}")
+                        transferred = True
                         break  # no need to try trailing dot variant
-                else:
-                    log_warn(f"  AXFR refused/failed for {domain} @{ip}")
+            if not transferred:
+                log_warn(f"  AXFR refused/failed for {domain} @{ip}")
 
     axfr_path = outdir / "dns_axfr_success.txt"
     if success_lines:
@@ -216,7 +223,7 @@ COMMON_NAMES = [
 ]
 
 
-def step_enum_hosts(servers, domains, outdir):
+def step_enum_hosts(servers, domains, outdir, args_port=53):
     """Try common AD/Windows hostnames against each DNS server."""
     log_step("STEP 3 — Common Subdomain Enumeration")
     if not confirm_step("STEP 3 — Common Subdomain Enumeration", f"dig +short <name>.<domain> @<ip>  ({len(COMMON_NAMES)} names x {len(servers)} server(s) x {len(domains)} domain(s))"):
@@ -228,7 +235,7 @@ def step_enum_hosts(servers, domains, outdir):
         for domain in domains:
             for name in COMMON_NAMES:
                 fqdn = f"{name}.{domain}"
-                out, _, rc = run(f"dig +short {shlex.quote(fqdn)} @{shlex.quote(ip)} +time=5 +tries=1", timeout=10)
+                out, _, rc = run(f"dig +short {shlex.quote(fqdn)} @{shlex.quote(ip)} -p {args_port} +time=5 +tries=1", timeout=10)
                 result = out.strip()
                 if result and not result.startswith(';'):
                     for addr in result.splitlines():
@@ -256,7 +263,7 @@ def step_enum_hosts(servers, domains, outdir):
 MAX_REVERSE_HOSTS = 256  # hard limit to avoid sweeping /16 etc.
 
 
-def step_reverse(servers, target_range, outdir):
+def step_reverse(servers, target_range, outdir, args_port=53):
     """PTR lookup sweep over target_range using first DNS server."""
     log_step("STEP 4 — Reverse Lookup Sweep")
 
@@ -292,7 +299,7 @@ def step_reverse(servers, target_range, outdir):
     ptr_map = {}  # ip → hostname
     for host in host_list:
         ip_str = str(host)
-        out, _, _ = run(f"dig +short -x {shlex.quote(ip_str)} @{shlex.quote(dns_server)} +time=3 +tries=1", timeout=8)
+        out, _, _ = run(f"dig +short -x {shlex.quote(ip_str)} @{shlex.quote(dns_server)} -p {args_port} +time=3 +tries=1", timeout=8)
         result = out.strip().rstrip('.')
         if result and not result.startswith(';'):
             ptr_map[ip_str] = result
@@ -385,6 +392,8 @@ Examples:
     p.add_argument("-d", "--domain", action="append", dest="domains",
                    metavar="DOMAIN",
                    help="Domain to attempt AXFR on (can be specified multiple times)")
+    p.add_argument("--port", type=int, default=53,
+                   help="DNS server port (default: 53)")
     p.add_argument("--range",
                    help="IP range for reverse lookup (e.g. 192.168.1.0/24)")
     p.add_argument("-y", "--yes", action="store_true",
@@ -429,7 +438,7 @@ def main():
         reverse_range = cidr_from_ip(servers[0])
 
     # Run steps
-    detected_domains = step_soa(servers, candidate_domains, outdir)
+    detected_domains = step_soa(servers, candidate_domains, outdir, args.port)
 
     # Merge user-supplied + auto-detected; fall back to common guesses if nothing found
     all_domains = list(dict.fromkeys(user_domains + detected_domains))
@@ -437,9 +446,9 @@ def main():
         log_warn("No domain detected; falling back to common domain guesses for AXFR/enum")
         all_domains = COMMON_DOMAINS[:6]  # keep it short
 
-    axfr_successes = step_axfr(servers, all_domains, outdir)
-    enum_hosts = step_enum_hosts(servers, all_domains, outdir)
-    ptr_map = step_reverse(servers, reverse_range, outdir)
+    axfr_successes = step_axfr(servers, all_domains, outdir, args.port)
+    enum_hosts = step_enum_hosts(servers, all_domains, outdir, args.port)
+    ptr_map = step_reverse(servers, reverse_range, outdir, args.port)
 
     write_summary(outdir, servers, detected_domains, axfr_successes, enum_hosts, ptr_map, args)
 

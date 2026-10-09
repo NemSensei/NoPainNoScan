@@ -61,11 +61,11 @@ def _expand_target(s):
 # STEP 1 — Banner grab
 # ---------------------------------------------------------------------------
 
-def grab_banner(ip, timeout=10):
+def grab_banner(ip, timeout=10, port=21):
     """Return (banner_str, ftp_obj_connected_not_logged_in) or (None, None)."""
     try:
         ftp = ftplib.FTP(timeout=timeout)
-        ftp.connect(ip, 21, timeout=timeout)
+        ftp.connect(ip, port, timeout=timeout)
         banner = ftp.getwelcome()
         return banner, ftp
     except Exception as e:
@@ -93,12 +93,12 @@ def try_login(ftp, user, password):
         return False
 
 
-def test_anonymous_login(ip, timeout=10):
+def test_anonymous_login(ip, timeout=10, port=21):
     """Try all anonymous credential variants. Returns (success, cred_tuple, ftp) or (False, None, None)."""
     for user, pwd in ANON_CREDS:
         try:
             ftp = ftplib.FTP(timeout=timeout)
-            ftp.connect(ip, 21, timeout=timeout)
+            ftp.connect(ip, port, timeout=timeout)
             if try_login(ftp, user, pwd):
                 return True, (user, pwd), ftp
             ftp.close()
@@ -107,11 +107,11 @@ def test_anonymous_login(ip, timeout=10):
     return False, None, None
 
 
-def test_custom_login(ip, user, password, timeout=10):
+def test_custom_login(ip, user, password, timeout=10, port=21):
     """Try a specific credential pair. Returns (success, ftp) or (False, None)."""
     try:
         ftp = ftplib.FTP(timeout=timeout)
-        ftp.connect(ip, 21, timeout=timeout)
+        ftp.connect(ip, port, timeout=timeout)
         if try_login(ftp, user, password):
             return True, ftp
         ftp.close()
@@ -125,7 +125,10 @@ def test_custom_login(ip, user, password, timeout=10):
 # ---------------------------------------------------------------------------
 
 INTERESTING_EXTENSIONS = {
-    '.conf', '.config', '.txt', '.log', '.bak', '.key',
+    # Pas de '.txt' : tout serveur FTP a un README.txt/license.txt → le flag
+    # INTERESTING perdait toute valeur (bruit). Les vrais fichiers à creds/
+    # secrets (.conf, .bak, .key, ...) suffisent.
+    '.conf', '.config', '.log', '.bak', '.key',
     '.pem', '.db', '.sql', '.xlsx', '.docx', '.pdf',
 }
 
@@ -282,6 +285,8 @@ def main():
                         help='Username for credential test (default: anonymous)')
     parser.add_argument('-p', '--password', default='anonymous@',
                         help='Password for credential test (default: anonymous@)')
+    parser.add_argument('--port', type=int, default=21,
+                        help='FTP port (default: 21)')
     parser.add_argument("-y", "--yes", action="store_true",
                         help="Non-interactive: accept all steps (for automation/UI)")
     args = parser.parse_args()
@@ -318,8 +323,8 @@ def main():
         log_ok(f"Results saved to: {output_dir.resolve()}")
         sys.exit(0)
     for ip in targets:
-        log_info(f"Connecting to {ip}:21...")
-        banner, ftp = grab_banner(ip)
+        log_info(f"Connecting to {ip}:{args.port}...")
+        banner, ftp = grab_banner(ip, port=args.port)
         if banner:
             banners[ip] = banner
             log_ok(f"  {ip} → {banner[:120]}")
@@ -354,7 +359,7 @@ def main():
         )
         for ip in banners:
             log_info(f"Testing anonymous login on {ip}...")
-            success, cred, ftp = test_anonymous_login(ip)
+            success, cred, ftp = test_anonymous_login(ip, port=args.port)
             if success:
                 log_ok(f"  [CRITICAL] {ip} — anonymous login OK (user='{cred[0]}', pass='{cred[1]}')")
                 anon_success.append((ip, cred[0], cred[1]))
@@ -462,7 +467,7 @@ def main():
     if step4_ok and use_custom_creds and not tool_exists('nxc'):
         log_info(f"Testing custom credentials {args.username}:*** via ftplib...")
         for ip in banners:
-            success, ftp = test_custom_login(ip, args.username, args.password)
+            success, ftp = test_custom_login(ip, args.username, args.password, port=args.port)
             if success:
                 log_ok(f"  [+] Custom creds worked on {ip}")
                 custom_success.append(ip)
@@ -471,8 +476,10 @@ def main():
                 except Exception:
                     pass
 
-    # Write custom login results
-    if use_custom_creds:
+    # Write custom login results — le fichier est TOUJOURS écrit : le rapport
+    # final (generate_report) teste sa présence, et un fichier manquant après
+    # un skip passait pour un scan qui n'a jamais tourné.
+    if use_custom_creds and step4_ok:
         with (output_dir / 'ftp_login_success.txt').open('w') as f:
             f.write(f"# FTP Login Success (user={args.username}) — {datetime.now()}\n\n")
             if custom_success:
@@ -480,6 +487,10 @@ def main():
                     f.write(f"{ip}\tuser={args.username}\n")
             else:
                 f.write("# No successful logins with provided credentials\n")
+    else:
+        reason = ("no credentials provided" if not use_custom_creds
+                  else "skipped by user request")
+        (output_dir / 'ftp_login_success.txt').write_text(f"# {reason}\n")
 
     # -----------------------------------------------------------------------
     # Summary

@@ -86,12 +86,28 @@ def read_any(base: Path, *names: str) -> list[str]:
 
 
 def merge_ports_summary(base: Path) -> dict:
-    """Fusionne tous les ports_summary.json trouvés → {ip: set(ports)}."""
+    """Fusionne tous les ports_summary.json trouvés → {ip: set(ports)}.
+
+    Deux formats de fichier gérés : {ip: [161, 445]} (ancien, protocole non
+    précisé) et {ip: {"tcp": [...], "udp": [...]}} (nouveau). Le protocole est
+    ignoré ici (les top ports sont comptés par numéro, tcp et udp confondus).
+    """
     merged: dict = {}
     for p in sorted(base.rglob("ports_summary.json")):
-        data = jload(p) or {}
+        data = jload(p)
+        if not isinstance(data, dict):
+            continue
         for ip, ports in data.items():
-            merged.setdefault(ip, set()).update(ports)
+            if isinstance(ports, dict):
+                # nouveau format : {"tcp": [...], "udp": [...]}
+                all_ports = list(ports.get("tcp", [])) + list(ports.get("udp", []))
+            elif isinstance(ports, (list, set)):
+                all_ports = list(ports)
+            else:
+                continue  # un JSON valide mais pas {ip: [ports]} ne doit pas
+                          # injecter de pseudo-ports (caractères d'une string, ...)
+            merged.setdefault(ip, set()).update(
+                int(x) for x in all_ports if isinstance(x, int))
     return merged
 
 

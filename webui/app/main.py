@@ -30,19 +30,27 @@ app = FastAPI(title="NoPainNoScan Web UI", version="0.1.0")
 # while the UI runs is enough for DNS rebinding to become same-origin: the
 # page could then launch scans (POST /api/runs) and read the findings.
 # Rejecting every Host other than the loopback endpoints breaks that vector.
-_ALLOWED_HOSTS = {
-    f"127.0.0.1:{PORT}",
-    f"localhost:{PORT}",
-    f"[::1]:{PORT}",
-    "127.0.0.1",   # Host header without port (HTTP/1.0 style requests)
-    "localhost",
-}
+# Only the host part matters (the UI legitimately runs on any local port):
+# a rebound domain would show up as "attacker.tld" here, which is what we
+# must refuse. Loopback names/IPs are always allowed.
+_ALLOWED_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
+
+
+def _host_is_loopback(host_header: str) -> bool:
+    """True si le header Host désigne la boucle locale, quel qu'en soit le port."""
+    if host_header.startswith("["):          # IPv6 bracketée : [::1]:8000
+        host = host_header.split("]", 1)[0][1:]
+    elif host_header.count(":") == 1:        # host:port
+        host = host_header.rsplit(":", 1)[0]
+    else:
+        host = host_header
+    return host in _ALLOWED_HOSTNAMES
 
 
 @app.middleware("http")
 async def _host_allowlist(request: Request, call_next):
     host = request.headers.get("host", "")
-    if host and host not in _ALLOWED_HOSTS:
+    if host and not _host_is_loopback(host):
         return JSONResponse(
             {"detail": f"Refused Host header '{host}' — this UI is local-only"},
             status_code=403,

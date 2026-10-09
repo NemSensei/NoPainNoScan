@@ -7,7 +7,7 @@ from pathlib import Path
 
 from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
                          tool_exists, confirm_step, set_total_steps, enable_auto_accept,
-                         emit_progress)
+                         emit_progress, timed_out)
 
 
 set_total_steps(3)
@@ -90,7 +90,9 @@ def brute_onesixtyone(hosts, communities, versions):
     found = {}
     log_info(f"Running onesixtyone against {len(hosts)} host(s) with {len(communities)} community string(s)...")
     out, err, rc = run(f"onesixtyone -c {shlex.quote(comm_file)} -i {shlex.quote(hosts_file)}", timeout=120)
-    if rc != 0 and not out:
+    if timed_out(err):
+        log_warn("onesixtyone timed out — results incomplete, hosts may be missing")
+    elif rc != 0 and not out:
         log_warn(f"onesixtyone returned code {rc}: {err.strip()}")
         return found
 
@@ -112,7 +114,8 @@ def brute_onesixtyone(hosts, communities, versions):
 def brute_snmpwalk(ip, communities, versions):
     """Fallback: try each community with snmpwalk.
 
-    Returns list of working community strings.
+    Returns list of (community, version) pairs — la version effectivement
+    validée est conservée pour ne pas la re-deviner à l'énumération.
     """
     working = []
     ver_list = [v.strip() for v in versions.split(",")]
@@ -123,21 +126,41 @@ def brute_snmpwalk(ip, communities, versions):
                 timeout=10
             )
             if out.strip() and "No Such Object" not in out and "Timeout" not in out:
-                if comm not in working:
-                    working.append(comm)
+                working.append((comm, ver))
                 break  # no need to test other versions for this community
     return working
 
 
-def enumerate_host(ip, community, version, output_dir):
+def resolve_version(ip, community, versions):
+    """Détermine la version SNMP qui marche réellement pour (ip, community).
+
+    Teste chaque version candidate avec un walk `system` court et retourne la
+    première qui répond. Avant, enumerate_* prenait `version.split(",")[0]` —
+    soit TOUJOURS "1" (ou "2c") même si l'agent ne répond qu'en v2c/v3 → tous
+    les walks timeout → fichiers vides, faux négatif total.
+    En dernier recours (rien ne répond), retourne la première candidate.
+    """
+    ver_list = [v.strip() for v in versions.split(",") if v.strip()]
+    for ver in ver_list:
+        out, err, _ = run(
+            f"snmpwalk -v{shlex.quote(ver)} -c {shlex.quote(community)} {shlex.quote(ip)} sysName.0 2>/dev/null",
+            timeout=10
+        )
+        if out.strip() and "Timeout" not in out:
+            return ver
+    return ver_list[0] if ver_list else "2c"
+
+
+def enumerate_host(ip, community, ver, output_dir):
     """Run full SNMP walk for a host and save to file.
+
+    `ver` = version SNMP validée pour ce couple (ip, community) — voir
+    resolve_version().
 
     Returns dict with parsed sysDescr and sysName.
     """
     outfile = output_dir / f"snmp_data_{ip}.txt"
     info = {"ip": ip, "community": community, "sysDescr": "", "sysName": "", "interfaces": []}
-
-    ver = version.split(",")[0].strip()   # use first version that worked
 
     lines_collected = []
 
@@ -161,9 +184,8 @@ def enumerate_host(ip, community, version, output_dir):
     return info
 
 
-def enumerate_windows(ip, community, version, output_dir):
-    """Enumerate Windows-specific SNMP OIDs."""
-    ver = version.split(",")[0].strip()
+def enumerate_windows(ip, community, ver, output_dir):
+    """Enumerate Windows-specific SNMP OIDs (ver = version validée)."""
     results = []
 
     for label in ("win_users", "win_shares"):
@@ -256,22 +278,30 @@ Examples:
             log_info(f"  Trying snmpwalk on {ip}...")
             working = brute_snmpwalk(ip, communities, args.version)
             if working:
-                accessible[ip] = working
+                accessible[ip] = [comm for comm, _ in working]
 
     if accessible:
         log_ok(f"Found {len(accessible)} accessible host(s).")
     else:
         log_warn("No hosts responded to SNMP community probes.")
 
+    # Résout la version SNMP qui marche RÉELLEMENT par hôte (première
+    # community de chaque). Sans ça l'énumération utilise la 1re version de
+    # --version en dur et peut timeout sur 100% des requêtes (faux négatif).
+    access = {}   # {ip: (community, version)}
+    for ip in sorted(accessible):
+        comm = accessible[ip][0]
+        access[ip] = (comm, resolve_version(ip, comm, args.version))
+
     # Write snmp_accessible.txt
     accessible_file = out_dir / "snmp_accessible.txt"
     with accessible_file.open("w") as f:
         f.write("# SNMP Accessible Hosts\n")
         f.write(f"# Generated: {datetime.now().isoformat()}\n\n")
-        for ip in sorted(accessible):
-            for comm in accessible[ip]:
-                f.write(f"{ip}\t{comm}\n")
-                log_ok(f"  ACCESSIBLE: {ip}  community={comm}")
+        for ip in sorted(access):
+            comm, ver = access[ip]
+            f.write(f"{ip}\t{comm}\t{ver}\n")
+            log_ok(f"  ACCESSIBLE: {ip}  community={comm}  version={ver}")
     log_info(f"Accessible hosts written to {accessible_file}")
 
     if not accessible:
@@ -288,25 +318,25 @@ Examples:
 
     summary_entries = []
 
-    if confirm_step("STEP 2 — System enumeration", f"snmpwalk against system/interfaces/processes/software/storage OIDs  (x{len(accessible)} accessible host(s))"):
-        for ip in sorted(accessible):
-            community = accessible[ip][0]   # use first working community
-            log_info(f"Enumerating {ip} (community={community})...")
-            info = enumerate_host(ip, community, args.version, out_dir)
+    if confirm_step("STEP 2 — System enumeration", f"snmpwalk against system/interfaces/processes/software/storage OIDs  (x{len(access)} accessible host(s))"):
+        for ip in sorted(access):
+            community, ver = access[ip]
+            log_info(f"Enumerating {ip} (community={community}, version={ver})...")
+            info = enumerate_host(ip, community, ver, out_dir)
             summary_entries.append(info)
     else:
-        for ip in sorted(accessible):
-            summary_entries.append({"ip": ip, "community": accessible[ip][0], "sysDescr": "", "sysName": ""})
+        for ip in sorted(access):
+            summary_entries.append({"ip": ip, "community": access[ip][0], "sysDescr": "", "sysName": ""})
 
     # ================================================================
     log_step("STEP 3 — Windows user/share enumeration")
     # ================================================================
 
-    if confirm_step("STEP 3 — Windows user/share enumeration", f"snmpwalk against Windows-specific OIDs (users/shares)  (x{len(accessible)} accessible host(s))"):
-        for ip in sorted(accessible):
-            community = accessible[ip][0]
+    if confirm_step("STEP 3 — Windows user/share enumeration", f"snmpwalk against Windows-specific OIDs (users/shares)  (x{len(access)} accessible host(s))"):
+        for ip in sorted(access):
+            community, ver = access[ip]
             log_info(f"Checking Windows SNMP OIDs on {ip}...")
-            enumerate_windows(ip, community, args.version, out_dir)
+            enumerate_windows(ip, community, ver, out_dir)
 
     # ================================================================
     # Summary file
