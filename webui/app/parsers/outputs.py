@@ -135,12 +135,17 @@ _FINDING_SPECS: dict[str, list[tuple[str, str, str, str]]] = {
          "Write access to a share (payload drop / data tampering)"),
         ("smb_shares_null.txt",  "Null-session share access",   "medium",
          "Shares listable/readable without authentication"),
-        ("sysvol_files.txt",     "Sensitive SYSVOL/NETLOGON file", "medium",
-         "Potential secrets in SYSVOL/NETLOGON (e.g. GPP cpassword)"),
-        ("smb_spider.txt",       "Interesting file (share spider)", "medium",
-         "Interesting file discovered while spidering shares"),
         ("smb_shares_read.txt",  "Readable SMB share",          "info",
          "Authenticated read access to a share"),
+    ],
+    # DC (check_dc.py) — SYSVOL/NETLOGON content, migrated out of SMB.
+    "dc": [
+        ("dc_gpp.txt",           "GPP credentials in SYSVOL",   "critical",
+         "cpassword/autologin in SYSVOL - cleartext/decryptable (MS14-025)"),
+        ("dc_sysvol_creds.txt",  "SYSVOL/NETLOGON script creds","high",
+         "High-confidence credential pattern in a SYSVOL/NETLOGON script"),
+        ("dc_sysvol_hints.txt",  "SYSVOL/NETLOGON line to review","low",
+         "Lower-confidence credential mention - manual review (Tier 2)"),
     ],
     "ldap": [
         ("ldap_nullbind.txt",    "Anonymous LDAP bind",         "high",
@@ -247,6 +252,7 @@ _FINDING_SPECS: dict[str, list[tuple[str, str, str, str]]] = {
 _MARKER_FILES: dict[str, list[str]] = {
     "discovery": ["hosts_alive.txt", "ports_summary.json"],
     "smb":       ["smb_hosts_info.txt", "smb_summary.txt"],
+    "dc":        ["dc_summary.txt", "dc_gpp.txt", "dc_sysvol_files.txt"],
     "ldap":      ["ldap_domain_info.txt", "ldap_summary.txt", "ldap_users.txt"],
     "rdp":       ["rdp_results.txt", "rdp_summary.txt"],
     "ssh":       ["ssh_banners.txt", "ssh_summary.txt"],

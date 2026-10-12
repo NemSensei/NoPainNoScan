@@ -71,8 +71,9 @@ Centralisée dans [`npns_common.py`](npns_common.py) :
 > **Corrigé** : `403` ne déclenche plus (un portail d'auth global renvoie 401/403 partout ≠ ADCS) ; `/adcs/` (pas un chemin ADCS par défaut) retiré. 401 = enrôlement NTLM = signal ESC8 fort.
 
 ### SMB — [`check_smb.py`](check_smb.py)
-Flux : **1. recon** → **2. null session** → **3. shares** → **4. GPP**. Les steps 3 et 4
-ne ciblent que les hôtes où l'auth réussit (reco step 1) → bien plus rapide sur gros scope.
+Flux : **1. recon** → **2. null session** → **3. shares**. Le step 3 ne cible que les
+hôtes où l'auth réussit (reco step 1) → bien plus rapide sur gros scope. Le contenu
+SYSVOL/NETLOGON (GPP + fichiers intéressants) est **migré dans [`check_dc.py`](check_dc.py)**.
 
 | Finding | Critère | Fichier | Crit. |
 |---|---|---|---|
@@ -84,9 +85,22 @@ ne ciblent que les hôtes où l'auth réussit (reco step 1) → bien plus rapide
 | Partage inscriptible | share `READ,WRITE`/`WRITE` (hors `$`) | `smb_shares_write.txt` | 🔴 |
 | Shares accessibles (R/W) | tout share non-`$` avec READ/WRITE (creds) | `smb_shares_accessible.txt` | ⚠️ |
 | Null session | partages via session nulle | `smb_shares_null.txt` | ⚠️ |
-| Creds GPP (SYSVOL) | `-M gpp_password`/`-M gpp_autologin` → ligne cred (hors négatives) | `sysvol_gpp.txt` (brut: `sysvol_gpp_raw.txt`) | 🔴 |
 
-> Pas de faux positif admin (ne s'appuie pas sur `(Pwn3d!)` pour les shares). STEP 1-4 nettoient l'ANSI (`strip_ansi`) avant parsing et **excluent les partages `$`** des fichiers shares. Robustesse gros scope : `run_nxc()` redirige vers fichier, **tue le groupe de processus sur timeout et conserve la sortie partielle** (fini le « plus rien ne remonte »), timeouts scalés sur le nb d'hôtes, `--threads` transmis (défaut 100). **Spidering retiré volontairement** (`--spider` SYSVOL/NETLOGON + `-M spider_plus`) — trop bruyant ; GPP couvre les secrets SYSVOL, le reste se fait à la main. **⚠ Reste** : regex null-session fixée (plus de mauvais classement `READ,WRITE`).
+> Pas de faux positif admin (ne s'appuie pas sur `(Pwn3d!)` pour les shares). STEP 1-3 nettoient l'ANSI (`strip_ansi`) avant parsing et **excluent les partages `$`** des fichiers shares. Robustesse gros scope : `run_nxc()` redirige vers fichier, **tue le groupe de processus sur timeout et conserve la sortie partielle**, timeouts scalés sur le nb d'hôtes, `--threads` transmis (défaut 100).
+
+### DC (SYSVOL / NETLOGON) — [`check_dc.py`](check_dc.py)
+Script dédié DC. **Nécessite des creds** (SYSVOL/NETLOGON = lecture authentifiée).
+Flux : **1. GPP** (nxc, sweep multi-hôtes) → **2. fichiers intéressants** (téléchargement
+tar via `smbclient` sur **un seul DC** — partages répliqués — puis analyse locale).
+
+| Finding | Critère | Fichier | Crit. |
+|---|---|---|---|
+| Creds GPP (SYSVOL) | `-M gpp_password`/`-M gpp_autologin` → ligne cred (hors négatives) | `dc_gpp.txt` (brut: `dc_gpp_raw.txt`) | 🔴 |
+| Creds dans scripts SYSVOL/NETLOGON (Tier 1) | motif haute confiance (password=…, net use …, psexec -p, schtasks /rp, cmdkey, connectionstring, ConvertTo-SecureString, api_key, `$cred=…password`) sur une extension ciblée, hors exclusions | `dc_sysvol_creds.txt` | 🔴 |
+| Lignes à revoir (Tier 2) | mention plus faible (`<password>`, `passwd`, `password`, `credential`, `secret/token=`) hors exclusions | `dc_sysvol_hints.txt` | ⚠️ |
+| Fichiers analysés | inventaire des fichiers d'extension ciblée lus | `dc_sysvol_files.txt` | ℹ️ |
+
+> Critères inspirés d'**adPEAS / Snaffler**. Extensions scannées : `.txt .bat .ini .conf .cnf .cmd .vbs .vbe .kix .ps1 .psm1` (les `.xml` GPP sont couverts par le step 1). **Exclusions anti-faux-positifs** : doc de politique de mot de passe (`password policy/length/complexity/must be…`), commentaires (`REM`/`::`/`#`/`'`), `usage:`/`echo … help`, prompts (`Enter your password`), valeurs masquées (`password: ****`/`<…>`). Le tar est parcouru **en mémoire** (pas d'extraction disque — archive de la cible non fiable). Secrets **redacted** dans les logs/UI. GPP reprend la logique anti-faux-positif migrée de SMB (`_GPP_FINDING_RE`/`_GPP_NEGATIVE_RE` : payoffs `Found credentials in`/`Usernames:`/`Passwords:`/`cpassword`/`autologin`, jamais la ligne d'auth nxc). `.vbe` encodé **non décodé** (limite connue).
 
 ### LDAP — [`check_ldap.py`](check_ldap.py)
 Flux : **1. rootDSE** (identifie les vrais DC) → **2. signing/channel binding** → **3. null bind + dump anonyme** → **4. énum authentifiée (nxc)** → **5. BloodHound (opt-in `--bloodhound`, sur 1 DC)**. L'étape 4 cible les **DC** (hôtes répondant au rootDSE, repli sur toutes les cibles), pas tout le scope ; l'étape 5 ne tourne que si `--bloodhound` est passé et sur **un seul DC** (bloodhound-python `-ns <DC>` collecte tout le domaine).

@@ -134,7 +134,7 @@ def collect(base: Path) -> dict:
     else:
         d["top_ports"] = []
 
-    # SMB
+    # SMB (GPP + SYSVOL/NETLOGON content migrés vers le service "dc" ci-dessous)
     d["smb"] = {
         "scanned": scanned("smb_hosts_info.txt", "smb_unsigned.txt"),
         "unsigned":    read_all(base, "smb_unsigned.txt"),
@@ -145,9 +145,18 @@ def collect(base: Path) -> dict:
         "read_shares": read_all(base, "smb_shares_read.txt"),
         "write_shares":read_all(base, "smb_shares_write.txt"),
         "admin":       read_all(base, "smb_admin.txt"),
-        "sysvol":      read_all(base, "sysvol_files.txt"),
-        "spider":      read_all(base, "smb_spider.txt"),
-        "gpp":         read_all(base, "sysvol_gpp.txt"),
+    }
+
+    # DC (check_dc.py) — GPP SYSVOL + fichiers intéressants SYSVOL/NETLOGON.
+    # On lit aussi l'ancien nom `sysvol_gpp.txt` pour que d'anciens runs SMB
+    # (avant migration) remontent toujours, désormais sous le service DC.
+    d["dc"] = {
+        "scanned": scanned("dc_summary.txt", "dc_gpp.txt", "dc_sysvol_files.txt",
+                           "sysvol_gpp.txt"),
+        "gpp":          read_any(base, "dc_gpp.txt", "sysvol_gpp.txt"),
+        "sysvol_creds": read_all(base, "dc_sysvol_creds.txt"),
+        "sysvol_hints": read_all(base, "dc_sysvol_hints.txt"),
+        "sysvol_files": read_any(base, "dc_sysvol_files.txt", "sysvol_files.txt"),
     }
 
     # LDAP (union dédupliquée des users/groups/computers sur tous les runs).
@@ -278,8 +287,11 @@ def get_criticals(d: dict) -> list[tuple[str, str, str]]:
     if smb["v1"]:          c.append(("SMB",      f"{len(smb['v1'])} hosts with SMBv1 enabled (EternalBlue)", "critical"))
     if smb["write_shares"]:c.append(("SMB",      f"{len(smb['write_shares'])} writable shares found", "critical"))
     if smb["admin"]:       c.append(("SMB",      f"{len(smb['admin'])} host(s) where provided creds have admin access (Pwn3d!)", "critical"))
-    if smb["gpp"]:         c.append(("SMB",      f"{len(smb['gpp'])} GPP credential finding(s) in SYSVOL (cleartext/decryptable)", "critical"))
-    if smb["sysvol"]:      c.append(("SMB",      f"{len(smb['sysvol'])} interesting files in SYSVOL/NETLOGON", "warning"))
+
+    dc = d["dc"]
+    if dc["gpp"]:          c.append(("DC",       f"{len(dc['gpp'])} GPP credential finding(s) in SYSVOL (cleartext/decryptable)", "critical"))
+    if dc["sysvol_creds"]: c.append(("DC",       f"{len(dc['sysvol_creds'])} probable credential(s) in SYSVOL/NETLOGON scripts", "critical"))
+    if dc["sysvol_hints"]: c.append(("DC",       f"{len(dc['sysvol_hints'])} SYSVOL/NETLOGON file line(s) to review (possible secrets)", "warning"))
 
     ldap = d["ldap"]
     if ldap["nullbind"]:   c.append(("LDAP",     f"{len(ldap['nullbind'])} hosts allow anonymous LDAP bind", "critical"))
@@ -464,7 +476,6 @@ def build_smb(d: dict) -> str:
     unsigned_lvl = "critical" if s["unsigned"] else "ok"
     v1_lvl       = "critical" if s["v1"]       else "ok"
     write_lvl    = "critical" if s["write_shares"] else "ok"
-    sysvol_lvl   = "warning"  if s["sysvol"]   else "ok"
 
     parts.append(subsec(f"SMB Signing disabled ({len(s['unsigned'])} hosts)",
                         ip_table(s["unsigned"]) if s["unsigned"] else '<p class="empty">All hosts have SMB signing enabled.</p>',
@@ -499,15 +510,42 @@ def build_smb(d: dict) -> str:
         parts.append(subsec(f"Readable shares ({len(s['read_shares'])} entries)",
                             text_table(s["read_shares"], "Share"), "info"))
 
-    if s["gpp"]:
-        parts.append(subsec(f"GPP credentials in SYSVOL ({len(s['gpp'])} findings)",
-                            text_table(s["gpp"], "GPP finding (cleartext / decryptable creds)"),
-                            "critical"))
+    return "".join(parts)
 
-    if s["sysvol"] or s["spider"]:
-        combined = list(dict.fromkeys(s["sysvol"] + s["spider"]))
-        parts.append(subsec(f"SYSVOL / Spider findings ({len(combined)} files)",
-                            text_table(combined, "File path"), sysvol_lvl))
+
+def build_dc(d: dict) -> str:
+    s = d["dc"]
+    parts = []
+
+    gpp_lvl   = "critical" if s["gpp"]          else "ok"
+    creds_lvl = "critical" if s["sysvol_creds"] else "ok"
+    hints_lvl = "warning"  if s["sysvol_hints"] else "ok"
+
+    stats = '<div class="stat-row">'
+    stats += stat_card(len(s["gpp"]),          "GPP secrets",   "critical" if s["gpp"] else "skip")
+    stats += stat_card(len(s["sysvol_creds"]), "Script creds",  "critical" if s["sysvol_creds"] else "skip")
+    stats += stat_card(len(s["sysvol_hints"]), "Hints",         "warning"  if s["sysvol_hints"] else "skip")
+    stats += stat_card(len(s["sysvol_files"]), "Files reviewed","info"     if s["sysvol_files"] else "skip")
+    stats += '</div>'
+    parts.append(stats)
+
+    parts.append(subsec(f"GPP credentials in SYSVOL ({len(s['gpp'])} findings)",
+                        text_table(s["gpp"], "GPP finding (cleartext / decryptable creds)")
+                        if s["gpp"] else '<p class="empty">No GPP credentials found.</p>',
+                        gpp_lvl))
+
+    parts.append(subsec(f"SYSVOL/NETLOGON script credentials — Tier 1 ({len(s['sysvol_creds'])})",
+                        text_table(s["sysvol_creds"], "File : matched line")
+                        if s["sysvol_creds"] else '<p class="empty">No high-confidence credentials found.</p>',
+                        creds_lvl))
+
+    if s["sysvol_hints"]:
+        parts.append(subsec(f"SYSVOL/NETLOGON lines to review — Tier 2 ({len(s['sysvol_hints'])})",
+                            text_table(s["sysvol_hints"], "File : matched line"), hints_lvl))
+
+    if s["sysvol_files"]:
+        parts.append(subsec(f"Files reviewed ({len(s['sysvol_files'])})",
+                            text_table(s["sysvol_files"], "File"), "info"))
 
     return "".join(parts)
 
@@ -836,7 +874,7 @@ def section_level(d: dict, key: str) -> str:
     labels = {c[0] for c in crits if c[2] == "critical"}
     warns  = {c[0] for c in crits if c[2] == "warning"}
     svc_map = {
-        "smb": "SMB", "ldap": "LDAP", "rdp": "RDP", "ssh": "SSH",
+        "dc": "DC", "smb": "SMB", "ldap": "LDAP", "rdp": "RDP", "ssh": "SSH",
         "http": "HTTP", "mssql": "MSSQL", "dns": "DNS", "ftp": "FTP",
         "snmp": "SNMP", "ipmi": "IPMI", "winrm": "WinRM", "kerberos": "Kerberos",
     }
@@ -971,6 +1009,7 @@ def generate_html(d: dict, crits: list, engagement: str, base_dir: str) -> str:
     sections_meta = [
         ("discovery", "🌐 Discovery",   "info"),
         ("smb",       "📁 SMB",         section_level(d, "smb")),
+        ("dc",        "🏰 DC (SYSVOL)", section_level(d, "dc")),
         ("ldap",      "📂 LDAP",        section_level(d, "ldap")),
         ("kerberos",  "🎟 Kerberos",    section_level(d, "kerberos")),
         ("rdp",       "🖥 RDP",         section_level(d, "rdp")),
@@ -996,7 +1035,7 @@ def generate_html(d: dict, crits: list, engagement: str, base_dir: str) -> str:
     top_stats += stat_card(len(d["alive"]), "Hosts Alive", "info" if d["alive"] else "skip")
     top_stats += stat_card(n_crits, "Critical Findings", "critical" if n_crits else "ok")
     top_stats += stat_card(n_warns, "Warnings", "warning" if n_warns else "ok")
-    scanned_count = sum(1 for k in ["smb","ldap","rdp","ssh","http","mssql","dns","ftp","snmp","ipmi","winrm","kerberos"]
+    scanned_count = sum(1 for k in ["smb","dc","ldap","rdp","ssh","http","mssql","dns","ftp","snmp","ipmi","winrm","kerberos"]
                         if d[k].get("scanned"))
     top_stats += stat_card(scanned_count, "Services Scanned", "info")
     top_stats += '</div>'
@@ -1031,6 +1070,7 @@ def generate_html(d: dict, crits: list, engagement: str, base_dir: str) -> str:
 
     for sid, icon, builder, title in [
         ("smb",      "📁", build_smb,      "SMB"),
+        ("dc",       "🏰", build_dc,       "DC (SYSVOL / NETLOGON)"),
         ("ldap",     "📂", build_ldap,     "LDAP"),
         ("kerberos", "🎟", build_kerberos, "Kerberos"),
         ("rdp",      "🖥", build_rdp,      "RDP"),
@@ -1126,10 +1166,10 @@ Examples:
           + ", ".join(dirs[:25]) + (" ..." if len(dirs) > 25 else ""))
     d = collect(base)
 
-    scanned = sum(1 for k in ["smb","ldap","rdp","ssh","http","mssql","dns",
-                               "ftp","snmp","ipmi","winrm","kerberos"]
-                  if d[k].get("scanned"))
-    print(f"[*] Hosts alive: {len(d['alive'])} — Services with data: {scanned}/12")
+    svc_keys = ["smb","dc","ldap","rdp","ssh","http","mssql","dns",
+                "ftp","snmp","ipmi","winrm","kerberos"]
+    scanned = sum(1 for k in svc_keys if d[k].get("scanned"))
+    print(f"[*] Hosts alive: {len(d['alive'])} — Services with data: {scanned}/{len(svc_keys)}")
 
     crits = get_criticals(d)
     n_crit = sum(1 for c in crits if c[2] == "critical")

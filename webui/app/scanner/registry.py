@@ -153,8 +153,8 @@ REGISTRY: dict[str, CheckDefinition] = {
         id="smb",
         script="check_smb.py",
         label="SMB (139/445)",
-        description="SMB signing, SMBv1, null-session and authenticated shares, "
-                    "SYSVOL/NETLOGON spidering.",
+        description="SMB signing, SMBv1, null-session and authenticated shares. "
+                    "SYSVOL/NETLOGON content (GPP, interesting files) moved to check_dc.",
         supports_creds=True,
         required_tools=["nxc"],
         arguments=[
@@ -163,6 +163,25 @@ REGISTRY: dict[str, CheckDefinition] = {
             _domain_arg(default="WORKGROUP"),
             CheckArgument(name="--threads", dest="threads", type="int",
                           default=10, help="Worker threads"),
+        ],
+    ),
+
+    # -- DC (SYSVOL / NETLOGON) --------------------------------------------- #
+    "dc": CheckDefinition(
+        id="dc",
+        script="check_dc.py",
+        label="DC (SYSVOL/NETLOGON)",
+        description="Domain Controller content: GPP credentials (cpassword/autologin) "
+                    "and interesting-file scan of SYSVOL/NETLOGON (adPEAS-style criteria). "
+                    "Requires domain credentials.",
+        supports_creds=True,
+        required_tools=["nxc"],
+        optional_tools=["smbclient"],
+        arguments=[
+            _ARG_TARGET, _ARG_OUTPUT,
+            _ARG_USERNAME, _ARG_PASSWORD, _ARG_HASH, _domain_arg(),
+            CheckArgument(name="--threads", dest="threads", type="int",
+                          default=50, help="nxc concurrency for GPP sweep"),
         ],
     ),
 

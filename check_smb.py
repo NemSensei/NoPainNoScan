@@ -13,10 +13,11 @@ Workflow:
          → this reduced host set feeds the heavy authenticated steps (fast on big scope)
     2. Null session share listing (no creds, on reachable hosts)
     3. Authenticated share enumeration (on auth hosts): READ / WRITE / accessible (non-$)
-    4. GPP credentials in SYSVOL (on auth hosts): gpp_password / gpp_autologin
 
-    NB: file spidering (--spider SYSVOL/NETLOGON and -M spider_plus) was removed on
-    purpose — too noisy; GPP covers the high-value SYSVOL secrets, the rest is manual.
+    NB: SYSVOL/NETLOGON content (GPP credentials and interesting-file spidering) was
+    MOVED to check_dc.py — a DC-specific script. SMB here stays focused on signing,
+    SMBv1, null session and share access. File spidering (--spider, -M spider_plus)
+    remains deliberately out (too noisy); check_dc does targeted, criteria-based scan.
 
 Output files:
     smb_hosts_info.txt         Full host info table
@@ -28,8 +29,6 @@ Output files:
     smb_shares_read.txt        Readable shares with creds (non-$)
     smb_shares_write.txt       Writable shares with creds (non-$) [CRITICAL]
     smb_shares_accessible.txt  Consolidated R/W accessible shares (non-$)
-    sysvol_gpp.txt             GPP credentials from SYSVOL [CRITICAL]
-    sysvol_gpp_raw.txt         Raw gpp_password/gpp_autologin output
     smb_summary.txt            Human-readable findings summary
 """
 
@@ -54,7 +53,7 @@ from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
                          emit_progress, strip_ansi, nxc_is_admin, nxc_login_ok)
 
 
-set_total_steps(4)
+set_total_steps(3)
 
 # Concurrence nxc, fixée depuis --threads dans main(). nxc gère le fan-out par hôte ;
 # plus de threads = plus rapide sur gros scope.
@@ -201,7 +200,7 @@ def step1_recon(hosts_file, out_dir, creds_args, n_hosts):
        la liste des hôtes SMB JOIGNABLES.
     2) Sweep AVEC creds (si fournis) : hôtes où l'authentification réussit ([+]) et
        ceux en admin (Pwn3d!/admin). Cette liste d'hôtes authentifiés sert de cible
-       RÉDUITE aux étapes lourdes (shares, GPP) → beaucoup plus rapide sur gros scope.
+       RÉDUITE à l'étape lourde (shares) → beaucoup plus rapide sur gros scope.
 
     Returns: (unsigned, smbv1, host_rows, reachable, auth_hosts)
     """
@@ -381,76 +380,10 @@ def step3_auth_shares(hosts_file, out_dir, creds_args, n_hosts):
 
 
 # =============================================================================
-# STEP 4 — GPP CREDENTIALS (SYSVOL)
-# =============================================================================
-# NB : le spidering SYSVOL/NETLOGON (--spider) et spider_plus (inventaire de tous les
-# shares) ont été RETIRÉS volontairement — trop de bruit. GPP ci-dessous extrait les
-# secrets à forte valeur de SYSVOL ; le reste de l'exploration se fait à la main.
-# Lignes à retenir dans la sortie des modules GPP : les marqueurs de PAYOFF d'un
-# vrai secret — cpassword déchiffré, autologon, "Found credentials in …", et les
-# lignes de résultat "Usernames:" / "Passwords:". On cible ces motifs précis (avec
-# ':' ou "in ") plutôt que les mots génériques "password/username/credential" seuls :
-#   • la version précédente trop large comptait les lignes d'auth nxc
-#     (ex. "[+] CORP\svc:xxx STATUS_PASSWORD_MUST_CHANGE") comme un faux GPP ;
-#   • la version trop étroite (cpassword|GPP|autologin) jetait au contraire les
-#     vraies lignes "Found credentials…/Usernames:/Passwords:" → faux négatif.
-# Ce motif précis ne matche jamais un "user:pass" d'auth, et garde tous les payoffs.
-_GPP_FINDING_RE = re.compile(
-    r"(?i)(cpassword|autologin|credentials?\s+in\b|usernames?\s*:|passwords?\s*:)"
-)
-# Ceinture-bretelles : on exclut quand même les lignes négatives et de statut nxc.
-_GPP_NEGATIVE_RE = re.compile(
-    r"(?i)(no (gpp|autologin|credential|password|result|xml|file)"
-    r"|not found|nothing found|could ?n'?t|could not|failed to"
-    r"|STATUS_[A-Z_]+)"
-)
-
-
-def step_gpp(hosts_file, out_dir, creds_args, n_hosts):
-    """Extract GPP credentials from SYSVOL via nxc gpp_password / gpp_autologin.
-
-    gpp_password déchiffre les cpassword des fichiers de préférences GPP
-    (Groups.xml, Services.xml, ScheduledTasks.xml, DataSources.xml, Drives.xml,
-    Printers.xml) ; gpp_autologin extrait les identifiants d'autologon de
-    registry.xml. Les deux lisent SYSVOL. Toute trouvaille = creds en clair → 🔴.
-    """
-    log_step("STEP 4 — GPP credentials (SYSVOL)")
-
-    findings = []
-    if not confirm_step("STEP 4 — GPP credentials (SYSVOL)",
-                        "nxc smb <auth-hosts> <creds> -M gpp_password  +  -M gpp_autologin"):
-        write_file(out_dir / "sysvol_gpp.txt", [])
-        return findings
-
-    raw_parts = []
-    for module in ("gpp_password", "gpp_autologin"):
-        log_info(f"Running {module} on SYSVOL ...")
-        out, rc = run_nxc(_nxc(hosts_file, f"-M {module}", creds=creds_args),
-                          timeout=scaled_timeout(n_hosts))
-        out = strip_ansi(out)
-        raw_parts.append(f"# === {module} ===\n{out}")
-        for line in out.splitlines():
-            if _GPP_FINDING_RE.search(line) and not _GPP_NEGATIVE_RE.search(line):
-                findings.append(line.strip())
-
-    (out_dir / "sysvol_gpp_raw.txt").write_text("\n".join(raw_parts) + "\n")
-    findings = list(dict.fromkeys(findings))
-    write_file(out_dir / "sysvol_gpp.txt", findings, sort=False,
-               label="GPP credentials [CRITICAL]")
-
-    if findings:
-        log_warn(f"[CRITICAL] {len(findings)} GPP credential finding(s) in SYSVOL!")
-    else:
-        log_info("No GPP credentials found (see sysvol_gpp_raw.txt for raw module output).")
-
-    return findings
-
-
-# =============================================================================
 # SUMMARY
 # =============================================================================
 def write_summary(out_dir, unsigned, smbv1, reachable, auth_hosts, null_shares,
-                  read_shares, write_shares, accessible_shares, gpp_findings, has_creds):
+                  read_shares, write_shares, accessible_shares, has_creds):
     """Write a human-readable summary file and print it."""
     log_step("SUMMARY")
 
@@ -470,7 +403,6 @@ def write_summary(out_dir, unsigned, smbv1, reachable, auth_hosts, null_shares,
             f"[AUTH]     Accessible shares (R/W, non-admin):             {len(accessible_shares)}",
             f"[AUTH]     Readable shares (with creds):                   {len(read_shares)}",
             f"[CRITICAL] Writable shares (with creds):                   {len(write_shares)}",
-            f"[CRITICAL] GPP credential findings (SYSVOL):               {len(gpp_findings)}",
         ]
 
     lines += ["", "Output directory: " + str(out_dir)]
@@ -488,10 +420,6 @@ def write_summary(out_dir, unsigned, smbv1, reachable, auth_hosts, null_shares,
     if write_shares:
         lines += ["", "[CRITICAL] WRITABLE SHARES:"]
         lines += [f"    {s}" for s in write_shares]
-
-    if gpp_findings:
-        lines += ["", "[CRITICAL] GPP CREDENTIALS (SYSVOL):"]
-        lines += [f"    {g}" for g in gpp_findings]
 
     summary_text = "\n".join(lines)
     (out_dir / "smb_summary.txt").write_text(summary_text + "\n")
@@ -568,7 +496,7 @@ def main():
         for fname in ["smb_unsigned.txt", "smb_v1.txt", "smb_hosts_info.txt",
                       "smb_login_success.txt", "smb_shares_null.txt",
                       "smb_shares_read.txt", "smb_shares_write.txt",
-                      "smb_shares_accessible.txt", "sysvol_gpp.txt", "smb_summary.txt"]:
+                      "smb_shares_accessible.txt", "smb_summary.txt"]:
             (out_dir / fname).write_text("")
         sys.exit(1)
 
@@ -585,30 +513,28 @@ def main():
     null_shares = step2_null_session(reachable_tmp, out_dir, len(reachable) or n_all)
 
     read_shares, write_shares, accessible_shares = [], [], []
-    gpp_findings = []
     auth_tmp = None
 
-    # --- STEP 3 & 4: authenticated, only against hosts where creds work ---
+    # --- STEP 3: authenticated share enum, only against hosts where creds work ---
     if has_creds and auth_hosts:
         auth_tmp = hosts_to_tmpfile(auth_hosts)
         n_auth = len(auth_hosts)
         read_shares, write_shares, accessible_shares = step3_auth_shares(
             auth_tmp, out_dir, creds_args, n_auth)
-        gpp_findings = step_gpp(auth_tmp, out_dir, creds_args, n_auth)
     else:
         if has_creds and not auth_hosts:
-            log_warn("Creds did not authenticate anywhere — skipping share/GPP steps.")
+            log_warn("Creds did not authenticate anywhere — skipping share step.")
         else:
-            log_info("No credentials provided — skipping authenticated checks (steps 3-4)")
+            log_info("No credentials provided — skipping authenticated checks (step 3)")
         for fname in ["smb_shares_read.txt", "smb_shares_write.txt",
-                      "smb_shares_accessible.txt", "sysvol_gpp.txt"]:
+                      "smb_shares_accessible.txt"]:
             (out_dir / fname).write_text("")
 
     # -------------------------------------------------------------------------
     # SUMMARY
     # -------------------------------------------------------------------------
     write_summary(out_dir, unsigned, smbv1, reachable, auth_hosts, null_shares,
-                  read_shares, write_shares, accessible_shares, gpp_findings, has_creds)
+                  read_shares, write_shares, accessible_shares, has_creds)
 
     # Cleanup temp host files
     tmp_files = [hosts_tmp]
