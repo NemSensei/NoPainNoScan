@@ -171,17 +171,20 @@ REGISTRY: dict[str, CheckDefinition] = {
         id="dc",
         script="check_dc.py",
         label="DC (SYSVOL/NETLOGON)",
-        description="Domain Controller content: GPP credentials (cpassword/autologin) "
-                    "and interesting-file scan of SYSVOL/NETLOGON (adPEAS-style criteria). "
-                    "Requires domain credentials.",
+        description="Domain Controller checks: DC vulns (Zerologon/noPac/SMBGhost/"
+                    "coercion), GPP credentials, SYSVOL/NETLOGON interesting + sensitive "
+                    "files and writable-share (GPO abuse), optional ADCS (--adcs). "
+                    "Vulns run without creds; SYSVOL/GPP/ADCS need domain credentials.",
         supports_creds=True,
         required_tools=["nxc"],
-        optional_tools=["smbclient"],
+        optional_tools=["smbclient", "certipy"],
         arguments=[
             _ARG_TARGET, _ARG_OUTPUT,
             _ARG_USERNAME, _ARG_PASSWORD, _ARG_HASH, _domain_arg(),
+            CheckArgument(name="--adcs", dest="adcs", type="bool", default=False,
+                          help="Enumerate vulnerable ADCS templates (certipy find -vulnerable)"),
             CheckArgument(name="--threads", dest="threads", type="int",
-                          default=50, help="nxc concurrency for GPP sweep"),
+                          default=50, help="nxc concurrency"),
         ],
     ),
 

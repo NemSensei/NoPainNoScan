@@ -5,17 +5,19 @@
 une lecture authentifiée — n'importe quel compte du domaine suffit).
 
   STEP 1  GPP credentials (SYSVOL) — nxc -M gpp_password / gpp_autologin.
-          cpassword GPP (MS14-025) déchiffrés + autologon (Registry.xml).
-  STEP 2  Fichiers intéressants SYSVOL/NETLOGON — télécharge les deux partages
-          (smbclient, tar) et analyse le contenu localement, critères inspirés
-          d'adPEAS / Snaffler : extensions ciblées + motifs à deux niveaux
-          (Tier 1 = secret à forte confiance 🔴, Tier 2 = indice à revoir ⚠️),
-          avec liste d'exclusions anti-faux-positifs (doc de politique de mot de
-          passe, commentaires, prompts, valeurs masquées).
+          cpassword GPP (MS14-025) déchiffrés + autologon (Registry.xml).  [creds]
+  STEP 2  Contenu SYSVOL/NETLOGON — télécharge les deux partages (smbclient -Tc)
+          et analyse localement, critères adPEAS/Snaffler : extensions ciblées +
+          motifs Tier 1 (secret 🔴) / Tier 2 (indice ⚠️) + exclusions ; détecte
+          aussi les fichiers sensibles (clés, KeePass, unattend/sysprep, .rdp) et
+          l'accès WRITE à SYSVOL/NETLOGON (GPO abuse, via nxc --shares).   [creds]
+  STEP 3  Vulnérabilités DC (nxc) — zerologon, noPac, SMBGhost, PrintNightmare,
+          Spooler, coercion (PetitPotam/…). Mode CHECK only.    [marche sans creds]
+  STEP 4  ADCS (optionnel --adcs) — certipy find -vulnerable (ESC1-16).     [creds]
 
-Pensé « gros scope » : GPP via nxc (sweep multi-hôtes) ; le téléchargement
-SYSVOL/NETLOGON ne se fait que sur UN DC (les partages sont répliqués, identiques
-sur tous les DC) — inutile de tout re-télécharger par hôte.
+Pensé « gros scope » : GPP/vulns via nxc (sweep multi-hôtes) ; le téléchargement
+SYSVOL/NETLOGON ne se fait que sur UN DC (partages répliqués, identiques sur tous
+les DC) — inutile de tout re-télécharger par hôte.
 """
 
 import argparse
@@ -35,7 +37,7 @@ from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
                          tool_exists, confirm_step, set_total_steps, enable_auto_accept,
                          emit_progress, strip_ansi)
 
-set_total_steps(2)
+set_total_steps(4)
 
 _THREADS = 50
 
@@ -207,7 +209,14 @@ def step_gpp(hosts_file, out_dir, creds_real, creds_disp, n_hosts):
 # Les exclusions écartent la doc de politique de mot de passe, les commentaires,
 # les prompts, les valeurs masquées — source classique de faux positifs.
 SCRIPT_EXTS = {'.txt', '.bat', '.ini', '.conf', '.cnf', '.cmd',
-               '.vbs', '.vbe', '.kix', '.ps1', '.psm1'}
+               '.vbs', '.kix', '.ps1', '.psm1'}
+
+# Fichiers SENSIBLES détectés par nom/extension : leur simple présence dans
+# SYSVOL/NETLOGON est un finding (à récupérer et inspecter à la main — binaires
+# ou formats structurés qu'on ne scanne pas ligne à ligne).
+SENSITIVE_EXTS = {'.pfx', '.p12', '.pem', '.cer', '.kdbx', '.ppk', '.rdp'}
+SENSITIVE_NAMES = {'id_rsa', 'id_dsa', 'id_ecdsa',
+                   'unattend.xml', 'autounattend.xml', 'sysprep.inf', 'sysprep.xml'}
 
 _NET_USE = (r"net use (?:\w|\*|LPT\d):? \\\\?\S+"
             r"(?:.*?(?:/user:\S+|\s(?!/)\S+|/savecred))+")
@@ -288,9 +297,12 @@ def download_share_tar(host, share, userarg, extra, tmpdir):
     return None
 
 
-def analyze_tar(tarpath, share, findings, hints, inventory):
-    """Parcourt le tar EN MÉMOIRE (pas d'extraction disque — archive non fiable),
-    filtre par extension et scanne le contenu."""
+def analyze_tar(tarpath, share, findings, hints, inventory, sensitive):
+    """Parcourt le tar EN MÉMOIRE (pas d'extraction disque — archive non fiable).
+
+    - extensions scripts/config → scan de contenu (Tier1/Tier2) ;
+    - fichiers sensibles (clés, KeePass, unattend/sysprep, .rdp) → finding de
+      présence (pas de scan ligne à ligne, souvent binaire)."""
     try:
         tf = tarfile.open(tarpath)
     except (tarfile.TarError, OSError) as e:
@@ -301,7 +313,14 @@ def analyze_tar(tarpath, share, findings, hints, inventory):
             if not m.isfile():
                 continue
             name = m.name.replace('\\', '/').lstrip('./')
-            if os.path.splitext(name)[1].lower() not in SCRIPT_EXTS:
+            base = name.rsplit('/', 1)[-1].lower()
+            ext = os.path.splitext(name)[1].lower()
+
+            if ext in SENSITIVE_EXTS or base in SENSITIVE_NAMES:
+                kind = base if base in SENSITIVE_NAMES else ext
+                sensitive.append(f"[{share}] {name} ({kind})")
+                continue
+            if ext not in SCRIPT_EXTS:
                 continue
             inventory.append(f"[{share}] {name}")
             try:
@@ -313,22 +332,47 @@ def analyze_tar(tarpath, share, findings, hints, inventory):
                       findings, hints)
 
 
-def step_interesting_files(hosts, out_dir, user, password, nt_hash, domain):
-    log_step("STEP 2 — Interesting files in SYSVOL / NETLOGON")
-    findings, hints, inventory = [], [], []
+# SYSVOL/NETLOGON inscriptibles (écriture = GPO abuse → RCE). On lit la permission
+# au niveau partage via `nxc --shares` (NON intrusif : aucune écriture tentée). Les
+# ACL d'un GPO précis se vérifient à la main / via BloodHound.
+def check_writable_sysvol(hosts_file, creds_real, n_hosts):
+    """Retourne les lignes SYSVOL/NETLOGON montrant un accès WRITE (via nxc --shares)."""
+    if not tool_exists("nxc"):
+        return []
+    out, _ = run_nxc(f"nxc smb {shlex.quote(str(hosts_file))} {creds_real} "
+                     f"--threads {_THREADS} --shares", timeout=scaled_timeout(n_hosts))
+    writable = []
+    for line in strip_ansi(out).splitlines():
+        # garde uniquement SYSVOL/NETLOGON avec WRITE (le regex share générique ailleurs)
+        if re.search(r"\b(SYSVOL|NETLOGON)\b", line, re.I) and re.search(r"\bWRITE\b", line):
+            writable.append(line.strip())
+    return writable
+
+
+def step_interesting_files(hosts, hosts_file, out_dir, user, password, nt_hash,
+                           domain, creds_real):
+    log_step("STEP 2 — SYSVOL / NETLOGON content (files, sensitive, writable)")
+    findings, hints, inventory, sensitive, writable = [], [], [], [], []
+    outs = ("dc_sysvol_creds.txt", "dc_sysvol_hints.txt", "dc_sysvol_files.txt",
+            "dc_sysvol_sensitive.txt", "dc_sysvol_writable.txt")
 
     if not tool_exists("smbclient"):
         log_warn("smbclient introuvable (apt install smbclient) — étape ignorée.")
-        for f in ("dc_sysvol_creds.txt", "dc_sysvol_hints.txt", "dc_sysvol_files.txt"):
+        for f in outs:
             write_lines(out_dir / f, [])
-        return findings, hints, inventory
+        return findings, hints, inventory, sensitive, writable
 
     userarg, extra, disp = smbclient_auth(user, password, nt_hash, domain)
-    if not confirm_step("STEP 2 — Interesting files in SYSVOL/NETLOGON",
-                        f"smbclient //<dc>/SYSVOL -U {disp} -c 'recurse; tar c …'  (+ NETLOGON, 1 DC)"):
-        for f in ("dc_sysvol_creds.txt", "dc_sysvol_hints.txt", "dc_sysvol_files.txt"):
+    if not confirm_step("STEP 2 — SYSVOL/NETLOGON content",
+                        f"smbclient //<dc>/SYSVOL -U {disp} -Tc <tar>  (+ NETLOGON, 1 DC) ; "
+                        "nxc --shares (write?)"):
+        for f in outs:
             write_lines(out_dir / f, [])
-        return findings, hints, inventory
+        return findings, hints, inventory, sensitive, writable
+
+    # Permission d'écriture SYSVOL/NETLOGON (non intrusif, sur toutes les cibles).
+    log_info("nxc smb <dc> --shares  (recherche WRITE sur SYSVOL/NETLOGON)")
+    writable = check_writable_sysvol(hosts_file, creds_real, len(hosts))
 
     # Les partages sont répliqués → on prend le 1er DC qui répond, pas tous.
     with tempfile.TemporaryDirectory() as tmp:
@@ -336,48 +380,172 @@ def step_interesting_files(hosts, out_dir, user, password, nt_hash, domain):
         for host in hosts:
             got_any = False
             for share in ("SYSVOL", "NETLOGON"):
-                log_info(f"smbclient //{host}/{share} -U {disp} -c 'tar c …'")
+                log_info(f"smbclient //{host}/{share} -U {disp} -Tc <tar>")
                 tarpath = download_share_tar(host, share, userarg, extra, tmp)
                 if tarpath:
                     got_any = True
-                    analyze_tar(tarpath, share, findings, hints, inventory)
+                    analyze_tar(tarpath, share, findings, hints, inventory, sensitive)
             if got_any:
                 done_host = host
                 break
         if not done_host:
             log_warn("Aucun DC n'a renvoyé SYSVOL/NETLOGON (creds ? accès ?).")
 
-    findings = write_lines(out_dir / "dc_sysvol_creds.txt", findings)
-    hints    = write_lines(out_dir / "dc_sysvol_hints.txt", hints)
-    inventory = write_lines(out_dir / "dc_sysvol_files.txt", inventory, sort=True)
-    log_ok(f"Fichiers analysés: {len(inventory)} | Tier1 (creds): {len(findings)} | "
-           f"Tier2 (hints): {len(hints)}")
+    findings   = write_lines(out_dir / "dc_sysvol_creds.txt", findings)
+    hints      = write_lines(out_dir / "dc_sysvol_hints.txt", hints)
+    inventory  = write_lines(out_dir / "dc_sysvol_files.txt", inventory, sort=True)
+    sensitive  = write_lines(out_dir / "dc_sysvol_sensitive.txt", sensitive, sort=True)
+    writable   = write_lines(out_dir / "dc_sysvol_writable.txt", writable)
+    log_ok(f"Fichiers: {len(inventory)} | Tier1: {len(findings)} | Tier2: {len(hints)} | "
+           f"sensibles: {len(sensitive)} | SYSVOL/NETLOGON WRITE: {len(writable)}")
     if findings:
-        log_warn(f"[CRITICAL] {len(findings)} secret(s) probable(s) dans SYSVOL/NETLOGON !")
-    return findings, hints, inventory
+        log_warn(f"[CRITICAL] {len(findings)} secret(s) probable(s) dans les scripts !")
+    if writable:
+        log_warn(f"[CRITICAL] SYSVOL/NETLOGON inscriptible ({len(writable)}) → GPO abuse !")
+    return findings, hints, inventory, sensitive, writable
+
+
+# ===========================================================================
+# STEP 3 — Vulnérabilités DC (nxc modules) — Lot A
+# ===========================================================================
+# Modules nxc lancés sur les DC. zerologon/smbghost/spooler marchent sans creds ;
+# nopac/coerce_plus en profitent si on en a. NB : les NOMS de modules bougent
+# selon le build NetExec (coerce_plus récent regroupe PetitPotam/DFSCoerce/
+# ShadowCoerce/PrinterBug) — la sortie brute est conservée pour ajuster au besoin.
+# On reste en mode CHECK : jamais d'exploitation qui casserait le compte machine.
+#   severity "crit" → dc_vulns.txt (🔴) ; "warn" → dc_coercion.txt (⚠️, vecteurs).
+DC_VULN_MODULES = [
+    ("zerologon",      "Zerologon (CVE-2020-1472)",            "crit"),
+    ("nopac",          "noPac (CVE-2021-42278/42287)",         "crit"),
+    ("smbghost",       "SMBGhost (CVE-2020-0796)",             "crit"),
+    ("printnightmare", "PrintNightmare (CVE-2021-34527)",      "warn"),
+    ("spooler",        "Spooler service enabled (coercion)",   "warn"),
+    ("coerce_plus",    "Coercion (PetitPotam/DFSCoerce/…)",    "warn"),
+]
+_VULN_POS = re.compile(r"(VULNERABLE|is enabled|enabled\b|likely vulnerable|"
+                       r"path:|coerc|found)", re.I)
+_VULN_NEG = re.compile(r"(not vulnerable|non vulnerable|not enabled|disabled|"
+                       r"error|traceback)", re.I)
+_IP_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+
+def step_dc_vulns(hosts_file, out_dir, creds_real, creds_disp, n_hosts):
+    log_step("STEP 3 — DC vulnerabilities (nxc modules)")
+    crit, coercion, raw = [], [], []
+    if not tool_exists("nxc"):
+        log_warn("nxc introuvable — vulns DC ignorées.")
+        write_lines(out_dir / "dc_vulns.txt", [])
+        write_lines(out_dir / "dc_coercion.txt", [])
+        return crit, coercion
+    if not confirm_step("STEP 3 — DC vulnerabilities",
+                        "nxc smb <dc> -M " + "/".join(m for m, _, _ in DC_VULN_MODULES)):
+        write_lines(out_dir / "dc_vulns.txt", [])
+        write_lines(out_dir / "dc_coercion.txt", [])
+        return crit, coercion
+
+    creds = creds_real or "-u '' -p ''"
+    disp  = creds_disp or "-u '' -p ''"
+    for module, label, sev in DC_VULN_MODULES:
+        log_info(f"nxc smb <dc> {disp} -M {module}")
+        out, _ = run_nxc(f"nxc smb {shlex.quote(str(hosts_file))} {creds} "
+                         f"--threads {_THREADS} -M {module}",
+                         timeout=scaled_timeout(n_hosts))
+        out = strip_ansi(out)
+        raw.append(f"# === {module} ===\n{out}")
+        hits = []
+        for line in out.splitlines():
+            if _VULN_POS.search(line) and not _VULN_NEG.search(line):
+                ip = _IP_RE.search(line)
+                hits.append(f"{ip.group(1) if ip else '?'}  [{label}]  {line.strip()[-160:]}")
+        hits = list(dict.fromkeys(hits))
+        if hits:
+            (crit if sev == "crit" else coercion).extend(hits)
+            (log_warn if sev == "crit" else log_info)(
+                f"  {label}: {len(hits)} hôte(s) concerné(s)"
+                + (" [CRITICAL]" if sev == "crit" else ""))
+        else:
+            log_ok(f"  {label}: non vulnérable / non détecté")
+
+    (out_dir / "dc_vulns_raw.txt").write_text("\n".join(raw) + "\n")
+    crit     = write_lines(out_dir / "dc_vulns.txt", crit)
+    coercion = write_lines(out_dir / "dc_coercion.txt", coercion)
+    return crit, coercion
+
+
+# ===========================================================================
+# STEP 4 — ADCS (optionnel, --adcs) : certipy find -vulnerable
+# ===========================================================================
+
+def step_adcs(hosts, out_dir, user, password, nt_hash, domain):
+    log_step("STEP 4 — ADCS vulnerable templates (certipy)")
+    findings = []
+    if not tool_exists("certipy") and not tool_exists("certipy-ad"):
+        log_warn("certipy introuvable (pip install certipy-ad) — --adcs ignoré.")
+        write_lines(out_dir / "dc_adcs_vulnerable.txt", [])
+        return findings
+    if not domain:
+        log_warn("--adcs nécessite un domaine (-d) — ignoré.")
+        write_lines(out_dir / "dc_adcs_vulnerable.txt", [])
+        return findings
+
+    cbin = "certipy" if tool_exists("certipy") else "certipy-ad"
+    dc = hosts[0]
+    if nt_hash:
+        auth = f"-hashes {shlex.quote(nt_hash)}"
+        disp = "-hashes '***'"
+    else:
+        auth = f"-p {shlex.quote(password or '')}"
+        disp = "-p '***'"
+    upn = f"{user}@{domain}"
+    if not confirm_step("STEP 4 — ADCS (certipy find -vulnerable)",
+                        f"certipy find -u {upn} {disp} -dc-ip {dc} -vulnerable -stdout"):
+        write_lines(out_dir / "dc_adcs_vulnerable.txt", [])
+        return findings
+
+    log_info(f"{cbin} find -u {upn} {disp} -dc-ip {dc} -vulnerable -stdout")
+    out, err, _ = run(f"{cbin} find -u {shlex.quote(upn)} {auth} "
+                      f"-dc-ip {shlex.quote(dc)} -vulnerable -stdout 2>&1", timeout=300)
+    (out_dir / "dc_adcs_raw.txt").write_text(out or err)
+    for line in strip_ansi(out).splitlines():
+        if re.search(r"\bESC\d+\b", line) or re.search(r"(?i)vulnerab", line):
+            findings.append(line.strip())
+    findings = write_lines(out_dir / "dc_adcs_vulnerable.txt", findings)
+    if findings:
+        log_warn(f"[CRITICAL] ADCS: {len(findings)} ligne(s) de vulnérabilité (ESCx) "
+                 f"→ dc_adcs_vulnerable.txt")
+    else:
+        log_ok("ADCS: aucune template vulnérable détectée (voir dc_adcs_raw.txt).")
+    return findings
 
 
 # ---------------------------------------------------------------------------
 # Résumé
 # ---------------------------------------------------------------------------
 
-def write_summary(out_dir, hosts, gpp, creds, hints, inventory):
+def write_summary(out_dir, hosts, gpp, creds, hints, inventory, sensitive,
+                  writable, vulns, coercion, adcs):
     lines = [
         RULE,
-        "Domain Controller (SYSVOL/NETLOGON) Summary",
+        "Domain Controller Summary",
         f"  Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         RULE,
-        f"Targets                        : {len(hosts)}",
-        f"[CRITICAL] GPP secrets (SYSVOL): {len(gpp)}",
-        f"[CRITICAL] Script creds (Tier1): {len(creds)}",
-        f"[WARN]     Hints (Tier2)       : {len(hints)}",
-        f"Files reviewed                 : {len(inventory)}",
+        f"Targets                          : {len(hosts)}",
+        f"[CRITICAL] DC vulns (zerologon…)  : {len(vulns)}",
+        f"[CRITICAL] GPP secrets (SYSVOL)   : {len(gpp)}",
+        f"[CRITICAL] Script creds (Tier1)   : {len(creds)}",
+        f"[CRITICAL] SYSVOL/NETLOGON WRITE  : {len(writable)}",
+        f"[CRITICAL] ADCS vulnerable lines  : {len(adcs)}",
+        f"[WARN]     Coercion vectors       : {len(coercion)}",
+        f"[WARN]     Sensitive files        : {len(sensitive)}",
+        f"[WARN]     Hints (Tier2)          : {len(hints)}",
+        f"Files reviewed                   : {len(inventory)}",
     ]
-    if gpp:
-        lines += ["", "[CRITICAL] GPP:"] + [f"    {g}" for g in gpp[:20]]
-    if creds:
-        lines += ["", "[CRITICAL] SYSVOL/NETLOGON script credentials:"]
-        lines += [f"    {c}" for c in creds[:20]]
+    for title, items in [("DC VULNS", vulns), ("GPP", gpp),
+                         ("SYSVOL/NETLOGON script credentials", creds),
+                         ("SYSVOL/NETLOGON WRITABLE", writable),
+                         ("ADCS", adcs)]:
+        if items:
+            lines += ["", f"[CRITICAL] {title}:"] + [f"    {i}" for i in items[:20]]
     lines.append(RULE)
     summary = "\n".join(lines) + "\n"
     (out_dir / "dc_summary.txt").write_text(summary)
@@ -395,6 +563,8 @@ def parse_args():
         epilog="""Examples:
   %(prog)s -t dc01.corp.local -u jdoe -p 'P@ss' -d corp.local
   %(prog)s -t hosts_dc.txt   -u svc  -H aad3b435b51404eeaad3b435b51404ee:abc -d corp.local
+  %(prog)s -t 10.0.0.10 -u svc -p 'P@ss' -d corp.local --adcs
+  %(prog)s -t 10.0.0.10            # sans creds : seules les vulns DC (zerologon…) tournent
 """)
     p.add_argument("-t", "--target", required=True,
                    help="Cible : fichier de hosts (DC), IP, ou CIDR")
@@ -404,8 +574,11 @@ def parse_args():
     p.add_argument("-p", "--password", default=None, help="Mot de passe")
     p.add_argument("-H", "--hash", default=None, help="Hash NTLM LM:NT (pass-the-hash)")
     p.add_argument("-d", "--domain", default=None, help="Domaine FQDN")
+    p.add_argument("--adcs", action="store_true",
+                   help="Énumère les templates ADCS vulnérables (certipy find -vulnerable). "
+                        "Désactivé par défaut.")
     p.add_argument("--threads", type=int, default=50,
-                   help="Concurrence nxc pour GPP (--threads, défaut 50)")
+                   help="Concurrence nxc (--threads, défaut 50)")
     p.add_argument("-y", "--yes", action="store_true",
                    help="Non-interactif : accepte toutes les étapes (automatisation/UI)")
     return p.parse_args()
@@ -429,28 +602,54 @@ def main():
         sys.exit(0)
     log_info(f"Loaded {len(hosts)} target(s)")
 
-    # SYSVOL/NETLOGON exigent une lecture authentifiée (tout compte du domaine).
+    # Les étapes SYSVOL/GPP/ADCS exigent des creds (lecture authentifiée) ; les
+    # vulns DC (STEP 3 : zerologon/smbghost/spooler…) tournent même sans creds.
     has_creds = bool(args.username and (args.password is not None or args.hash))
-    if not has_creds:
-        log_err("check_dc nécessite des identifiants (-u + -p/-H). "
-                "SYSVOL/NETLOGON ne sont pas lisibles anonymement. Exiting.")
-        sys.exit(1)
+    creds_real, creds_disp = ("", "")
+    if has_creds:
+        creds_real, creds_disp = nxc_creds(args.username, args.password, args.hash, args.domain)
+    else:
+        log_warn("Aucun identifiant (-u + -p/-H) : SYSVOL/GPP/ADCS sautés ; "
+                 "seules les vulns DC (STEP 3) tournent.")
 
-    creds_real, creds_disp = nxc_creds(args.username, args.password, args.hash, args.domain)
-
-    # ---- STEP 1 : GPP (sweep nxc sur toutes les cibles) ----
     hosts_tmp = hosts_to_tmpfile(hosts)
-    gpp = step_gpp(hosts_tmp, out_dir, creds_real, creds_disp, len(hosts))
+    gpp, creds, hints, inventory, sensitive, writable, adcs = [], [], [], [], [], [], []
+
+    # ---- STEP 1 : GPP ----
+    if has_creds:
+        gpp = step_gpp(hosts_tmp, out_dir, creds_real, creds_disp, len(hosts))
+    else:
+        write_lines(out_dir / "dc_gpp.txt", [])
+
+    # ---- STEP 2 : SYSVOL/NETLOGON content ----
+    if has_creds:
+        creds, hints, inventory, sensitive, writable = step_interesting_files(
+            hosts, hosts_tmp, out_dir, args.username, args.password, args.hash,
+            args.domain, creds_real)
+    else:
+        for f in ("dc_sysvol_creds.txt", "dc_sysvol_hints.txt", "dc_sysvol_files.txt",
+                  "dc_sysvol_sensitive.txt", "dc_sysvol_writable.txt"):
+            write_lines(out_dir / f, [])
+
+    # ---- STEP 3 : vulns DC (avec ou sans creds) ----
+    vulns, coercion = step_dc_vulns(hosts_tmp, out_dir, creds_real, creds_disp, len(hosts))
+
+    # ---- STEP 4 : ADCS (opt-in --adcs) ----
+    if args.adcs:
+        if not has_creds:
+            log_warn("--adcs nécessite des creds — ignoré.")
+            write_lines(out_dir / "dc_adcs_vulnerable.txt", [])
+        else:
+            adcs = step_adcs(hosts, out_dir, args.username, args.password,
+                             args.hash, args.domain)
+
     try:
         os.unlink(hosts_tmp)
     except OSError:
         pass
 
-    # ---- STEP 2 : fichiers intéressants (1 DC) ----
-    creds, hints, inventory = step_interesting_files(
-        hosts, out_dir, args.username, args.password, args.hash, args.domain)
-
-    write_summary(out_dir, hosts, gpp, creds, hints, inventory)
+    write_summary(out_dir, hosts, gpp, creds, hints, inventory, sensitive,
+                  writable, vulns, coercion, adcs)
     log_ok(f"Done. Results in: {out_dir.resolve()}")
 
 

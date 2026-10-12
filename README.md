@@ -34,6 +34,7 @@ Chaque script vérifie ses outils au démarrage et signale les manquants sans pl
 | `masscan`, `fping`, `nmap` | discovery (`ad_recon_userless`) |
 | `nxc` / `netexec` | smb, dc, ldap, rdp, mssql, ssh, ftp, winrm, kerberos |
 | `smbclient` | dc (téléchargement SYSVOL/NETLOGON) |
+| `certipy` (opt.) | dc (`--adcs` : templates ADCS vulnérables) |
 | `ldapsearch`, `bloodhound-python` | ldap |
 | `dig` | dns |
 | `ssh-audit` | ssh |
@@ -68,7 +69,7 @@ python3 generate_report.py -d /tmp/pentest -n "Client" -o /tmp/pentest/report.ht
 |---|---|---|
 | `ad_recon_userless.py` | — | Découverte réseau (fping + nmap), port scan masscan, tri par service |
 | `check_smb.py` | 139/445 | Recon (hôtes joignables + hôtes où les creds passent/admin), signing, SMBv1, null session, partages R/W accessibles (hors `$`) |
-| `check_dc.py` | 139/445 | **DC** : creds GPP SYSVOL (`gpp_password`/`gpp_autologin`), fichiers intéressants SYSVOL/NETLOGON (critères adPEAS : extensions + Tier1 🔴/Tier2 ⚠️ + exclusions). Nécessite des creds |
+| `check_dc.py` | 139/445 | **DC** : vulns (Zerologon/noPac/SMBGhost/PrintNightmare/Spooler/coercion), GPP SYSVOL, fichiers intéressants + sensibles SYSVOL/NETLOGON (critères adPEAS : Tier1 🔴/Tier2 ⚠️ + exclusions), SYSVOL inscriptible (GPO abuse), ADCS (`--adcs`, certipy). Vulns sans creds ; SYSVOL/GPP/ADCS avec creds |
 | `check_ldap.py` | 389/636/3268 | Null bind + dump anonyme, LDAP signing/channel binding (relais NTLM), pass-pol, MachineAccountQuota, délégation, adminCount, LAPS/gMSA lisibles, ADCS, descriptions, AS-REP/Kerberoast, BloodHound (`--bloodhound [DC_IP]`, 1 DC) |
 | `check_rdp.py` | 3389 | NLA, OS, test de login, screenshot |
 | `check_ssh.py` | 22 | Bannière, algos faibles, méthodes d'auth, test creds |

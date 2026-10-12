@@ -88,19 +88,25 @@ SYSVOL/NETLOGON (GPP + fichiers intéressants) est **migré dans [`check_dc.py`]
 
 > Pas de faux positif admin (ne s'appuie pas sur `(Pwn3d!)` pour les shares). STEP 1-3 nettoient l'ANSI (`strip_ansi`) avant parsing et **excluent les partages `$`** des fichiers shares. Robustesse gros scope : `run_nxc()` redirige vers fichier, **tue le groupe de processus sur timeout et conserve la sortie partielle**, timeouts scalés sur le nb d'hôtes, `--threads` transmis (défaut 100).
 
-### DC (SYSVOL / NETLOGON) — [`check_dc.py`](check_dc.py)
-Script dédié DC. **Nécessite des creds** (SYSVOL/NETLOGON = lecture authentifiée).
-Flux : **1. GPP** (nxc, sweep multi-hôtes) → **2. fichiers intéressants** (téléchargement
-tar via `smbclient` sur **un seul DC** — partages répliqués — puis analyse locale).
+### DC — [`check_dc.py`](check_dc.py)
+Script dédié DC. Flux : **1. GPP** → **2. contenu SYSVOL/NETLOGON** (téléchargement
+tar `smbclient -Tc` sur **un seul DC**, partages répliqués) → **3. vulns DC (nxc)** →
+**4. ADCS (opt-in `--adcs`)**. Les steps 1/2/4 nécessitent des **creds** ; le step 3
+(vulns) **tourne même sans creds**.
 
 | Finding | Critère | Fichier | Crit. |
 |---|---|---|---|
+| Vuln DC | `-M zerologon`/`nopac`/`smbghost` → marqueur VULNERABLE (hors « not vulnerable »/erreur) | `dc_vulns.txt` (brut: `dc_vulns_raw.txt`) | 🔴 |
+| Vecteur de coercition | `-M printnightmare`/`spooler`/`coerce_plus` → spooler actif / coercition possible | `dc_coercion.txt` | ⚠️ |
 | Creds GPP (SYSVOL) | `-M gpp_password`/`-M gpp_autologin` → ligne cred (hors négatives) | `dc_gpp.txt` (brut: `dc_gpp_raw.txt`) | 🔴 |
-| Creds dans scripts SYSVOL/NETLOGON (Tier 1) | motif haute confiance (password=…, net use …, psexec -p, schtasks /rp, cmdkey, connectionstring, ConvertTo-SecureString, api_key, `$cred=…password`) sur une extension ciblée, hors exclusions | `dc_sysvol_creds.txt` | 🔴 |
+| SYSVOL/NETLOGON inscriptible | `nxc --shares` → `SYSVOL`/`NETLOGON` avec `WRITE` (non intrusif, aucune écriture) | `dc_sysvol_writable.txt` | 🔴 |
+| Creds dans scripts (Tier 1) | motif haute confiance (password=…, net use …, psexec -p, schtasks /rp, cmdkey, connectionstring, ConvertTo-SecureString, api_key, `$cred=…password`) sur extension ciblée, hors exclusions | `dc_sysvol_creds.txt` | 🔴 |
+| Fichiers sensibles | présence par nom/extension : `.pfx .p12 .pem .cer .kdbx .ppk .rdp`, `id_rsa/id_dsa/id_ecdsa`, `unattend.xml/autounattend.xml/sysprep.inf/sysprep.xml` | `dc_sysvol_sensitive.txt` | ⚠️ |
 | Lignes à revoir (Tier 2) | mention plus faible (`<password>`, `passwd`, `password`, `credential`, `secret/token=`) hors exclusions | `dc_sysvol_hints.txt` | ⚠️ |
+| ADCS vulnérable (`--adcs`) | `certipy find -vulnerable` → ligne `ESCx` / « vulnerab » | `dc_adcs_vulnerable.txt` (brut: `dc_adcs_raw.txt`) | 🔴 |
 | Fichiers analysés | inventaire des fichiers d'extension ciblée lus | `dc_sysvol_files.txt` | ℹ️ |
 
-> Critères inspirés d'**adPEAS / Snaffler**. Extensions scannées : `.txt .bat .ini .conf .cnf .cmd .vbs .vbe .kix .ps1 .psm1` (les `.xml` GPP sont couverts par le step 1). **Exclusions anti-faux-positifs** : doc de politique de mot de passe (`password policy/length/complexity/must be…`), commentaires (`REM`/`::`/`#`/`'`), `usage:`/`echo … help`, prompts (`Enter your password`), valeurs masquées (`password: ****`/`<…>`). Le tar est parcouru **en mémoire** (pas d'extraction disque — archive de la cible non fiable). Secrets **redacted** dans les logs/UI. GPP reprend la logique anti-faux-positif migrée de SMB (`_GPP_FINDING_RE`/`_GPP_NEGATIVE_RE` : payoffs `Found credentials in`/`Usernames:`/`Passwords:`/`cpassword`/`autologin`, jamais la ligne d'auth nxc). `.vbe` encodé **non décodé** (limite connue).
+> **Scan de contenu** inspiré d'**adPEAS / Snaffler**. Extensions scannées ligne à ligne : `.txt .bat .ini .conf .cnf .cmd .vbs .kix .ps1 .psm1` (plus de `.vbe` : encodé, inutile à scanner brut ; `web.config` volontairement exclu ; `.xml` GPP couverts par le step 1). **Exclusions anti-faux-positifs** : doc de politique (`password policy/length/complexity/must be…`), commentaires (`REM`/`::`/`#`/`'`), `usage:`/`echo … help`, prompts (`Enter your password`), valeurs masquées (`password: ****`/`<…>`). Tar parcouru **en mémoire** (pas d'extraction disque — archive de la cible non fiable). GPP = logique anti-faux-positif migrée de SMB. Secrets **redacted** dans les logs/UI. Vulns en **mode CHECK** (jamais d'exploitation qui casse le compte machine). **⚠ Noms de modules nxc version-dépendants** (`coerce_plus` récent) — sortie brute conservée pour ajuster. ACL/DCSync **volontairement non couverts** (→ BloodHound).
 
 ### LDAP — [`check_ldap.py`](check_ldap.py)
 Flux : **1. rootDSE** (identifie les vrais DC) → **2. signing/channel binding** → **3. null bind + dump anonyme** → **4. énum authentifiée (nxc)** → **5. BloodHound (opt-in `--bloodhound`, sur 1 DC)**. L'étape 4 cible les **DC** (hôtes répondant au rootDSE, repli sur toutes les cibles), pas tout le scope ; l'étape 5 ne tourne que si `--bloodhound` est passé et sur **un seul DC** (bloodhound-python `-ns <DC>` collecte tout le domaine).

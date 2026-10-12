@@ -152,11 +152,16 @@ def collect(base: Path) -> dict:
     # (avant migration) remontent toujours, désormais sous le service DC.
     d["dc"] = {
         "scanned": scanned("dc_summary.txt", "dc_gpp.txt", "dc_sysvol_files.txt",
-                           "sysvol_gpp.txt"),
+                           "dc_vulns.txt", "sysvol_gpp.txt"),
         "gpp":          read_any(base, "dc_gpp.txt", "sysvol_gpp.txt"),
         "sysvol_creds": read_all(base, "dc_sysvol_creds.txt"),
         "sysvol_hints": read_all(base, "dc_sysvol_hints.txt"),
         "sysvol_files": read_any(base, "dc_sysvol_files.txt", "sysvol_files.txt"),
+        "sensitive":    read_all(base, "dc_sysvol_sensitive.txt"),
+        "writable":     read_all(base, "dc_sysvol_writable.txt"),
+        "vulns":        read_all(base, "dc_vulns.txt"),
+        "coercion":     read_all(base, "dc_coercion.txt"),
+        "adcs":         read_all(base, "dc_adcs_vulnerable.txt"),
     }
 
     # LDAP (union dédupliquée des users/groups/computers sur tous les runs).
@@ -289,8 +294,13 @@ def get_criticals(d: dict) -> list[tuple[str, str, str]]:
     if smb["admin"]:       c.append(("SMB",      f"{len(smb['admin'])} host(s) where provided creds have admin access (Pwn3d!)", "critical"))
 
     dc = d["dc"]
+    if dc["vulns"]:        c.append(("DC",       f"{len(dc['vulns'])} DC vulnerability finding(s) (Zerologon/noPac/SMBGhost)", "critical"))
     if dc["gpp"]:          c.append(("DC",       f"{len(dc['gpp'])} GPP credential finding(s) in SYSVOL (cleartext/decryptable)", "critical"))
     if dc["sysvol_creds"]: c.append(("DC",       f"{len(dc['sysvol_creds'])} probable credential(s) in SYSVOL/NETLOGON scripts", "critical"))
+    if dc["writable"]:     c.append(("DC",       f"{len(dc['writable'])} SYSVOL/NETLOGON share(s) writable (GPO abuse → RCE)", "critical"))
+    if dc["adcs"]:         c.append(("DC",       f"{len(dc['adcs'])} ADCS vulnerability line(s) (ESCx — Certipy)", "critical"))
+    if dc["coercion"]:     c.append(("DC",       f"{len(dc['coercion'])} NTLM coercion vector(s) (PetitPotam/PrinterBug/Spooler)", "warning"))
+    if dc["sensitive"]:    c.append(("DC",       f"{len(dc['sensitive'])} sensitive file(s) in SYSVOL/NETLOGON (keys/KeePass/unattend — retrieve)", "warning"))
     if dc["sysvol_hints"]: c.append(("DC",       f"{len(dc['sysvol_hints'])} SYSVOL/NETLOGON file line(s) to review (possible secrets)", "warning"))
 
     ldap = d["ldap"]
@@ -517,31 +527,56 @@ def build_dc(d: dict) -> str:
     s = d["dc"]
     parts = []
 
+    vuln_lvl  = "critical" if s["vulns"]        else "ok"
     gpp_lvl   = "critical" if s["gpp"]          else "ok"
     creds_lvl = "critical" if s["sysvol_creds"] else "ok"
-    hints_lvl = "warning"  if s["sysvol_hints"] else "ok"
+    write_lvl = "critical" if s["writable"]     else "ok"
 
     stats = '<div class="stat-row">'
+    stats += stat_card(len(s["vulns"]),        "DC vulns",      "critical" if s["vulns"] else "skip")
     stats += stat_card(len(s["gpp"]),          "GPP secrets",   "critical" if s["gpp"] else "skip")
     stats += stat_card(len(s["sysvol_creds"]), "Script creds",  "critical" if s["sysvol_creds"] else "skip")
-    stats += stat_card(len(s["sysvol_hints"]), "Hints",         "warning"  if s["sysvol_hints"] else "skip")
+    stats += stat_card(len(s["writable"]),     "Writable",      "critical" if s["writable"] else "skip")
+    stats += stat_card(len(s["adcs"]),         "ADCS ESC",      "critical" if s["adcs"] else "skip")
     stats += stat_card(len(s["sysvol_files"]), "Files reviewed","info"     if s["sysvol_files"] else "skip")
     stats += '</div>'
     parts.append(stats)
+
+    parts.append(subsec(f"DC vulnerabilities — Zerologon / noPac / SMBGhost ({len(s['vulns'])})",
+                        text_table(s["vulns"], "Host : vulnerability")
+                        if s["vulns"] else '<p class="empty">No DC vulnerability detected.</p>',
+                        vuln_lvl))
+
+    if s["coercion"]:
+        parts.append(subsec(f"NTLM coercion vectors — PetitPotam / PrinterBug / Spooler ({len(s['coercion'])})",
+                            text_table(s["coercion"], "Host : vector"), "warning"))
+
+    if s["adcs"]:
+        parts.append(subsec(f"ADCS vulnerable templates — Certipy ({len(s['adcs'])})",
+                            text_table(s["adcs"], "ESC finding"), "critical"))
 
     parts.append(subsec(f"GPP credentials in SYSVOL ({len(s['gpp'])} findings)",
                         text_table(s["gpp"], "GPP finding (cleartext / decryptable creds)")
                         if s["gpp"] else '<p class="empty">No GPP credentials found.</p>',
                         gpp_lvl))
 
+    parts.append(subsec(f"SYSVOL/NETLOGON writable shares — GPO abuse ({len(s['writable'])})",
+                        text_table(s["writable"], "Share (WRITE)")
+                        if s["writable"] else '<p class="empty">SYSVOL/NETLOGON not writable.</p>',
+                        write_lvl))
+
     parts.append(subsec(f"SYSVOL/NETLOGON script credentials — Tier 1 ({len(s['sysvol_creds'])})",
                         text_table(s["sysvol_creds"], "File : matched line")
                         if s["sysvol_creds"] else '<p class="empty">No high-confidence credentials found.</p>',
                         creds_lvl))
 
+    if s["sensitive"]:
+        parts.append(subsec(f"Sensitive files to retrieve — keys / KeePass / unattend ({len(s['sensitive'])})",
+                            text_table(s["sensitive"], "File (type)"), "warning"))
+
     if s["sysvol_hints"]:
         parts.append(subsec(f"SYSVOL/NETLOGON lines to review — Tier 2 ({len(s['sysvol_hints'])})",
-                            text_table(s["sysvol_hints"], "File : matched line"), hints_lvl))
+                            text_table(s["sysvol_hints"], "File : matched line"), "warning"))
 
     if s["sysvol_files"]:
         parts.append(subsec(f"Files reviewed ({len(s['sysvol_files'])})",
