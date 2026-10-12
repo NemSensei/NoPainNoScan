@@ -131,8 +131,20 @@ Flux : **1. rootDSE** (identifie les vrais DC) → **2. signing/channel binding*
 > **Corrigé (faux positifs)** : la sortie nxc n'est plus écrite BRUTE dans les fichiers lus par le rapport. Avant, chaque ligne bannière `[*]`, auth `[+] dom\user:pass` et en-tête `-Username-` était comptée → `delegation`/`no_preauth` remontaient en finding **à chaque run** même à 0 compte réel, et `users_count` était gonflé (idem le dump null-bind brut `dn:/sAMAccountName:`). On parse désormais en **une entité par ligne** (`nxc_data_lines`), on détecte l'échec d'auth (plus de « succès » sur `rc==0` d'un bind raté : on exige un `[+]`), et les bruts sont gardés en `*.raw.txt` / `*_raw.txt` (hors glob du rapport). `--password-not-required` reste nommé `ldap_no_preauth.txt` pour compat rapport mais est bien étiqueté **PASSWD_NOTREQD** (≠ sans préauth Kerberos — ça c'est l'AS-REP roast).
 > **Opérationnel** : `run_nxc` tue le groupe de processus sur timeout et conserve la sortie partielle ; `strip_ansi` avant parsing ; `--threads` ; secrets **redacted** dans les logs/UI (`-p '***'`). Roasting AS-REP/Kerberoast présent **aussi** dans [`check_kerberos.py`](check_kerberos.py) (overlap voulu : check_ldap autonome).
 
-### Kerberos, SSH, DNS, SNMP, FTP
-Détection inchangée sur cette passe (**en attente** selon ta consigne), sauf le bug SSH ci-dessous. Points connus à fiabiliser : Kerberos (suffixe realm qui casse la userlist AS-REP + clock-skew), SNMP (version de brute non réutilisée → énum vide), DNS (crash IPv6 `cidr_from_ip`), FTP (listing non borné / filtre trop large).
+### Kerberos — [`check_kerberos.py`](check_kerberos.py)
+Recentré sur les **deux attaques** (plus d'énum/bruteforce de comptes : l'énum
+authentifiée est dans check_ldap). Flux : **1. détection domaine** → **2. AS-REP
+roast** → **3. Kerberoast**.
+
+| Finding | Critère | Fichier | Crit. |
+|---|---|---|---|
+| AS-REP roastable | avec creds `nxc ldap --asreproast` ; sans creds `GetNPUsers -no-pass -usersfile <--users>` → ≥1 `$krb5asrep$` | `kerberos_asrep_hashes.txt` | 🔴 (m18200) |
+| Kerberoastable | `nxc ldap --kerberoasting` (fallback `GetUserSPNs -request`) → ≥1 `$krb5tgs$` | `kerberos_spn_hashes.txt` | 🔴 (m13100) |
+
+> **Corrigé** : (1) la userlist `--users` est **assainie** (`CORP\user` / `user@realm` → sAMAccountName nu) — sinon GetNPUsers échouait sur toute la liste ; (2) **clock-skew** Kerberos (`KRB_AP_ERR_SKEW`) détecté dans la sortie impacket/nxc → message de remédiation (synchro horloge sur le DC) au lieu d'un échec muet. Overlap roasting **authentifié** assumé avec check_ldap (demandé). L'**énumération de comptes** (ex-kerbrute + wordlist) a été **retirée**.
+
+### SSH, DNS, SNMP, FTP
+Détection inchangée sur cette passe (**en attente** selon ta consigne), sauf le bug SSH ci-dessous. Points connus à fiabiliser : SNMP (version de brute non réutilisée → énum vide), DNS (crash IPv6 `cidr_from_ip`), FTP (listing non borné / filtre trop large).
 
 ---
 

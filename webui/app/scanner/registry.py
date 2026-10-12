@@ -376,17 +376,16 @@ REGISTRY: dict[str, CheckDefinition] = {
         id="kerberos",
         script="check_kerberos.py",
         label="Kerberos (88)",
-        description="User enumeration, AS-REP roasting, Kerberoasting.",
+        description="AS-REP roasting (with creds via nxc, or credential-less via "
+                    "GetNPUsers on a --users list) and Kerberoasting (nxc / GetUserSPNs).",
         supports_creds=True,
         required_tools=[],
-        optional_tools=["kerbrute", "impacket", "nxc"],
+        optional_tools=["impacket", "nxc"],
         arguments=[
             _ARG_TARGET, _ARG_OUTPUT,
             _ARG_USERNAME, _ARG_PASSWORD, _ARG_HASH, _domain_arg(),
             CheckArgument(name="--users", dest="users", type="str", default=None,
-                          help="File with usernames for AS-REP roasting"),
-            CheckArgument(name="--wordlist", dest="wordlist", type="str", default=None,
-                          help="Wordlist for user enumeration"),
+                          help="Account list for credential-less AS-REP roasting"),
         ],
     ),
 }

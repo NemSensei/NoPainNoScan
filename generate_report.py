@@ -275,7 +275,8 @@ def collect(base: Path) -> dict:
 
     # Kerberos
     d["kerberos"] = {
-        "scanned":     scanned("kerberos_valid_users.txt", "kerberos_asrep_hashes.txt"),
+        "scanned":     scanned("kerberos_summary.txt", "kerberos_valid_users.txt",
+                               "kerberos_asrep_hashes.txt", "kerberos_spn_hashes.txt"),
         "valid_users": read_all(base, "kerberos_valid_users.txt"),
         "asrep":       read_all(base, "kerberos_asrep_hashes.txt"),
         "spn":         read_all(base, "kerberos_spn_hashes.txt"),

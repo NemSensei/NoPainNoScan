@@ -23,8 +23,7 @@ Toolkit Python d'automatisation pour les **pentests internes Active Directory**.
 git clone <repo> && cd NoPainNoScan
 # Outils système (selon les checks utilisés)
 sudo apt install masscan fping nmap ldap-utils dnsutils ipmitool onesixtyone snmp whatweb curl smbclient
-pip install netexec impacket bloodhound ssh-audit
-# kerbrute : https://github.com/ropnop/kerbrute/releases
+pip install netexec impacket bloodhound ssh-audit certipy-ad
 ```
 
 Chaque script vérifie ses outils au démarrage et signale les manquants sans planter.
@@ -38,7 +37,7 @@ Chaque script vérifie ses outils au démarrage et signale les manquants sans pl
 | `ldapsearch`, `bloodhound-python` | ldap |
 | `dig` | dns |
 | `ssh-audit` | ssh |
-| `kerbrute`, `impacket` | kerberos |
+| `nxc`, `impacket` (GetNPUsers/GetUserSPNs) | kerberos |
 | `ipmitool`, `ipmipwner` (opt.) | ipmi |
 | `onesixtyone`, `snmpwalk` | snmp |
 | `whatweb`, `curl` | http, winrm |
@@ -80,7 +79,7 @@ python3 generate_report.py -d /tmp/pentest -n "Client" -o /tmp/pentest/report.ht
 | `check_snmp.py` | 161/UDP | Community strings, snmpwalk |
 | `check_ipmi.py` | 623/UDP | Cipher-zero, RAKP, creds par défaut |
 | `check_winrm.py` | 5985/5986 | Méthodes d'auth, test creds, exécution |
-| `check_kerberos.py` | 88/464 | Énum users, AS-REP roasting, Kerberoasting |
+| `check_kerberos.py` | 88/464 | AS-REP roasting (avec creds via nxc, ou sans creds via GetNPUsers sur `--users`), Kerberoasting (nxc / GetUserSPNs) |
 | `generate_report.py` | — | Rapport HTML agrégeant toutes les sorties |
 
 ### Arguments communs
