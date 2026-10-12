@@ -273,11 +273,14 @@ def scan_text(text, label, findings, hints, max_per_file=10):
 
 
 def download_share_tar(host, share, userarg, extra, tmpdir):
-    """Télécharge un partage entier en tar via smbclient. Retourne le chemin ou None."""
+    """Télécharge un partage entier en tar via smbclient. Retourne le chemin ou None.
+
+    Forme canonique `-Tc <tar>` (flag ligne de commande) : `tar` récurse de
+    lui-même, pas besoin de `tarmode/recurse/prompt` (dont la syntaxe varie selon
+    la version de Samba et pourrait casser la chaîne `-c`)."""
     tarpath = Path(tmpdir) / f"{share}.tar"
-    inner = f"tarmode full; recurse ON; prompt OFF; tar c {tarpath}"
     cmd = (f"smbclient //{shlex.quote(host)}/{share} -U {userarg} {extra} "
-           f"-c {shlex.quote(inner)}")
+           f"-Tc {shlex.quote(str(tarpath))}")
     out, err, rc = run(cmd, timeout=600)
     if tarpath.exists() and tarpath.stat().st_size > 0:
         return tarpath
